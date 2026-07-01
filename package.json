@@ -1,0 +1,37 @@
+{
+  "name": "game-platform-api-nest",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/clean-dist.js && tsc -p tsconfig.build.json",
+    "seed": "scripts/current-network.sh seed",
+    "start:current-network": "scripts/current-network.sh start",
+    "seed:local-auth": "node scripts/seed-local-auth.js",
+    "smoke:local-flow": "node scripts/smoke-local-flow.js",
+    "start": "node dist/main.js",
+    "start:dev": "ts-node src/main.ts",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@nestjs/common": "^11.1.9",
+    "@nestjs/core": "^11.1.9",
+    "@nestjs/platform-express": "^11.1.9",
+    "jose": "^5.10.0",
+    "multer": "2.2.0",
+    "pg": "^8.16.3",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.15.6",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "@nestjs/platform-express": {
+      "multer": "2.2.0"
+    }
+  }
+}
