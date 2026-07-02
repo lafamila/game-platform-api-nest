@@ -1918,8 +1918,7 @@ function simulateAlkkagi(pieces: AlkkagiPiece[], options: AlkkagiSimulationOptio
       item.vy *= 0.965;
       if (Math.abs(item.vx) < 0.02) item.vx = 0;
       if (Math.abs(item.vy) < 0.02) item.vy = 0;
-      const radius = pieceRadius(item);
-      if (item.x < -radius || item.x > ALKKAGI_BOARD_SIZE + radius || item.y < -radius || item.y > ALKKAGI_BOARD_SIZE + radius) {
+      if (item.x < 0 || item.x > ALKKAGI_BOARD_SIZE || item.y < 0 || item.y > ALKKAGI_BOARD_SIZE) {
         item.active = false;
         item.vx = 0;
         item.vy = 0;

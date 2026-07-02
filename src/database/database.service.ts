@@ -147,5 +147,20 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       )
     `);
     await this.query(`CREATE INDEX IF NOT EXISTS idx_custom_emotes_account ON custom_emotes(account_id, slot)`);
+
+    await this.query(`
+      CREATE TABLE IF NOT EXISTS client_error_reports (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        account_id text NOT NULL,
+        method text NOT NULL DEFAULT '',
+        path text NOT NULL DEFAULT '',
+        status_code integer NULL,
+        message text NOT NULL DEFAULT '',
+        context_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+        occurred_at timestamptz NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_client_error_reports_account ON client_error_reports(account_id, created_at DESC)`);
   }
 }

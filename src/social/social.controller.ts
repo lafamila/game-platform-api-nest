@@ -25,6 +25,11 @@ export class SocialController {
     return this.social.listFriends(user);
   }
 
+  @Get('friends/:accountId/stats')
+  friendStats(@CurrentUser() user: AuthAccount, @Param('accountId') accountId: string) {
+    return this.social.friendStats(user, accountId);
+  }
+
   @Post('friends/requests')
   createFriendRequest(@CurrentUser() user: AuthAccount, @Body() body: { recipientAccountId: string }) {
     return this.social.createFriendRequest(user, body.recipientAccountId);

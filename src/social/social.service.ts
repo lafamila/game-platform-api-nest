@@ -42,6 +42,11 @@ interface SocialBlockRow {
   created_at: Date;
 }
 
+interface FriendGameStatsRow {
+  game_key: string;
+  state_json: Record<string, unknown>;
+}
+
 export interface SocialAccountView {
   accountId: string;
   loginId: string;
@@ -165,6 +170,54 @@ export class SocialService {
           updatedAt: row.updated_at.toISOString(),
         };
       }),
+    };
+  }
+
+  async friendStats(user: AuthAccount, friendAccountId: string) {
+    await this.cacheAuthAccount(user);
+    if (!(await this.areFriends(user.accountId, friendAccountId))) {
+      throw new ForbiddenException('friend stats are only available between friends');
+    }
+    const result = await this.db.query<FriendGameStatsRow>(
+      `SELECT game_key, state_json
+       FROM game_sessions
+       WHERE mode = 'friend_match'
+         AND status IN ('finished', 'cleared')
+         AND (
+           (owner_account_id = $1 AND opponent_account_id = $2)
+           OR (owner_account_id = $2 AND opponent_account_id = $1)
+         )
+       ORDER BY updated_at DESC`,
+      [user.accountId, friendAccountId],
+    );
+    const stats = {
+      sudoku: { wins: 0, losses: 0 },
+      gomoku: { wins: 0, losses: 0 },
+      alkkagi: { wins: 0, losses: 0 },
+    };
+    for (const row of result.rows) {
+      const gameKey = row.game_key as keyof typeof stats;
+      if (!stats[gameKey]) {
+        continue;
+      }
+      const winnerAccountId = winnerAccountForRow(row.game_key, row.state_json);
+      if (winnerAccountId === user.accountId) {
+        stats[gameKey].wins += 1;
+      } else if (winnerAccountId === friendAccountId) {
+        stats[gameKey].losses += 1;
+      }
+    }
+    return {
+      accountId: friendAccountId,
+      games: [
+        { gameKey: 'sudoku', label: '스도쿠', ...stats.sudoku },
+        { gameKey: 'gomoku', label: '오목', ...stats.gomoku },
+        { gameKey: 'alkkagi', label: '알까기', ...stats.alkkagi },
+      ],
+      total: {
+        wins: stats.sudoku.wins + stats.gomoku.wins + stats.alkkagi.wins,
+        losses: stats.sudoku.losses + stats.gomoku.losses + stats.alkkagi.losses,
+      },
     };
   }
 
@@ -551,6 +604,18 @@ function accountViewFromRow(row: SocialAccountRow): SocialAccountView {
 
 function hasPlayerPermissionKey(permission: string | null | undefined): boolean {
   return ['player', 'premium', 'superadmin'].includes(String(permission ?? '').toLowerCase());
+}
+
+function winnerAccountForRow(gameKey: string, state: Record<string, unknown>): string | undefined {
+  if (gameKey === 'sudoku') {
+    return typeof state.winnerAccountId === 'string' ? state.winnerAccountId : undefined;
+  }
+  const winner = typeof state.winner === 'string' ? state.winner : undefined;
+  const players = state.players && typeof state.players === 'object'
+    ? state.players as Record<string, unknown>
+    : {};
+  const accountId = winner ? players[winner] : undefined;
+  return typeof accountId === 'string' ? accountId : undefined;
 }
 
 function friendRequestView(row: FriendRequestRow, accounts: Map<string, SocialAccountView>) {

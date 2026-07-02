@@ -11,9 +11,11 @@ import { RealtimeController } from './realtime/realtime.controller';
 import { RealtimeService } from './realtime/realtime.service';
 import { SocialController } from './social/social.controller';
 import { SocialService } from './social/social.service';
+import { DiagnosticsController } from './diagnostics/diagnostics.controller';
+import { DiagnosticsService } from './diagnostics/diagnostics.service';
 
 @Module({
-  controllers: [HealthController, SessionController, GamesController, SocialController, RealtimeController],
+  controllers: [HealthController, SessionController, GamesController, SocialController, DiagnosticsController, RealtimeController],
   providers: [
     DatabaseService,
     AuthService,
@@ -21,6 +23,7 @@ import { SocialService } from './social/social.service';
     GamePlatformSessionGuard,
     GamesService,
     SocialService,
+    DiagnosticsService,
     RealtimeService,
   ],
 })
