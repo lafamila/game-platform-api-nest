@@ -1,7 +1,16 @@
 export type Difficulty = 'easy' | 'medium' | 'hard';
 export type PlayerColor = 'black' | 'white';
 export type PieceTeam = 'red' | 'blue';
-export type GameMode = 'solo' | 'local_two_player' | 'friend_match';
+export type SudokuSide = 'challenger' | 'opponent';
+export type GameMode = 'solo' | 'local_ai' | 'friend_match';
+
+export interface MatchPauseState {
+  active: boolean;
+  requestedByAccountId?: string;
+  startedAt?: string;
+  resumableAt?: string;
+  counts?: Record<string, number>;
+}
 
 export interface TimedTurnState {
   mode?: GameMode;
@@ -10,36 +19,65 @@ export interface TimedTurnState {
   networkGraceStartedAt?: string;
   networkGraceDeadlineAt?: string;
   networkGraceAccountId?: string;
+  pause?: MatchPauseState;
   finishReason?: string;
 }
 
 export interface SudokuSession {
   id: string;
+  mode?: GameMode;
   ownerAccountId: string;
   difficulty: Difficulty;
   puzzle: number[][];
   board: number[][];
   solution: number[][];
-  status: 'playing' | 'cleared' | 'failed';
+  players?: Record<SudokuSide, string>;
+  boards?: Record<SudokuSide, number[][]>;
+  progress?: Record<SudokuSide, SudokuProgress>;
+  battle?: Record<SudokuSide, SudokuBattleState>;
+  winnerAccountId?: string;
+  winnerSide?: SudokuSide;
+  turnStartedAt?: string;
+  turnDeadlineAt?: string;
+  networkGraceStartedAt?: string;
+  networkGraceDeadlineAt?: string;
+  pause?: MatchPauseState;
+  finishReason?: string;
+  status: 'playing' | 'cleared' | 'failed' | 'finished';
   createdAt: string;
   updatedAt: string;
   clearedAt?: string;
 }
 
+export interface SudokuProgress {
+  filled: number;
+  total: number;
+  percent: number;
+}
+
+export interface SudokuBattleState {
+  combo: number;
+  pendingDamage: number;
+  completedUnits: string[];
+  obscuredCells: Array<{ row: number; col: number; until: string }>;
+}
+
 export interface GomokuSession {
   id: string;
   mode?: GameMode;
+  aiDifficulty?: Difficulty;
   board: (PlayerColor | null)[][];
   currentTurn: PlayerColor;
   winner?: PlayerColor;
   status: 'playing' | 'finished';
   players: Record<PlayerColor, string>;
-  moves: Array<{ row: number; col: number; color: PlayerColor; accountId: string; createdAt: string; source?: 'manual' | 'timeout' }>;
+  moves: Array<{ row: number; col: number; color: PlayerColor; accountId: string; createdAt: string; source?: 'manual' | 'timeout' | 'ai' }>;
   turnStartedAt?: string;
   turnDeadlineAt?: string;
   networkGraceStartedAt?: string;
   networkGraceDeadlineAt?: string;
   networkGraceAccountId?: string;
+  pause?: MatchPauseState;
   finishReason?: string;
   createdAt: string;
   updatedAt: string;
@@ -61,17 +99,19 @@ export interface AlkkagiPiece {
 export interface AlkkagiSession {
   id: string;
   mode?: GameMode;
+  aiDifficulty?: Difficulty;
   currentTurn: PieceTeam;
   winner?: PieceTeam;
   status: 'playing' | 'finished';
   players: Record<PieceTeam, string>;
   pieces: AlkkagiPiece[];
-  shots: Array<{ pieceId: string; team: PieceTeam; vx: number; vy: number; accountId: string; createdAt: string; source?: 'manual' | 'timeout' }>;
+  shots: Array<{ pieceId: string; team: PieceTeam; vx: number; vy: number; accountId: string; createdAt: string; source?: 'manual' | 'timeout' | 'ai' }>;
   turnStartedAt?: string;
   turnDeadlineAt?: string;
   networkGraceStartedAt?: string;
   networkGraceDeadlineAt?: string;
   networkGraceAccountId?: string;
+  pause?: MatchPauseState;
   lastAim?: {
     accountId: string;
     pieceId: string;

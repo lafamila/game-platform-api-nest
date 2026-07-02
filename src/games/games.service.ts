@@ -11,9 +11,13 @@ import {
   CustomEmote,
   Difficulty,
   GomokuSession,
+  MatchPauseState,
   PieceTeam,
   PlayerColor,
+  SudokuBattleState,
+  SudokuProgress,
   SudokuSession,
+  SudokuSide,
 } from './games.types';
 
 const GOMOKU_SIZE = 15;
@@ -21,12 +25,19 @@ const ALKKAGI_BOARD_SIZE = 1000;
 const MATCH_READY_DELAY_MS = 4_000;
 const GOMOKU_TURN_LIMIT_MS = 15_000;
 const ALKKAGI_TURN_LIMIT_MS = 10_000;
+const GOMOKU_AI_BUDGET_MS = 900;
+const ALKKAGI_AI_BUDGET_MS = 1_400;
+const LOCAL_AI_RESPONSE_DELAY_MS = 180;
 const DISCONNECT_GRACE_MS = 10_000;
 const EMOTE_COOLDOWN_MS = 3_000;
+const MATCH_PAUSE_LIMIT = 3;
+const MATCH_PAUSE_RESUME_LOCK_MS = 3_000;
+const SUDOKU_OBSCURE_MS = 5_000;
 const EMOTE_COLORS = new Set(['red', 'orange', 'yellow', 'green', 'blue', 'indigo', 'purple', 'black', 'white']);
+const LOCAL_AI_ACCOUNT_ID = '__game_platform_local_ai__';
 const ALKKAGI_HINGES = [
-  { x: 310, y: 500, radius: 30 },
-  { x: 690, y: 500, radius: 30 },
+  { x1: 220, y1: 500, x2: 400, y2: 500, radius: 10 },
+  { x1: 600, y1: 500, x2: 780, y2: 500, radius: 10 },
 ] as const;
 
 interface GameRow {
@@ -76,9 +87,9 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
 
   listGames() {
     return [
-      { key: 'sudoku', title: 'Sudoku', modes: ['solo'], status: 'playable' },
-      { key: 'gomoku', title: 'Gomoku', modes: ['local_two_player', 'friend_match'], status: 'playable' },
-      { key: 'alkkagi', title: 'Alkkagi', modes: ['local_two_player', 'friend_match'], status: 'playable' },
+      { key: 'sudoku', title: 'Sudoku', modes: ['solo', 'friend_match'], status: 'playable' },
+      { key: 'gomoku', title: 'Gomoku', modes: ['local_ai', 'friend_match'], status: 'playable' },
+      { key: 'alkkagi', title: 'Alkkagi', modes: ['local_ai', 'friend_match'], status: 'playable' },
     ];
   }
 
@@ -124,30 +135,59 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return emoteFromRow(result.rows[0]);
   }
 
-  async createSudokuSession(user: AuthAccount, difficulty: Difficulty): Promise<Omit<SudokuSession, 'solution'>> {
+  async createSudokuSession(
+    user: AuthAccount,
+    difficulty: Difficulty,
+    opponentAccountId?: string,
+  ): Promise<Omit<SudokuSession, 'solution'>> {
     this.assertDifficulty(difficulty);
     const { puzzle, solution } = createSudoku(difficulty);
+    const resolvedMode = opponentAccountId ? 'friend_match' : 'solo';
+    const board = puzzle.map((row) => [...row]);
     const state: SudokuSession = {
       id: '',
+      mode: resolvedMode,
       ownerAccountId: user.accountId,
       difficulty,
       puzzle,
-      board: puzzle.map((row) => [...row]),
+      board,
       solution,
       status: 'playing',
       createdAt: '',
       updatedAt: '',
     };
-    const row = await this.insertGame('sudoku', 'solo', user.accountId, null, state.status, null, null, state);
+    if (opponentAccountId) {
+      state.players = {
+        challenger: user.accountId,
+        opponent: opponentAccountId,
+      };
+      state.boards = {
+        challenger: cloneSudokuGrid(board),
+        opponent: cloneSudokuGrid(board),
+      };
+      state.progress = createSudokuProgressMap(state);
+      state.battle = {
+        challenger: createSudokuBattleState(state.boards.challenger, state.solution),
+        opponent: createSudokuBattleState(state.boards.opponent, state.solution),
+      };
+      state.pause = {
+        active: false,
+        counts: {
+          [user.accountId]: 0,
+          [opponentAccountId]: 0,
+        },
+      };
+    }
+    const row = await this.insertGame('sudoku', resolvedMode, user.accountId, opponentAccountId ?? null, state.status, null, null, state);
     const session = this.sudokuFromRow(row);
-    this.realtime.emitToAccounts([user.accountId], 'game.session.created', hideSudokuSolution(session));
-    return hideSudokuSolution(session);
+    this.emitSudokuEvent(session, 'game.session.created');
+    return hideSudokuSolution(session, user);
   }
 
   async getSudokuSession(id: string, user: AuthAccount): Promise<Omit<SudokuSession, 'solution'>> {
     const session = this.sudokuFromRow(await this.requireGameRow(id, 'sudoku'));
-    this.assertParticipant(user, session.ownerAccountId);
-    return hideSudokuSolution(session);
+    this.assertSudokuParticipant(user, session);
+    return hideSudokuSolution(session, user);
   }
 
   async updateSudokuCell(
@@ -163,15 +203,26 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('value must be an integer from 0 to 9');
     }
     const current = this.sudokuFromRow(await this.requireGameRow(id, 'sudoku'));
-    this.assertParticipant(user, current.ownerAccountId);
+    this.assertSudokuParticipant(user, current);
+    this.assertNotPaused(current);
     if (current.puzzle[row][col] !== 0) {
       throw new BadRequestException('given cells cannot be changed');
     }
-    current.board[row][col] = value;
+    const side = this.sudokuSideForUser(current, user);
+    const board = side ? ensureSudokuPlayerBoard(current, side) : current.board;
+    board[row][col] = value;
+    if (side) {
+      current.boards![side] = board;
+      applySudokuBattleMove(current, side);
+      current.progress = createSudokuProgressMap(current);
+      current.board = board;
+    } else {
+      current.board = board;
+    }
     current.updatedAt = new Date().toISOString();
     const saved = this.sudokuFromRow(await this.updateGame(id, current.status, null, null, current));
-    this.realtime.emitToAccounts([current.ownerAccountId], 'sudoku.cell.updated', hideSudokuSolution(saved));
-    return hideSudokuSolution(saved);
+    this.emitSudokuEvent(saved, 'sudoku.cell.updated');
+    return hideSudokuSolution(saved, user);
   }
 
   async submitSudoku(
@@ -180,37 +231,59 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     board?: number[][],
   ): Promise<{ solved: boolean; session: Omit<SudokuSession, 'solution'> }> {
     const current = this.sudokuFromRow(await this.requireGameRow(id, 'sudoku'));
-    this.assertParticipant(user, current.ownerAccountId);
-    if (board !== undefined) {
+    this.assertSudokuParticipant(user, current);
+    this.assertNotPaused(current);
+    const side = this.sudokuSideForUser(current, user);
+    if (board !== undefined && !side) {
       validateSudokuBoard(board);
       current.board = board;
     }
-    const solved = isSolvedSudoku(current.board, current.solution);
-    current.status = solved ? 'cleared' : 'failed';
-    current.updatedAt = new Date().toISOString();
-    if (solved) {
-      current.clearedAt = current.updatedAt;
+    const currentBoard = side ? ensureSudokuPlayerBoard(current, side) : current.board;
+    const solved = isSolvedSudoku(currentBoard, current.solution);
+    if (side) {
+      if (solved) {
+        current.status = 'finished';
+        current.winnerSide = side;
+        current.winnerAccountId = current.players?.[side];
+        current.finishReason = 'sudoku_first_clear';
+        current.clearedAt = new Date().toISOString();
+      }
+    } else {
+      current.status = solved ? 'cleared' : 'failed';
+      if (solved) {
+        current.clearedAt = new Date().toISOString();
+      }
     }
-    const saved = this.sudokuFromRow(await this.updateGame(id, current.status, null, solved ? 'cleared' : null, current));
-    this.realtime.emitToAccounts([current.ownerAccountId], 'sudoku.submitted', hideSudokuSolution(saved));
-    return { solved, session: hideSudokuSolution(saved) };
+    current.updatedAt = new Date().toISOString();
+    const saved = this.sudokuFromRow(await this.updateGame(id, current.status, null, solved ? (side ?? 'cleared') : null, current));
+    this.emitSudokuEvent(saved, solved && side ? 'game.session.finished' : 'sudoku.submitted');
+    return { solved, session: hideSudokuSolution(saved, user) };
+  }
+
+  async sendSudokuEmote(id: string, user: AuthAccount, slot: number): Promise<unknown> {
+    const session = this.sudokuFromRow(await this.requireGameRow(id, 'sudoku'));
+    this.assertSudokuParticipant(user, session);
+    return this.sendSessionEmote('sudoku', session, user, slot);
   }
 
   async createGomokuSession(
     user: AuthAccount,
     opponentAccountId?: string,
-    mode?: 'local_two_player' | 'friend_match',
+    mode?: 'local_ai' | 'friend_match',
+    difficulty: Difficulty = 'easy',
   ): Promise<GomokuSession> {
-    const resolvedMode = opponentAccountId ? 'friend_match' : mode ?? 'local_two_player';
+    this.assertDifficulty(difficulty);
+    const resolvedMode = opponentAccountId ? 'friend_match' : mode ?? 'local_ai';
     const state: GomokuSession = {
       id: '',
       mode: resolvedMode,
+      aiDifficulty: resolvedMode === 'local_ai' ? difficulty : undefined,
       board: Array.from({ length: GOMOKU_SIZE }, () => Array.from({ length: GOMOKU_SIZE }, () => null)),
       currentTurn: 'black',
       status: 'playing',
       players: {
         black: user.accountId,
-        white: opponentAccountId || user.accountId,
+        white: opponentAccountId || LOCAL_AI_ACCOUNT_ID,
       },
       moves: [],
       createdAt: '',
@@ -240,7 +313,11 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (session.status !== 'playing') {
       throw new BadRequestException('game is already finished');
     }
+    this.assertNotPaused(session);
     const color = session.currentTurn;
+    if (isLocalAiAccount(session.players[color])) {
+      throw new ForbiddenException('not your turn');
+    }
     if (!this.canActAs(user, session.players[color])) {
       throw new ForbiddenException('not your turn');
     }
@@ -251,6 +328,9 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     const saved = this.gomokuFromRow(await this.updateGame(id, session.status, session.currentTurn, session.winner ?? null, session));
     this.scheduleTurnTimer(saved, 'gomoku');
     this.emitSessionEvent(saved, 'gomoku.move.played', saved);
+    if (saved.mode === 'local_ai' && saved.status === 'playing' && isLocalAiAccount(saved.players[saved.currentTurn])) {
+      this.scheduleLocalGomokuAiTurn(saved.id);
+    }
     return saved;
   }
 
@@ -281,17 +361,20 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   async createAlkkagiSession(
     user: AuthAccount,
     opponentAccountId?: string,
-    mode?: 'local_two_player' | 'friend_match',
+    mode?: 'local_ai' | 'friend_match',
+    difficulty: Difficulty = 'easy',
   ): Promise<AlkkagiSession> {
-    const resolvedMode = opponentAccountId ? 'friend_match' : mode ?? 'local_two_player';
+    this.assertDifficulty(difficulty);
+    const resolvedMode = opponentAccountId ? 'friend_match' : mode ?? 'local_ai';
     const state: AlkkagiSession = {
       id: '',
       mode: resolvedMode,
+      aiDifficulty: resolvedMode === 'local_ai' ? difficulty : undefined,
       currentTurn: 'red',
       status: 'playing',
       players: {
         red: user.accountId,
-        blue: opponentAccountId || user.accountId,
+        blue: opponentAccountId || LOCAL_AI_ACCOUNT_ID,
       },
       pieces: initialAlkkagiPieces(),
       shots: [],
@@ -329,7 +412,11 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (session.status !== 'playing') {
       throw new BadRequestException('game is already finished');
     }
+    this.assertNotPaused(session);
     const team = session.currentTurn;
+    if (isLocalAiAccount(session.players[team])) {
+      throw new ForbiddenException('not your turn');
+    }
     if (!this.canActAs(user, session.players[team])) {
       throw new ForbiddenException('not your turn');
     }
@@ -347,6 +434,9 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.scheduleTurnTimer(saved, 'alkkagi');
     const result = { session: saved, animation };
     this.emitSessionEvent(saved, 'alkkagi.shot.played', result);
+    if (saved.mode === 'local_ai' && saved.status === 'playing' && isLocalAiAccount(saved.players[saved.currentTurn])) {
+      this.scheduleLocalAlkkagiAiTurn(saved.id);
+    }
     return result;
   }
 
@@ -366,7 +456,11 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (session.status !== 'playing') {
       throw new BadRequestException('game is already finished');
     }
+    this.assertNotPaused(session);
     const team = session.currentTurn;
+    if (isLocalAiAccount(session.players[team])) {
+      throw new ForbiddenException('not your turn');
+    }
     if (!this.canActAs(user, session.players[team])) {
       throw new ForbiddenException('not your turn');
     }
@@ -375,21 +469,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('piece does not belong to current turn');
     }
     const phase = input.phase === 'end' ? 'end' : input.phase === 'start' ? 'start' : 'update';
-    if (phase === 'end') {
-      delete session.lastAim;
-    } else {
-      session.lastAim = {
-        accountId: user.accountId,
-        pieceId: input.pieceId,
-        startX: clamp(input.startX, 0, ALKKAGI_BOARD_SIZE),
-        startY: clamp(input.startY, 0, ALKKAGI_BOARD_SIZE),
-        currentX: clamp(input.currentX, 0, ALKKAGI_BOARD_SIZE),
-        currentY: clamp(input.currentY, 0, ALKKAGI_BOARD_SIZE),
-        updatedAt: new Date().toISOString(),
-      };
-    }
-    await this.updateGame(id, session.status, session.currentTurn, session.winner ?? null, session);
-    this.emitSessionEvent(session, 'alkkagi.drag.updated', {
+    const dragEvent = {
       sessionId: id,
       accountId: user.accountId,
       team,
@@ -400,7 +480,22 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       currentY: clamp(input.currentY, 0, ALKKAGI_BOARD_SIZE),
       phase,
       at: new Date().toISOString(),
-    });
+    };
+    if (phase === 'end') {
+      this.emitSessionEvent(session, 'alkkagi.drag.updated', dragEvent);
+      return { ok: true };
+    }
+    session.lastAim = {
+      accountId: user.accountId,
+      pieceId: input.pieceId,
+      startX: dragEvent.startX,
+      startY: dragEvent.startY,
+      currentX: dragEvent.currentX,
+      currentY: dragEvent.currentY,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.updateGame(id, session.status, session.currentTurn, session.winner ?? null, session);
+    this.emitSessionEvent(session, 'alkkagi.drag.updated', dragEvent);
     return { ok: true };
   }
 
@@ -422,6 +517,66 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return saved;
   }
 
+  async pauseMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
+    if (gameKey === 'sudoku') {
+      const session = this.sudokuFromRow(await this.requireGameRow(id, 'sudoku'));
+      this.assertSudokuParticipant(user, session);
+      this.applyPause(session, user);
+      const saved = this.sudokuFromRow(await this.updateGame(id, session.status, null, null, session));
+      this.emitSudokuEvent(saved, 'game.session.paused');
+      return hideSudokuSolution(saved, user);
+    }
+    if (gameKey === 'gomoku') {
+      const session = this.gomokuFromRow(await this.requireGameRow(id, 'gomoku'));
+      this.assertGameParticipant(user, session.players.black, session.players.white);
+      this.applyPause(session, user);
+      this.clearTurnTimer(id);
+      const saved = this.gomokuFromRow(await this.updateGame(id, session.status, session.currentTurn, session.winner ?? null, session));
+      this.emitSessionEvent(saved, 'game.session.paused', saved);
+      return saved;
+    }
+    if (gameKey === 'alkkagi') {
+      const session = this.alkkagiFromRow(await this.requireGameRow(id, 'alkkagi'));
+      this.assertGameParticipant(user, session.players.red, session.players.blue);
+      this.applyPause(session, user);
+      this.clearTurnTimer(id);
+      const saved = this.alkkagiFromRow(await this.updateGame(id, session.status, session.currentTurn, session.winner ?? null, session));
+      this.emitSessionEvent(saved, 'game.session.paused', saved);
+      return saved;
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, or alkkagi');
+  }
+
+  async resumeMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
+    if (gameKey === 'sudoku') {
+      const session = this.sudokuFromRow(await this.requireGameRow(id, 'sudoku'));
+      this.assertSudokuParticipant(user, session);
+      this.applyResume(session);
+      const saved = this.sudokuFromRow(await this.updateGame(id, session.status, null, null, session));
+      this.emitSudokuEvent(saved, 'game.session.resumed');
+      return hideSudokuSolution(saved, user);
+    }
+    if (gameKey === 'gomoku') {
+      const session = this.gomokuFromRow(await this.requireGameRow(id, 'gomoku'));
+      this.assertGameParticipant(user, session.players.black, session.players.white);
+      this.applyResume(session);
+      const saved = this.gomokuFromRow(await this.updateGame(id, session.status, session.currentTurn, session.winner ?? null, session));
+      this.scheduleTurnTimer(saved, 'gomoku');
+      this.emitSessionEvent(saved, 'game.session.resumed', saved);
+      return saved;
+    }
+    if (gameKey === 'alkkagi') {
+      const session = this.alkkagiFromRow(await this.requireGameRow(id, 'alkkagi'));
+      this.assertGameParticipant(user, session.players.red, session.players.blue);
+      this.applyResume(session);
+      const saved = this.alkkagiFromRow(await this.updateGame(id, session.status, session.currentTurn, session.winner ?? null, session));
+      this.scheduleTurnTimer(saved, 'alkkagi');
+      this.emitSessionEvent(saved, 'game.session.resumed', saved);
+      return saved;
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, or alkkagi');
+  }
+
   async createSessionFromMatch(gameKey: string, requesterAccountId: string, opponentAccountId: string): Promise<string> {
     const fakeUser: AuthAccount = {
       accountId: requesterAccountId,
@@ -430,13 +585,16 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       permission: 'player',
       claims: {},
     };
+    if (gameKey === 'sudoku') {
+      return (await this.createSudokuSession(fakeUser, 'medium', opponentAccountId)).id;
+    }
     if (gameKey === 'gomoku') {
       return (await this.createGomokuSession(fakeUser, opponentAccountId, 'friend_match')).id;
     }
     if (gameKey === 'alkkagi') {
       return (await this.createAlkkagiSession(fakeUser, opponentAccountId, 'friend_match')).id;
     }
-    throw new BadRequestException('match requests support gomoku or alkkagi');
+    throw new BadRequestException('match requests support sudoku, gomoku, or alkkagi');
   }
 
   private async insertGame(
@@ -511,13 +669,87 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private assertSudokuParticipant(user: AuthAccount, session: SudokuSession): void {
+    if (session.players) {
+      this.assertGameParticipant(user, session.players.challenger, session.players.opponent);
+      return;
+    }
+    this.assertParticipant(user, session.ownerAccountId);
+  }
+
+  private sudokuSideForUser(session: SudokuSession, user: AuthAccount): SudokuSide | undefined {
+    if (!session.players) {
+      return undefined;
+    }
+    if (this.canActAs(user, session.players.challenger)) {
+      return 'challenger';
+    }
+    if (this.canActAs(user, session.players.opponent)) {
+      return 'opponent';
+    }
+    return undefined;
+  }
+
+  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession): void {
+    if (session.pause?.active) {
+      throw new BadRequestException('game is paused');
+    }
+  }
+
+  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession, user: AuthAccount): void {
+    if (session.mode !== 'friend_match' || session.status !== 'playing') {
+      throw new BadRequestException('pause is only available during matched games');
+    }
+    const counts = { ...(session.pause?.counts ?? {}) };
+    const used = counts[user.accountId] ?? 0;
+    if (used >= MATCH_PAUSE_LIMIT) {
+      throw new BadRequestException('pause request limit reached');
+    }
+    if (session.pause?.active) {
+      return;
+    }
+    const now = Date.now();
+    counts[user.accountId] = used + 1;
+    session.pause = {
+      active: true,
+      requestedByAccountId: user.accountId,
+      startedAt: new Date(now).toISOString(),
+      resumableAt: new Date(now + MATCH_PAUSE_RESUME_LOCK_MS).toISOString(),
+      counts,
+    };
+    session.updatedAt = new Date(now).toISOString();
+  }
+
+  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession): void {
+    const pause = session.pause;
+    if (session.mode !== 'friend_match' || session.status !== 'playing') {
+      throw new BadRequestException('resume is only available during matched games');
+    }
+    if (!pause?.active) {
+      return;
+    }
+    if (pause.resumableAt && Date.parse(pause.resumableAt) > Date.now()) {
+      throw new BadRequestException('pause cannot be resumed yet');
+    }
+    const pausedMs = pause.startedAt ? Math.max(0, Date.now() - Date.parse(pause.startedAt)) : 0;
+    shiftDeadline(session, 'turnStartedAt', pausedMs);
+    shiftDeadline(session, 'turnDeadlineAt', pausedMs);
+    shiftDeadline(session, 'networkGraceStartedAt', pausedMs);
+    shiftDeadline(session, 'networkGraceDeadlineAt', pausedMs);
+    session.pause = {
+      active: false,
+      counts: { ...(pause.counts ?? {}) },
+    };
+    session.updatedAt = new Date().toISOString();
+  }
+
   private canActAs(user: AuthAccount, accountId: string): boolean {
     return user.accountId === accountId || user.permission === 'superadmin';
   }
 
   private async sendSessionEmote(
-    gameKey: 'gomoku' | 'alkkagi',
-    session: GomokuSession | AlkkagiSession,
+    gameKey: 'sudoku' | 'gomoku' | 'alkkagi',
+    session: SudokuSession | GomokuSession | AlkkagiSession,
     user: AuthAccount,
     slot: number,
   ): Promise<unknown> {
@@ -562,7 +794,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     accountId: string,
     row: number,
     col: number,
-    source: 'manual' | 'timeout',
+    source: 'manual' | 'timeout' | 'ai',
   ): void {
     const color = session.currentTurn;
     session.board[row][col] = color;
@@ -582,13 +814,54 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     session.updatedAt = new Date().toISOString();
   }
 
+  private applyGomokuAiMove(session: GomokuSession): void {
+    const move = chooseGomokuAiMove(session, session.aiDifficulty ?? 'easy', Date.now() + GOMOKU_AI_BUDGET_MS);
+    if (!move) {
+      session.status = 'finished';
+      session.finishReason = 'draw';
+      session.updatedAt = new Date().toISOString();
+      return;
+    }
+    this.applyGomokuMove(session, LOCAL_AI_ACCOUNT_ID, move.row, move.col, 'ai');
+  }
+
+  private scheduleLocalGomokuAiTurn(id: string): void {
+    setTimeout(() => {
+      void this.runLocalGomokuAiTurn(id).catch((error) => {
+        // Local AI failures should not crash the API process.
+        console.error(error);
+      });
+    }, LOCAL_AI_RESPONSE_DELAY_MS);
+  }
+
+  private async runLocalGomokuAiTurn(id: string): Promise<void> {
+    const session = this.gomokuFromRow(await this.requireGameRow(id, 'gomoku'));
+    if (session.mode !== 'local_ai' || session.status !== 'playing' || !isLocalAiAccount(session.players[session.currentTurn])) {
+      return;
+    }
+    const deadline = Date.now() + GOMOKU_AI_BUDGET_MS;
+    const move = chooseGomokuAiMove(session, session.aiDifficulty ?? 'easy', deadline) ?? randomGomokuMove(session.board);
+    if (!move) {
+      session.status = 'finished';
+      session.finishReason = 'draw';
+      session.updatedAt = new Date().toISOString();
+    } else {
+      this.applyGomokuMove(session, LOCAL_AI_ACCOUNT_ID, move.row, move.col, 'ai');
+    }
+    const saved = this.gomokuFromRow(await this.updateGame(session.id, session.status, session.currentTurn, session.winner ?? null, session));
+    this.emitSessionEvent(saved, 'gomoku.move.played', saved);
+    if (saved.status === 'finished') {
+      this.emitSessionEvent(saved, 'game.session.finished', saved);
+    }
+  }
+
   private applyAlkkagiShot(
     session: AlkkagiSession,
     accountId: string,
     pieceId: string,
     vx: number,
     vy: number,
-    source: 'manual' | 'timeout',
+    source: 'manual' | 'timeout' | 'ai',
   ): AlkkagiShotResult['animation'] {
     const team = session.currentTurn;
     const piece = session.pieces.find((item) => item.id === pieceId);
@@ -616,8 +889,42 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return animation;
   }
 
+  private scheduleLocalAlkkagiAiTurn(id: string): void {
+    setTimeout(() => {
+      void this.runLocalAlkkagiAiTurn(id).catch((error) => {
+        // Local AI failures should not crash the API process.
+        console.error(error);
+      });
+    }, LOCAL_AI_RESPONSE_DELAY_MS);
+  }
+
+  private async runLocalAlkkagiAiTurn(id: string): Promise<void> {
+    const session = this.alkkagiFromRow(await this.requireGameRow(id, 'alkkagi'));
+    if (session.mode !== 'local_ai' || session.status !== 'playing' || !isLocalAiAccount(session.players[session.currentTurn])) {
+      return;
+    }
+    const deadline = Date.now() + ALKKAGI_AI_BUDGET_MS;
+    const shot = chooseAlkkagiAiShot(session, session.aiDifficulty ?? 'easy', deadline) ?? randomAlkkagiShot(session);
+    if (!shot) {
+      session.status = 'finished';
+      session.winner = session.currentTurn === 'red' ? 'blue' : 'red';
+      session.finishReason = 'no_active_piece';
+      session.updatedAt = new Date().toISOString();
+      const saved = this.alkkagiFromRow(await this.updateGame(session.id, session.status, session.currentTurn, session.winner, session));
+      this.emitSessionEvent(saved, 'alkkagi.shot.played', { session: saved, animation: { frameMs: 16, frames: [] } });
+      this.emitSessionEvent(saved, 'game.session.finished', saved);
+      return;
+    }
+    const animation = this.applyAlkkagiShot(session, LOCAL_AI_ACCOUNT_ID, shot.pieceId, shot.vx, shot.vy, 'ai');
+    const saved = this.alkkagiFromRow(await this.updateGame(session.id, session.status, session.currentTurn, session.winner ?? null, session));
+    this.emitSessionEvent(saved, 'alkkagi.shot.played', { session: saved, animation });
+    if (saved.status === 'finished') {
+      this.emitSessionEvent(saved, 'game.session.finished', saved);
+    }
+  }
+
   private startTimedTurn(session: GomokuSession | AlkkagiSession, gameKey: 'gomoku' | 'alkkagi', delayMs = 0): void {
-    if (session.mode !== 'friend_match' || session.status !== 'playing') {
+    if (session.mode !== 'friend_match' || session.status !== 'playing' || session.pause?.active) {
       return;
     }
     const now = Date.now();
@@ -662,6 +969,11 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   private async handleTurnTimer(id: string, gameKey: 'gomoku' | 'alkkagi'): Promise<void> {
     const row = await this.requireGameRow(id, gameKey);
     if (row.mode !== 'friend_match' || row.status !== 'playing') {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const state = row.state_json as { pause?: MatchPauseState };
+    if (state.pause?.active) {
       this.clearTurnTimer(id);
       return;
     }
@@ -854,8 +1166,14 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return fallback;
   }
 
-  private emitSessionEvent(session: GomokuSession | AlkkagiSession, event: string, payload: unknown): void {
-    this.realtime.emitToAccounts([...new Set(Object.values(session.players))], event, payload);
+  private emitSessionEvent(session: SudokuSession | GomokuSession | AlkkagiSession, event: string, payload: unknown): void {
+    this.realtime.emitToAccounts(sessionAccountIds(session), event, payload);
+  }
+
+  private emitSudokuEvent(session: SudokuSession, event: string): void {
+    for (const accountId of sessionAccountIds(session)) {
+      this.realtime.emitToAccounts([accountId], event, hideSudokuSolutionForAccount(session, accountId));
+    }
   }
 }
 
@@ -870,9 +1188,214 @@ function withRowDates<T extends { id: string; createdAt: string; updatedAt: stri
   };
 }
 
-function hideSudokuSolution(session: SudokuSession): Omit<SudokuSession, 'solution'> {
+function hideSudokuSolution(session: SudokuSession, user?: AuthAccount): Omit<SudokuSession, 'solution'> {
+  return hideSudokuSolutionForAccount(session, user?.accountId);
+}
+
+function hideSudokuSolutionForAccount(session: SudokuSession, accountId?: string): Omit<SudokuSession, 'solution'> {
   const { solution: _solution, ...visible } = session;
-  return visible;
+  if (!session.players || !accountId) {
+    return visible;
+  }
+  const side = sudokuSideForAccount(session, accountId) ?? 'challenger';
+  const opponent = side === 'challenger' ? 'opponent' : 'challenger';
+  return {
+    ...visible,
+    board: cloneSudokuGrid(ensureSudokuPlayerBoard(session, side)),
+    boards: undefined,
+    battle: undefined,
+    progress: {
+      [side]: sudokuProgress(session, side),
+      [opponent]: sudokuProgress(session, opponent),
+    } as Record<SudokuSide, SudokuProgress>,
+    obscuredCells: activeObscuredCells(session, side),
+    pendingDamage: session.battle?.[side]?.pendingDamage ?? 0,
+    combo: session.battle?.[side]?.combo ?? 0,
+    mySide: side,
+  } as Omit<SudokuSession, 'solution'> & {
+    obscuredCells: Array<{ row: number; col: number; until: string }>;
+    pendingDamage: number;
+    combo: number;
+    mySide: SudokuSide;
+  };
+}
+
+function cloneSudokuGrid(grid: number[][]): number[][] {
+  return grid.map((row) => [...row]);
+}
+
+function ensureSudokuPlayerBoard(session: SudokuSession, side: SudokuSide): number[][] {
+  session.boards ??= {
+    challenger: cloneSudokuGrid(session.board),
+    opponent: cloneSudokuGrid(session.board),
+  };
+  session.boards[side] ??= cloneSudokuGrid(session.board);
+  return session.boards[side];
+}
+
+function sudokuSideForAccount(session: SudokuSession, accountId: string): SudokuSide | undefined {
+  if (session.players?.challenger === accountId) return 'challenger';
+  if (session.players?.opponent === accountId) return 'opponent';
+  return undefined;
+}
+
+function createSudokuProgressMap(session: SudokuSession): Record<SudokuSide, SudokuProgress> {
+  return {
+    challenger: sudokuProgress(session, 'challenger'),
+    opponent: sudokuProgress(session, 'opponent'),
+  };
+}
+
+function sudokuProgress(session: SudokuSession, side: SudokuSide): SudokuProgress {
+  const board = ensureSudokuPlayerBoard(session, side);
+  let total = 0;
+  let filled = 0;
+  for (let row = 0; row < 9; row += 1) {
+    for (let col = 0; col < 9; col += 1) {
+      if (session.puzzle[row][col] === 0) {
+        total += 1;
+        if (board[row][col] !== 0) filled += 1;
+      }
+    }
+  }
+  return {
+    filled,
+    total,
+    percent: total === 0 ? 100 : Math.round((filled / total) * 1000) / 10,
+  };
+}
+
+function createSudokuBattleState(board: number[][], solution: number[][]): SudokuBattleState {
+  return {
+    combo: 0,
+    pendingDamage: 0,
+    completedUnits: completedSudokuUnits(board, solution),
+    obscuredCells: [],
+  };
+}
+
+function applySudokuBattleMove(session: SudokuSession, side: SudokuSide): void {
+  if (!session.players) return;
+  const opponent = side === 'challenger' ? 'opponent' : 'challenger';
+  session.battle ??= {
+    challenger: createSudokuBattleState(ensureSudokuPlayerBoard(session, 'challenger'), session.solution),
+    opponent: createSudokuBattleState(ensureSudokuPlayerBoard(session, 'opponent'), session.solution),
+  };
+  const self = session.battle[side];
+  const rival = session.battle[opponent];
+  self.obscuredCells = activeObscuredCells(session, side);
+  rival.obscuredCells = activeObscuredCells(session, opponent);
+
+  const board = ensureSudokuPlayerBoard(session, side);
+  const previousUnits = new Set(self.completedUnits);
+  const nextUnits = completedSudokuUnits(board, session.solution);
+  const completedThisMove = nextUnits.some((unit) => !previousUnits.has(unit));
+  self.completedUnits = nextUnits;
+
+  if (self.pendingDamage > 0) {
+    if (completedThisMove) {
+      self.pendingDamage = 0;
+    } else {
+      self.obscuredCells = applySudokuObscure(session, side, self.pendingDamage);
+      self.pendingDamage = 0;
+    }
+  }
+
+  if (!completedThisMove) {
+    self.combo = 0;
+    return;
+  }
+  self.combo += 1;
+  rival.pendingDamage += sudokuDamageForCombo(self.combo);
+}
+
+function completedSudokuUnits(board: number[][], solution: number[][]): string[] {
+  const units: string[] = [];
+  for (let row = 0; row < 9; row += 1) {
+    if (Array.from({ length: 9 }, (_, col) => board[row][col] === solution[row][col]).every(Boolean)) {
+      units.push(`r${row}`);
+    }
+  }
+  for (let col = 0; col < 9; col += 1) {
+    if (Array.from({ length: 9 }, (_, row) => board[row][col] === solution[row][col]).every(Boolean)) {
+      units.push(`c${col}`);
+    }
+  }
+  for (let boxRow = 0; boxRow < 3; boxRow += 1) {
+    for (let boxCol = 0; boxCol < 3; boxCol += 1) {
+      const complete = Array.from({ length: 9 }, (_, index) => {
+        const row = boxRow * 3 + Math.floor(index / 3);
+        const col = boxCol * 3 + (index % 3);
+        return board[row][col] === solution[row][col];
+      }).every(Boolean);
+      if (complete) units.push(`b${boxRow}${boxCol}`);
+    }
+  }
+  return units;
+}
+
+function sudokuDamageForCombo(combo: number): number {
+  if (combo <= 0) return 0;
+  if (combo === 1) return 1;
+  if (combo === 2) return 2;
+  return 5 + (combo - 3) * 3;
+}
+
+function activeObscuredCells(session: SudokuSession, side: SudokuSide): Array<{ row: number; col: number; until: string }> {
+  const now = Date.now();
+  return (session.battle?.[side]?.obscuredCells ?? []).filter((cell) => Date.parse(cell.until) > now);
+}
+
+function applySudokuObscure(session: SudokuSession, side: SudokuSide, amount: number): Array<{ row: number; col: number; until: string }> {
+  const existing = activeObscuredCells(session, side);
+  const existingKeys = new Set(existing.map((cell) => `${cell.row}:${cell.col}`));
+  const candidates: Array<{ row: number; col: number }> = [];
+  for (let row = 0; row < 9; row += 1) {
+    for (let col = 0; col < 9; col += 1) {
+      if (session.puzzle[row][col] !== 0 && !existingKeys.has(`${row}:${col}`)) {
+        candidates.push({ row, col });
+      }
+    }
+  }
+  const seed = Math.abs(hashText(`${session.id}:${side}:${Date.now()}`));
+  const selected: Array<{ row: number; col: number; until: string }> = [];
+  for (let index = 0; index < Math.min(amount, candidates.length); index += 1) {
+    const pick = (seed + index * 17) % candidates.length;
+    const [candidate] = candidates.splice(pick, 1);
+    selected.push({
+      ...candidate,
+      until: new Date(Date.now() + SUDOKU_OBSCURE_MS).toISOString(),
+    });
+  }
+  return [...existing, ...selected];
+}
+
+function hashText(value: string): number {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash << 5) - hash + value.charCodeAt(index)) | 0;
+  }
+  return hash;
+}
+
+function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession): string[] {
+  if ('players' in session && session.players) {
+    return [...new Set(Object.values(session.players).filter((accountId) => !isLocalAiAccount(accountId)))];
+  }
+  if ('ownerAccountId' in session) {
+    return [session.ownerAccountId].filter(Boolean);
+  }
+  return [];
+}
+
+function isLocalAiAccount(accountId: string): boolean {
+  return accountId === LOCAL_AI_ACCOUNT_ID;
+}
+
+function shiftDeadline(session: SudokuSession | GomokuSession | AlkkagiSession, key: 'turnStartedAt' | 'turnDeadlineAt' | 'networkGraceStartedAt' | 'networkGraceDeadlineAt', deltaMs: number): void {
+  const value = session[key];
+  if (!value || deltaMs <= 0) return;
+  session[key] = new Date(Date.parse(value) + deltaMs).toISOString();
 }
 
 function validateEmoteSlot(slot: number): void {
@@ -962,6 +1485,194 @@ function count(board: (PlayerColor | null)[][], row: number, col: number, dr: nu
   return total;
 }
 
+interface GomokuAiMove {
+  row: number;
+  col: number;
+}
+
+function chooseGomokuAiMove(session: GomokuSession, difficulty: Difficulty, deadlineMs = Date.now() + GOMOKU_AI_BUDGET_MS): GomokuAiMove | undefined {
+  const ai = session.currentTurn;
+  const opponent = oppositeGomokuColor(ai);
+  const winNow = findImmediateGomokuMove(session.board, ai);
+  if (winNow) return winNow;
+  if (Date.now() >= deadlineMs) return randomGomokuMove(session.board);
+  const blockNow = findImmediateGomokuMove(session.board, opponent);
+  if (blockNow && (difficulty !== 'easy' || Math.random() < 0.7)) return blockNow;
+  if (Date.now() >= deadlineMs) return randomGomokuMove(session.board);
+
+  const ranked = rankedGomokuCandidates(session.board, ai, difficulty);
+  if (ranked.length === 0) return undefined;
+  if (difficulty === 'easy') {
+    const loosePool = ranked.slice(0, Math.min(ranked.length, 10));
+    return loosePool[Math.floor(Math.random() * loosePool.length)];
+  }
+
+  const depth = difficulty === 'hard' ? 3 : 2;
+  const limit = difficulty === 'hard' ? 18 : 12;
+  let bestScore = Number.NEGATIVE_INFINITY;
+  const best: GomokuAiMove[] = [];
+  for (const move of ranked.slice(0, limit)) {
+    if (Date.now() >= deadlineMs) break;
+    session.board[move.row][move.col] = ai;
+    const score = hasFive(session.board, move.row, move.col, ai)
+      ? 10_000_000
+      : gomokuMinimax(session.board, opponent, ai, depth - 1, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY, deadlineMs);
+    session.board[move.row][move.col] = null;
+    if (score > bestScore) {
+      bestScore = score;
+      best.length = 0;
+      best.push(move);
+    } else if (score === bestScore) {
+      best.push(move);
+    }
+  }
+  if (best.length === 0) {
+    return ranked[0] ?? randomGomokuMove(session.board);
+  }
+  const pool = difficulty === 'medium' ? best.slice(0, 3) : best;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function gomokuMinimax(
+  board: (PlayerColor | null)[][],
+  current: PlayerColor,
+  ai: PlayerColor,
+  depth: number,
+  alpha: number,
+  beta: number,
+  deadlineMs: number,
+): number {
+  if (depth <= 0 || Date.now() >= deadlineMs) {
+    return evaluateGomokuBoard(board, ai);
+  }
+  const candidates = rankedGomokuCandidates(board, current, 'medium').slice(0, 14);
+  if (candidates.length === 0) {
+    return evaluateGomokuBoard(board, ai);
+  }
+  const maximizing = current === ai;
+  let best = maximizing ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY;
+  const next = oppositeGomokuColor(current);
+  for (const move of candidates) {
+    if (Date.now() >= deadlineMs) break;
+    board[move.row][move.col] = current;
+    const score = hasFive(board, move.row, move.col, current)
+      ? (maximizing ? 10_000_000 + depth : -10_000_000 - depth)
+      : gomokuMinimax(board, next, ai, depth - 1, alpha, beta, deadlineMs);
+    board[move.row][move.col] = null;
+    if (maximizing) {
+      best = Math.max(best, score);
+      alpha = Math.max(alpha, best);
+    } else {
+      best = Math.min(best, score);
+      beta = Math.min(beta, best);
+    }
+    if (beta <= alpha) break;
+  }
+  return best;
+}
+
+function randomGomokuMove(board: (PlayerColor | null)[][]): GomokuAiMove | undefined {
+  const empty = availableGomokuCells(board);
+  if (empty.length === 0) return undefined;
+  const [row, col] = empty[Math.floor(Math.random() * empty.length)];
+  return { row, col };
+}
+
+function rankedGomokuCandidates(board: (PlayerColor | null)[][], color: PlayerColor, difficulty: Difficulty): GomokuAiMove[] {
+  const candidates = gomokuCandidateCells(board, difficulty === 'hard' ? 2 : 1);
+  const opponent = oppositeGomokuColor(color);
+  return candidates
+    .map((move) => {
+      board[move.row][move.col] = color;
+      const attack = hasFive(board, move.row, move.col, color) ? 9_000_000 : evaluateGomokuBoard(board, color);
+      board[move.row][move.col] = opponent;
+      const defense = hasFive(board, move.row, move.col, opponent) ? 8_000_000 : evaluateGomokuBoard(board, opponent) * 0.82;
+      board[move.row][move.col] = null;
+      const center = 7 - Math.abs(move.row - 7) - Math.abs(move.col - 7) * 0.08;
+      return { ...move, score: attack + defense + center + Math.random() * (difficulty === 'easy' ? 900 : 4) };
+    })
+    .sort((left, right) => right.score - left.score)
+    .map(({ row, col }) => ({ row, col }));
+}
+
+function gomokuCandidateCells(board: (PlayerColor | null)[][], radius: number): GomokuAiMove[] {
+  const occupied: GomokuAiMove[] = [];
+  for (let row = 0; row < GOMOKU_SIZE; row += 1) {
+    for (let col = 0; col < GOMOKU_SIZE; col += 1) {
+      if (board[row][col] !== null) occupied.push({ row, col });
+    }
+  }
+  if (occupied.length === 0) {
+    return [{ row: 7, col: 7 }];
+  }
+  const seen = new Set<string>();
+  const cells: GomokuAiMove[] = [];
+  for (const stone of occupied) {
+    for (let row = Math.max(0, stone.row - radius); row <= Math.min(GOMOKU_SIZE - 1, stone.row + radius); row += 1) {
+      for (let col = Math.max(0, stone.col - radius); col <= Math.min(GOMOKU_SIZE - 1, stone.col + radius); col += 1) {
+        const key = `${row}:${col}`;
+        if (board[row][col] === null && !seen.has(key)) {
+          seen.add(key);
+          cells.push({ row, col });
+        }
+      }
+    }
+  }
+  return cells.length === 0 ? availableGomokuCells(board).map(([row, col]) => ({ row, col })) : cells;
+}
+
+function findImmediateGomokuMove(board: (PlayerColor | null)[][], color: PlayerColor): GomokuAiMove | undefined {
+  for (const move of gomokuCandidateCells(board, 1)) {
+    board[move.row][move.col] = color;
+    const wins = hasFive(board, move.row, move.col, color);
+    board[move.row][move.col] = null;
+    if (wins) return move;
+  }
+  return undefined;
+}
+
+function evaluateGomokuBoard(board: (PlayerColor | null)[][], ai: PlayerColor): number {
+  let score = 0;
+  const directions = [
+    [1, 0],
+    [0, 1],
+    [1, 1],
+    [1, -1],
+  ];
+  for (let row = 0; row < GOMOKU_SIZE; row += 1) {
+    for (let col = 0; col < GOMOKU_SIZE; col += 1) {
+      for (const [dr, dc] of directions) {
+        const endRow = row + dr * 4;
+        const endCol = col + dc * 4;
+        if (endRow < 0 || endRow >= GOMOKU_SIZE || endCol < 0 || endCol >= GOMOKU_SIZE) continue;
+        let own = 0;
+        let enemy = 0;
+        for (let step = 0; step < 5; step += 1) {
+          const cell = board[row + dr * step][col + dc * step];
+          if (cell === ai) own += 1;
+          else if (cell !== null) enemy += 1;
+        }
+        score += gomokuWindowScore(own, enemy);
+      }
+    }
+  }
+  return score;
+}
+
+function gomokuWindowScore(own: number, enemy: number): number {
+  if (own > 0 && enemy > 0) return 0;
+  if (own === 5) return 10_000_000;
+  if (enemy === 5) return -10_000_000;
+  const values = [0, 12, 120, 1_400, 75_000, 10_000_000];
+  if (own > 0) return values[own];
+  if (enemy > 0) return -values[enemy] * 1.08;
+  return 0;
+}
+
+function oppositeGomokuColor(color: PlayerColor): PlayerColor {
+  return color === 'black' ? 'white' : 'black';
+}
+
 function initialAlkkagiPieces(): AlkkagiPiece[] {
   const left = 110;
   const top = 70;
@@ -1007,7 +1718,196 @@ function piece(id: string, team: PieceTeam, rank: string, x: number, y: number, 
   return { id, team, rank, x, y, radius, mass, vx: 0, vy: 0, active: true };
 }
 
-function simulateAlkkagi(pieces: AlkkagiPiece[]): { frameMs: number; frames: AlkkagiPiece[][] } {
+interface AlkkagiAiShot {
+  pieceId: string;
+  vx: number;
+  vy: number;
+}
+
+interface AlkkagiSimulationOptions {
+  ignoreHinges?: boolean;
+}
+
+function chooseAlkkagiAiShot(session: AlkkagiSession, difficulty: Difficulty, deadlineMs = Date.now() + ALKKAGI_AI_BUDGET_MS): AlkkagiAiShot | undefined {
+  const team = session.currentTurn;
+  const candidates = generateAlkkagiShotCandidates(session, difficulty);
+  if (candidates.length === 0) return undefined;
+  const ignoreHingesInEvaluation = difficulty === 'easy' && Math.random() < 0.3;
+  const scored: Array<AlkkagiAiShot & { score: number }> = [];
+  for (const candidate of candidates) {
+    if (Date.now() >= deadlineMs) break;
+    const real = evaluateAlkkagiShot(session.pieces, team, candidate, {});
+    if (real.selfLostWeight > 0.01 && real.enemyLostWeight <= 0.01) {
+      continue;
+    }
+    const evaluated = ignoreHingesInEvaluation
+      ? evaluateAlkkagiShot(session.pieces, team, candidate, { ignoreHinges: true })
+      : real;
+    let score = evaluated.score;
+    if (difficulty === 'hard') {
+      score -= Math.max(0, bestAlkkagiResponseScore(evaluated.pieces, oppositeAlkkagiTeam(team), deadlineMs)) * 0.52;
+    }
+    const noise = difficulty === 'easy' ? 240 : difficulty === 'medium' ? 40 : 5;
+    scored.push({ ...candidate, score: score + (Math.random() - 0.5) * noise });
+  }
+  const fallback = scored.length > 0 ? scored : candidates.map((candidate) => ({ ...candidate, score: Math.random() * 100 }));
+  fallback.sort((left, right) => right.score - left.score);
+  if (difficulty === 'easy') {
+    const pool = fallback.slice(0, Math.max(1, Math.ceil(fallback.length * 0.55)));
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+  if (difficulty === 'medium') {
+    const pool = fallback.slice(0, Math.min(5, fallback.length));
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+  return fallback[0];
+}
+
+function randomAlkkagiShot(session: AlkkagiSession): AlkkagiAiShot | undefined {
+  const pieces = session.pieces.filter((item) => item.active && item.team === session.currentTurn);
+  if (pieces.length === 0) return undefined;
+  const pieceItem = pieces[Math.floor(Math.random() * pieces.length)];
+  const angle = Math.random() * Math.PI * 2;
+  const speed = 12 + Math.random() * 24;
+  return {
+    pieceId: pieceItem.id,
+    vx: Math.cos(angle) * speed,
+    vy: Math.sin(angle) * speed,
+  };
+}
+
+function generateAlkkagiShotCandidates(session: AlkkagiSession, difficulty: Difficulty): AlkkagiAiShot[] {
+  const team = session.currentTurn;
+  const own = session.pieces.filter((item) => item.active && item.team === team);
+  const enemies = session.pieces.filter((item) => item.active && item.team !== team);
+  if (own.length === 0) return [];
+  const limit = difficulty === 'easy' ? 22 : difficulty === 'medium' ? 72 : 170;
+  const candidates: AlkkagiAiShot[] = [];
+  for (const pieceItem of shuffle([...own])) {
+    for (const enemy of shuffle([...enemies]).slice(0, difficulty === 'hard' ? enemies.length : 5)) {
+      const dx = enemy.x - pieceItem.x;
+      const dy = enemy.y - pieceItem.y;
+      const distance = Math.max(1, Math.hypot(dx, dy));
+      const nx = dx / distance;
+      const ny = dy / distance;
+      const baseSpeed = clamp(distance / 23, 10, difficulty === 'easy' ? 30 : 38);
+      const spread = difficulty === 'easy' ? 0.42 : difficulty === 'medium' ? 0.22 : 0.1;
+      for (const multiplier of difficulty === 'easy' ? [0.75, 1.05] : [0.72, 0.94, 1.15]) {
+        const angle = (Math.random() - 0.5) * spread;
+        const cosValue = Math.cos(angle);
+        const sinValue = Math.sin(angle);
+        candidates.push({
+          pieceId: pieceItem.id,
+          vx: clamp((nx * cosValue - ny * sinValue) * baseSpeed * multiplier, -40, 40),
+          vy: clamp((nx * sinValue + ny * cosValue) * baseSpeed * multiplier, -40, 40),
+        });
+      }
+    }
+  }
+  while (candidates.length < limit) {
+    const pieceItem = own[Math.floor(Math.random() * own.length)];
+    const angle = Math.random() * Math.PI * 2;
+    const speed = difficulty === 'easy' ? 10 + Math.random() * 20 : 12 + Math.random() * 27;
+    candidates.push({
+      pieceId: pieceItem.id,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+    });
+  }
+  return shuffle(candidates).slice(0, limit);
+}
+
+function evaluateAlkkagiShot(
+  sourcePieces: AlkkagiPiece[],
+  team: PieceTeam,
+  shot: AlkkagiAiShot,
+  options: AlkkagiSimulationOptions,
+): { score: number; selfLostWeight: number; enemyLostWeight: number; pieces: AlkkagiPiece[] } {
+  const pieces = clonePieces(sourcePieces);
+  const pieceItem = pieces.find((item) => item.id === shot.pieceId && item.active && item.team === team);
+  if (!pieceItem) {
+    return { score: Number.NEGATIVE_INFINITY, selfLostWeight: 0, enemyLostWeight: 0, pieces };
+  }
+  const beforeOwn = alkkagiMaterial(sourcePieces, team);
+  const beforeEnemy = alkkagiMaterial(sourcePieces, oppositeAlkkagiTeam(team));
+  pieceItem.vx = shot.vx;
+  pieceItem.vy = shot.vy;
+  simulateAlkkagi(pieces, options);
+  const afterOwn = alkkagiMaterial(pieces, team);
+  const afterEnemy = alkkagiMaterial(pieces, oppositeAlkkagiTeam(team));
+  const selfLostWeight = beforeOwn - afterOwn;
+  const enemyLostWeight = beforeEnemy - afterEnemy;
+  const score =
+    enemyLostWeight * 140 -
+    selfLostWeight * 170 +
+    alkkagiPositionScore(pieces, team) -
+    alkkagiPositionScore(pieces, oppositeAlkkagiTeam(team)) * 0.35;
+  return { score, selfLostWeight, enemyLostWeight, pieces };
+}
+
+function bestAlkkagiResponseScore(pieces: AlkkagiPiece[], responseTeam: PieceTeam, deadlineMs: number): number {
+  const pseudoSession: AlkkagiSession = {
+    id: 'ai-response',
+    mode: 'local_ai',
+    currentTurn: responseTeam,
+    status: 'playing',
+    players: { red: '', blue: '' },
+    pieces: clonePieces(pieces),
+    shots: [],
+    createdAt: '',
+    updatedAt: '',
+  };
+  let best = 0;
+  for (const candidate of generateAlkkagiShotCandidates(pseudoSession, 'medium').slice(0, 34)) {
+    if (Date.now() >= deadlineMs) break;
+    const evaluated = evaluateAlkkagiShot(pieces, responseTeam, candidate, {});
+    best = Math.max(best, evaluated.score);
+  }
+  return best;
+}
+
+function alkkagiMaterial(pieces: AlkkagiPiece[], team: PieceTeam): number {
+  return pieces
+    .filter((item) => item.active && item.team === team)
+    .reduce((total, item) => total + alkkagiPieceValue(item), 0);
+}
+
+function alkkagiPieceValue(pieceItem: AlkkagiPiece): number {
+  const rankValue = {
+    general: 5,
+    chariot: 3.2,
+    cannon: 2.8,
+    horse: 2.4,
+    elephant: 2.4,
+    guard: 1.8,
+    soldier: 1,
+  }[pieceItem.rank ?? 'soldier'] ?? 1;
+  return rankValue * pieceMass(pieceItem);
+}
+
+function alkkagiPositionScore(pieces: AlkkagiPiece[], team: PieceTeam): number {
+  return pieces
+    .filter((item) => item.active && item.team === team)
+    .reduce((total, item) => {
+      const edgeDistance = Math.min(item.x, item.y, ALKKAGI_BOARD_SIZE - item.x, ALKKAGI_BOARD_SIZE - item.y);
+      const centerDistance = Math.hypot(item.x - 500, item.y - 500);
+      return total + clamp(edgeDistance / 40, 0, 7) - centerDistance / 900;
+    }, 0);
+}
+
+function oppositeAlkkagiTeam(team: PieceTeam): PieceTeam {
+  return team === 'red' ? 'blue' : 'red';
+}
+
+function shuffle<T>(items: T[]): T[] {
+  for (let index = items.length - 1; index > 0; index -= 1) {
+    const target = Math.floor(Math.random() * (index + 1));
+    [items[index], items[target]] = [items[target], items[index]];
+  }
+  return items;
+}
+
+function simulateAlkkagi(pieces: AlkkagiPiece[], options: AlkkagiSimulationOptions = {}): { frameMs: number; frames: AlkkagiPiece[][] } {
   const frames: AlkkagiPiece[][] = [clonePieces(pieces)];
   for (let tick = 0; tick < 260; tick += 1) {
     for (const item of pieces.filter((pieceItem) => pieceItem.active)) {
@@ -1025,7 +1925,9 @@ function simulateAlkkagi(pieces: AlkkagiPiece[]): { frameMs: number; frames: Alk
       }
     }
     const activePieces = pieces.filter((item) => item.active);
-    resolveHingeCollisions(activePieces);
+    if (!options.ignoreHinges) {
+      resolveHingeCollisions(activePieces);
+    }
     resolveCollisions(activePieces);
     if (tick % 4 === 0) {
       frames.push(clonePieces(pieces));
@@ -1047,8 +1949,16 @@ function simulateAlkkagi(pieces: AlkkagiPiece[]): { frameMs: number; frames: Alk
 function resolveHingeCollisions(pieces: AlkkagiPiece[]): void {
   for (const item of pieces) {
     for (const hinge of ALKKAGI_HINGES) {
-      const dx = item.x - hinge.x;
-      const dy = item.y - hinge.y;
+      const segmentX = hinge.x2 - hinge.x1;
+      const segmentY = hinge.y2 - hinge.y1;
+      const segmentLengthSquared = segmentX * segmentX + segmentY * segmentY;
+      const t = segmentLengthSquared === 0
+        ? 0
+        : clamp(((item.x - hinge.x1) * segmentX + (item.y - hinge.y1) * segmentY) / segmentLengthSquared, 0, 1);
+      const closestX = hinge.x1 + segmentX * t;
+      const closestY = hinge.y1 + segmentY * t;
+      const dx = item.x - closestX;
+      const dy = item.y - closestY;
       const distance = Math.hypot(dx, dy);
       const minDistance = pieceRadius(item) + hinge.radius;
       if (distance <= 0 || distance >= minDistance) continue;

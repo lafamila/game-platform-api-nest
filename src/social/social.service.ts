@@ -92,9 +92,14 @@ export class SocialService {
   }
 
   async createFriendRequest(user: AuthAccount, recipientAccountId: string) {
+    this.assertCanMatch(user);
     await this.cacheAuthAccount(user);
     if (recipientAccountId === user.accountId) {
       throw new BadRequestException('cannot add yourself');
+    }
+    const recipientStatus = await this.fetchPermissionUpgradeStatus(recipientAccountId);
+    if (!hasPlayerPermissionKey(recipientStatus.currentPermission)) {
+      throw new ForbiddenException('friend requests require a player account');
     }
     if (await this.areFriends(user.accountId, recipientAccountId)) {
       throw new BadRequestException('already friends');
@@ -263,8 +268,8 @@ export class SocialService {
 
   async createMatchRequest(user: AuthAccount, input: { gameKey: string; opponentAccountId: string }) {
     this.assertCanMatch(user);
-    if (!['gomoku', 'alkkagi'].includes(input.gameKey)) {
-      throw new BadRequestException('gameKey must be gomoku or alkkagi');
+    if (!['sudoku', 'gomoku', 'alkkagi'].includes(input.gameKey)) {
+      throw new BadRequestException('gameKey must be sudoku, gomoku, or alkkagi');
     }
     if (input.opponentAccountId === user.accountId) {
       throw new BadRequestException('opponent must be another account');
@@ -357,7 +362,19 @@ export class SocialService {
       throw new BadRequestException(await responseText(response, 'Permission upgrade request failed'));
     }
     const body = await response.json();
-    return { alreadyAllowed: false, request: body };
+    return { alreadyAllowed: false, status: 'pending', request: body };
+  }
+
+  async getPermissionUpgradeStatus(session: GamePlatformSession | undefined) {
+    if (!session) {
+      throw new UnauthorizedException('Game-platform session is required');
+    }
+    const status = await this.fetchPermissionUpgradeStatus(session.account.accountId);
+    return {
+      ...status,
+      sessionPermission: session.account.permission,
+      hasPlayerAccess: hasPlayerAccess(session.account),
+    };
   }
 
   private assertCanMatch(user: AuthAccount): void {
@@ -404,6 +421,35 @@ export class SocialService {
       status: '',
       permissionKey: user.permission,
     }]);
+  }
+
+  private async fetchPermissionUpgradeStatus(accountId: string): Promise<{
+    accountId: string;
+    serviceKey: string;
+    currentPermission: string | null;
+    status: 'none' | 'pending' | 'approved' | 'rejected';
+    application?: unknown;
+  }> {
+    const serviceKey = env('AUTH_SERVICE_KEY', 'game-platform');
+    const url = new URL('/api/internal/service-applications/status', env('AUTH_API_BASE_URL', 'http://localhost:3032'));
+    url.searchParams.set('serviceKey', serviceKey);
+    url.searchParams.set('accountId', accountId);
+    const response = await fetch(url, {
+      headers: {
+        'x-auth-service-key-id': env('AUTH_SERVICE_KEY_ID'),
+        'x-auth-service-secret': env('AUTH_SERVICE_SECRET'),
+      },
+    });
+    if (!response.ok) {
+      throw new BadRequestException(await responseText(response, 'Permission status lookup failed'));
+    }
+    return (await response.json()) as {
+      accountId: string;
+      serviceKey: string;
+      currentPermission: string | null;
+      status: 'none' | 'pending' | 'approved' | 'rejected';
+      application?: unknown;
+    };
   }
 
   private async cacheAccounts(accounts: SocialAccountView[]): Promise<void> {
@@ -500,6 +546,10 @@ function accountViewFromRow(row: SocialAccountRow): SocialAccountView {
     status: row.status,
     permissionKey: row.permission_key,
   };
+}
+
+function hasPlayerPermissionKey(permission: string | null | undefined): boolean {
+  return ['player', 'premium', 'superadmin'].includes(String(permission ?? '').toLowerCase());
 }
 
 function friendRequestView(row: FriendRequestRow, accounts: Map<string, SocialAccountView>) {

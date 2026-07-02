@@ -2,7 +2,7 @@ import { Body, Controller, Get, Post, Query, Req, Res, UseGuards } from '@nestjs
 import { Request, Response } from 'express';
 import { env, intEnv } from '../config/env';
 import { CurrentUser } from './current-user';
-import { AuthAccount } from './auth.types';
+import { AuthAccount, RequestWithAuth } from './auth.types';
 import { GamePlatformSessionGuard, setSessionCookie } from './session.guard';
 import { GamePlatformSessionService, sessionResponse } from './session.service';
 
@@ -49,6 +49,17 @@ export class SessionController {
   @Get('me')
   me(@CurrentUser() account: AuthAccount) {
     return account;
+  }
+
+  @UseGuards(GamePlatformSessionGuard)
+  @Post('refresh')
+  async refresh(
+    @Req() request: Request & Partial<RequestWithAuth>,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const session = await this.sessions.refreshSessionNow(request.gameSession);
+    setSessionCookie(response, session.id, intEnv('GAME_PLATFORM_SESSION_MAX_AGE_SECONDS', 604800));
+    return sessionResponse(session);
   }
 
   @Post('logout')

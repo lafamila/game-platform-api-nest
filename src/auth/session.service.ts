@@ -13,6 +13,8 @@ interface TokenResponse {
 
 @Injectable()
 export class GamePlatformSessionService {
+  private readonly refreshLocks = new Map<string, Promise<GamePlatformSession>>();
+
   constructor(
     private readonly db: DatabaseService,
     private readonly auth: AuthService,
@@ -166,7 +168,7 @@ export class GamePlatformSessionService {
     }
     let session = rowToSession(row);
     if (session.accessTokenExpiresAt - Date.now() <= 30_000) {
-      session = await this.refreshSession(session);
+      session = await this.refreshSessionLocked(session);
     }
     await this.db.query(`UPDATE app_sessions SET last_seen_at = now() WHERE id = $1`, [session.id]);
     return session;
@@ -206,6 +208,13 @@ export class GamePlatformSessionService {
         body: JSON.stringify({ token: session.refreshToken }),
       }).catch(() => undefined);
     }
+  }
+
+  async refreshSessionNow(session: GamePlatformSession | undefined): Promise<GamePlatformSession> {
+    if (!session?.refreshToken) {
+      throw new UnauthorizedException('Refreshable game-platform session is required');
+    }
+    return this.refreshSessionLocked(session);
   }
 
   private buildAuthorizeUrl(transaction: LoginTransaction): string {
@@ -346,6 +355,24 @@ export class GamePlatformSessionService {
       ],
     );
     return refreshed;
+  }
+
+  private refreshSessionLocked(session: GamePlatformSession): Promise<GamePlatformSession> {
+    const existing = this.refreshLocks.get(session.id);
+    if (existing) {
+      return existing;
+    }
+    const refresh = this.refreshSession(session).catch(async (error: unknown) => {
+      if (error instanceof UnauthorizedException) {
+        await this.db.query(`DELETE FROM app_sessions WHERE id = $1`, [session.id]);
+        throw new UnauthorizedException('Game-platform session expired. Please login again');
+      }
+      throw error;
+    }).finally(() => {
+      this.refreshLocks.delete(session.id);
+    });
+    this.refreshLocks.set(session.id, refresh);
+    return refresh;
   }
 
   private async markTransactionFailed(id: string, errorCode: string, error: string): Promise<void> {

@@ -30,8 +30,8 @@ export class GamesController {
   }
 
   @Post('sudoku/sessions')
-  createSudoku(@CurrentUser() user: AuthAccount, @Body() body: { difficulty?: Difficulty }) {
-    return this.games.createSudokuSession(user, body.difficulty ?? 'easy');
+  createSudoku(@CurrentUser() user: AuthAccount, @Body() body: { difficulty?: Difficulty; opponentAccountId?: string }) {
+    return this.games.createSudokuSession(user, body.difficulty ?? 'easy', body.opponentAccountId);
   }
 
   @Get('sudoku/sessions/:id')
@@ -49,9 +49,24 @@ export class GamesController {
     return this.games.submitSudoku(id, user, body.board);
   }
 
+  @Post('sudoku/sessions/:id/emotes')
+  sendSudokuEmote(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { slot: number }) {
+    return this.games.sendSudokuEmote(id, user, Number(body.slot));
+  }
+
+  @Post('games/:gameKey/sessions/:id/pause')
+  pauseGame(@Param('gameKey') gameKey: string, @Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.pauseMatchedGame(gameKey, id, user);
+  }
+
+  @Post('games/:gameKey/sessions/:id/resume')
+  resumeGame(@Param('gameKey') gameKey: string, @Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.resumeMatchedGame(gameKey, id, user);
+  }
+
   @Post('gomoku/sessions')
-  createGomoku(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string }) {
-    return this.games.createGomokuSession(user, body.opponentAccountId);
+  createGomoku(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
+    return this.games.createGomokuSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'easy');
   }
 
   @Get('gomoku/sessions/:id')
@@ -75,8 +90,8 @@ export class GamesController {
   }
 
   @Post('alkkagi/sessions')
-  createAlkkagi(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string }) {
-    return this.games.createAlkkagiSession(user, body.opponentAccountId);
+  createAlkkagi(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
+    return this.games.createAlkkagiSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'easy');
   }
 
   @Get('alkkagi/sessions/:id')

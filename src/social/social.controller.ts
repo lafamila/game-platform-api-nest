@@ -70,6 +70,11 @@ export class SocialController {
     return this.social.createPermissionUpgradeRequest(request.gameSession);
   }
 
+  @Get('permission-upgrade-requests/me')
+  getPermissionUpgradeRequest(@Req() request: Request & Partial<RequestWithAuth>) {
+    return this.social.getPermissionUpgradeStatus(request.gameSession);
+  }
+
   @Post('matches/:id/accept')
   acceptMatch(@CurrentUser() user: AuthAccount, @Param('id') id: string) {
     return this.social.acceptMatchRequest(user, id);
