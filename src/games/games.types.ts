@@ -179,6 +179,7 @@ export interface SokobanSession {
   states?: Record<SokobanSide, SokobanPlayerState>;
   winnerAccountId?: string;
   winnerSide?: SokobanSide;
+  mySide?: SokobanSide;
   pause?: MatchPauseState;
   status: 'playing' | 'finished';
   finishReason?: string;

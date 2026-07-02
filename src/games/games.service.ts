@@ -666,13 +666,21 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.assertNotPaused(session);
     const side = this.sokobanSideForUser(session, user);
     const playerState = side ? ensureSokobanPlayerState(session, side) : session.state;
-    applySokobanMove(session, playerState, direction);
-    if (playerState.solved) {
+    const moved = applySokobanMove(session, playerState, direction);
+    if (moved && playerState.solved) {
       session.status = 'finished';
       session.solvedAt = new Date().toISOString();
       session.winnerSide = side ?? 'challenger';
       session.winnerAccountId = side ? session.players?.[side] : session.ownerAccountId;
       session.finishReason = side ? 'first_clear' : 'solo_clear';
+    } else if (moved && !isSokobanStateSolvable(session, playerState)) {
+      session.status = 'finished';
+      session.finishReason = 'deadlock';
+      if (side && session.players) {
+        const winner = side === 'challenger' ? 'opponent' : 'challenger';
+        session.winnerSide = winner;
+        session.winnerAccountId = session.players[winner];
+      }
     }
     session.updatedAt = new Date().toISOString();
     const saved = this.sokobanFromRow(await this.updateGame(id, session.status, null, session.winnerSide ?? null, session));
@@ -2158,6 +2166,7 @@ function sessionForSokobanUser(session: SokobanSession, user: AuthAccount): Soko
   }
   return {
     ...session,
+    mySide: side,
     state: ensureSokobanPlayerState(session, side),
   };
 }
@@ -2171,27 +2180,128 @@ function sessionForSokobanAccount(session: SokobanSession, accountId: string): S
   }
   return {
     ...session,
+    mySide: side,
     state: ensureSokobanPlayerState(session, side),
   };
 }
 
-function applySokobanMove(session: SokobanSession, state: SokobanPlayerState, direction: string): void {
+function applySokobanMove(session: SokobanSession, state: SokobanPlayerState, direction: string): boolean {
   const delta = sokobanDelta(direction);
   const next = { row: state.player.row + delta.row, col: state.player.col + delta.col };
-  if (hasPosition(session.walls, next)) {
-    return;
+  if (!isSokobanFloor(session, next) || hasPosition(session.walls, next)) {
+    return false;
   }
   const boxIndex = state.boxes.findIndex((box) => samePosition(box, next));
   if (boxIndex >= 0) {
     const pushed = { row: next.row + delta.row, col: next.col + delta.col };
-    if (hasPosition(session.walls, pushed) || state.boxes.some((box, index) => index !== boxIndex && samePosition(box, pushed))) {
-      return;
+    if (!isSokobanFloor(session, pushed) || hasPosition(session.walls, pushed) || state.boxes.some((box, index) => index !== boxIndex && samePosition(box, pushed))) {
+      return false;
     }
     state.boxes[boxIndex] = pushed;
   }
   state.player = next;
   state.moves += 1;
   state.solved = state.boxes.every((box) => hasPosition(session.goals, box));
+  return true;
+}
+
+function isSokobanStateSolvable(session: SokobanSession, state: SokobanPlayerState): boolean {
+  if (state.boxes.every((box) => hasPosition(session.goals, box))) {
+    return true;
+  }
+  const queue: Array<{ player: SokobanPosition; boxes: SokobanPosition[] }> = [
+    { player: { ...state.player }, boxes: state.boxes.map((box) => ({ ...box })) },
+  ];
+  const seen = new Set<string>([sokobanSearchKey(queue[0].player, queue[0].boxes)]);
+  let index = 0;
+  while (index < queue.length) {
+    const current = queue[index++];
+    const reachable = reachableSokobanPositions(session, current.player, current.boxes);
+    for (let boxIndex = 0; boxIndex < current.boxes.length; boxIndex += 1) {
+      const box = current.boxes[boxIndex];
+      for (const delta of SOKOBAN_DELTAS) {
+        const pushFrom = { row: box.row - delta.row, col: box.col - delta.col };
+        const pushed = { row: box.row + delta.row, col: box.col + delta.col };
+        if (!reachable.has(positionKey(pushFrom)) || !isSokobanFree(session, pushed, current.boxes)) {
+          continue;
+        }
+        const nextBoxes = current.boxes.map((item, itemIndex) =>
+          itemIndex === boxIndex ? pushed : { ...item },
+        );
+        if (nextBoxes.every((item) => hasPosition(session.goals, item))) {
+          return true;
+        }
+        const nextPlayer = { ...box };
+        const key = sokobanSearchKey(nextPlayer, nextBoxes);
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        queue.push({ player: nextPlayer, boxes: nextBoxes });
+        if (seen.size > 100000) {
+          // Avoid false losses if a future map is much larger than the current set.
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+const SOKOBAN_DELTAS: SokobanPosition[] = [
+  { row: -1, col: 0 },
+  { row: 1, col: 0 },
+  { row: 0, col: -1 },
+  { row: 0, col: 1 },
+];
+
+function reachableSokobanPositions(session: SokobanSession, player: SokobanPosition, boxes: SokobanPosition[]): Set<string> {
+  const queue = [{ ...player }];
+  const seen = new Set<string>([positionKey(player)]);
+  let index = 0;
+  while (index < queue.length) {
+    const current = queue[index++];
+    for (const delta of SOKOBAN_DELTAS) {
+      const next = { row: current.row + delta.row, col: current.col + delta.col };
+      const key = positionKey(next);
+      if (seen.has(key) || !isSokobanFree(session, next, boxes)) {
+        continue;
+      }
+      seen.add(key);
+      queue.push(next);
+    }
+  }
+  return seen;
+}
+
+function isSokobanFree(session: SokobanSession, position: SokobanPosition, boxes: SokobanPosition[]): boolean {
+  return isSokobanFloor(session, position) && !hasPosition(session.walls, position) && !hasPosition(boxes, position);
+}
+
+function isSokobanFloor(session: SokobanSession, position: SokobanPosition): boolean {
+  const bounds = sokobanBounds(session);
+  return position.row >= bounds.minRow && position.row <= bounds.maxRow && position.col >= bounds.minCol && position.col <= bounds.maxCol;
+}
+
+function sokobanBounds(session: SokobanSession): { minRow: number; maxRow: number; minCol: number; maxCol: number } {
+  const positions = [...session.walls, ...session.goals, session.initialPlayer, ...session.initialBoxes];
+  return positions.reduce(
+    (bounds, position) => ({
+      minRow: Math.min(bounds.minRow, position.row),
+      maxRow: Math.max(bounds.maxRow, position.row),
+      minCol: Math.min(bounds.minCol, position.col),
+      maxCol: Math.max(bounds.maxCol, position.col),
+    }),
+    { minRow: 0, maxRow: 0, minCol: 0, maxCol: 0 },
+  );
+}
+
+function sokobanSearchKey(player: SokobanPosition, boxes: SokobanPosition[]): string {
+  return `${positionKey(player)}|${boxes.map(positionKey).sort().join(';')}`;
+}
+
+function positionKey(position: SokobanPosition): string {
+  return `${position.row},${position.col}`;
 }
 
 function sokobanDelta(direction: string): SokobanPosition {

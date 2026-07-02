@@ -10,6 +10,11 @@ const user = {
   permission: 'player',
   claims: {},
 };
+const opponent = {
+  ...user,
+  accountId: 'player-2',
+  subject: 'player-2',
+};
 
 test('gomoku local sessions are AI games and answer player moves', async () => {
   const service = new GamesService(new FakeDb(), new FakeRealtime());
@@ -88,6 +93,46 @@ test('sokoban solo sessions load difficulty maps and finish on solved moves', as
   assert.equal(moved.state.solved, true);
   assert.equal(moved.status, 'finished');
   assert.equal(moved.winnerSide, 'challenger');
+  assert.equal(moved.finishReason, 'solo_clear');
+});
+
+test('sokoban solo sessions finish as a loss when the puzzle becomes unsolvable', async () => {
+  const db = new FakeDb();
+  const service = new GamesService(db, new FakeRealtime());
+
+  const session = await service.createSokobanSession(user, 'easy');
+  db.rows.get(session.id).state_json.state = {
+    player: { row: 2, col: 1 },
+    boxes: [{ row: 1, col: 1 }],
+    moves: 0,
+    solved: false,
+  };
+
+  const moved = await service.moveSokoban(session.id, user, 'right');
+  assert.equal(moved.state.solved, false);
+  assert.equal(moved.status, 'finished');
+  assert.equal(moved.finishReason, 'deadlock');
+  assert.equal(moved.winnerSide, undefined);
+});
+
+test('sokoban matched sessions award the opponent when a player deadlocks', async () => {
+  const db = new FakeDb();
+  const service = new GamesService(db, new FakeRealtime());
+
+  const session = await service.createSokobanSession(user, 'easy', opponent.accountId);
+  db.rows.get(session.id).state_json.states.challenger = {
+    player: { row: 2, col: 1 },
+    boxes: [{ row: 1, col: 1 }],
+    moves: 0,
+    solved: false,
+  };
+
+  const moved = await service.moveSokoban(session.id, user, 'right');
+  assert.equal(moved.state.solved, false);
+  assert.equal(moved.status, 'finished');
+  assert.equal(moved.finishReason, 'deadlock');
+  assert.equal(moved.winnerSide, 'opponent');
+  assert.equal(moved.winnerAccountId, opponent.accountId);
 });
 
 function wait(ms) {
