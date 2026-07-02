@@ -355,6 +355,7 @@ export class SocialService {
       },
       body: JSON.stringify({
         serviceKey: env('AUTH_SERVICE_KEY', 'game-platform'),
+        requestedPermissionKey: 'player',
         message: 'game-platform 서비스를 매칭 플레이어로 이용하기 위해 player 권한 상승을 요청합니다.',
       }),
     });
