@@ -62,6 +62,16 @@ export class GamePlatformSessionService {
     if (!transaction) {
       return { errorCode: 'invalid_state', error: 'Invalid or expired login state' };
     }
+    if (transaction.status === 'completed' && transaction.sessionId) {
+      return {
+        loginTransactionId: transaction.id,
+        redirectUri: this.returnUriWithResult(transaction, 'success'),
+        session: await this.requireSession(transaction.sessionId),
+      };
+    }
+    if (transaction.status !== 'pending') {
+      return { errorCode: 'invalid_state', error: 'Invalid or expired login state' };
+    }
     if (input.error) {
       await this.markTransactionFailed(transaction.id, input.error, input.errorDescription ?? input.error);
       return {
@@ -247,7 +257,7 @@ export class GamePlatformSessionService {
     }>(
       `SELECT id, state, verifier, code_challenge, return_uri, status, session_id, error_code, error, expires_at
        FROM login_transactions
-       WHERE state = $1 AND status = 'pending'`,
+       WHERE state = $1`,
       [state],
     );
     if (!row || row.expires_at.getTime() <= Date.now()) {
