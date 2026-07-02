@@ -73,9 +73,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   onModuleInit(): void {
-    setTimeout(() => {
-      void this.restoreActiveTurnTimers().catch((error) => console.error(error));
-    }, 0);
+    void this.db
+      .ready()
+      .then(() => this.restoreActiveTurnTimers())
+      .catch((error) => console.error(error));
   }
 
   onModuleDestroy(): void {

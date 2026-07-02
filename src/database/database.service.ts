@@ -7,9 +7,10 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   private readonly pool = new Pool({
     connectionString: env('DATABASE_URL', 'postgres://postgres:postgres@localhost:5432/game_platform'),
   });
+  private readyPromise?: Promise<void>;
 
   async onModuleInit(): Promise<void> {
-    await this.migrate();
+    await this.ready();
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -23,6 +24,11 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   async one<T extends QueryResultRow = QueryResultRow>(sql: string, params: unknown[] = []): Promise<T | undefined> {
     const result = await this.query<T>(sql, params);
     return result.rows[0];
+  }
+
+  ready(): Promise<void> {
+    this.readyPromise ??= this.migrate();
+    return this.readyPromise;
   }
 
   private async migrate(): Promise<void> {
