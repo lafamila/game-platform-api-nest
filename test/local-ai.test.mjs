@@ -53,6 +53,43 @@ test('alkkagi local sessions are AI games and answer player shots', async () => 
   assert.equal(answered.currentTurn, 'red');
 });
 
+test('othello local sessions are AI games and answer player moves', async () => {
+  const service = new GamesService(new FakeDb(), new FakeRealtime());
+
+  const session = await service.createOthelloSession(user, undefined, undefined, 'medium');
+  assert.equal(session.mode, 'local_ai');
+  assert.equal(session.aiDifficulty, 'medium');
+  assert.equal(session.players.black, user.accountId);
+  assert.notEqual(session.players.white, user.accountId);
+
+  const moved = await service.playOthelloMove(session.id, user, 2, 3);
+  assert.equal(moved.moves.length, 1);
+  assert.equal(moved.moves[0].source, 'manual');
+  assert.equal(moved.currentTurn, 'white');
+
+  await wait(350);
+  const answered = await service.getOthelloSession(session.id, user);
+  assert.equal(answered.moves.length, 2);
+  assert.equal(answered.moves[1].source, 'ai');
+  assert.equal(answered.currentTurn, 'black');
+});
+
+test('sokoban solo sessions load difficulty maps and finish on solved moves', async () => {
+  const service = new GamesService(new FakeDb(), new FakeRealtime());
+
+  const session = await service.createSokobanSession(user, 'easy');
+  assert.equal(session.mode, 'solo');
+  assert.equal(session.difficulty, 'easy');
+  assert.equal(session.status, 'playing');
+  assert.deepEqual(session.state.player, { row: 1, col: 1 });
+
+  const moved = await service.moveSokoban(session.id, user, 'right');
+  assert.equal(moved.state.moves, 1);
+  assert.equal(moved.state.solved, true);
+  assert.equal(moved.status, 'finished');
+  assert.equal(moved.winnerSide, 'challenger');
+});
+
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

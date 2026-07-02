@@ -194,6 +194,8 @@ export class SocialService {
       sudoku: { wins: 0, losses: 0 },
       gomoku: { wins: 0, losses: 0 },
       alkkagi: { wins: 0, losses: 0 },
+      othello: { wins: 0, losses: 0 },
+      sokoban: { wins: 0, losses: 0 },
     };
     for (const row of result.rows) {
       const gameKey = row.game_key as keyof typeof stats;
@@ -213,10 +215,12 @@ export class SocialService {
         { gameKey: 'sudoku', label: '스도쿠', ...stats.sudoku },
         { gameKey: 'gomoku', label: '오목', ...stats.gomoku },
         { gameKey: 'alkkagi', label: '알까기', ...stats.alkkagi },
+        { gameKey: 'othello', label: '오델로', ...stats.othello },
+        { gameKey: 'sokoban', label: '소코반', ...stats.sokoban },
       ],
       total: {
-        wins: stats.sudoku.wins + stats.gomoku.wins + stats.alkkagi.wins,
-        losses: stats.sudoku.losses + stats.gomoku.losses + stats.alkkagi.losses,
+        wins: Object.values(stats).reduce((total, item) => total + item.wins, 0),
+        losses: Object.values(stats).reduce((total, item) => total + item.losses, 0),
       },
     };
   }
@@ -321,8 +325,8 @@ export class SocialService {
 
   async createMatchRequest(user: AuthAccount, input: { gameKey: string; opponentAccountId: string }) {
     this.assertCanMatch(user);
-    if (!['sudoku', 'gomoku', 'alkkagi'].includes(input.gameKey)) {
-      throw new BadRequestException('gameKey must be sudoku, gomoku, or alkkagi');
+    if (!['sudoku', 'gomoku', 'alkkagi', 'othello', 'sokoban'].includes(input.gameKey)) {
+      throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, or sokoban');
     }
     if (input.opponentAccountId === user.accountId) {
       throw new BadRequestException('opponent must be another account');
@@ -608,6 +612,9 @@ function hasPlayerPermissionKey(permission: string | null | undefined): boolean 
 
 function winnerAccountForRow(gameKey: string, state: Record<string, unknown>): string | undefined {
   if (gameKey === 'sudoku') {
+    return typeof state.winnerAccountId === 'string' ? state.winnerAccountId : undefined;
+  }
+  if (gameKey === 'sokoban') {
     return typeof state.winnerAccountId === 'string' ? state.winnerAccountId : undefined;
   }
   const winner = typeof state.winner === 'string' ? state.winner : undefined;

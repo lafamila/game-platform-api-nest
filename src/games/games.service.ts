@@ -12,15 +12,22 @@ import {
   Difficulty,
   GomokuSession,
   MatchPauseState,
+  OthelloColor,
+  OthelloSession,
   PieceTeam,
   PlayerColor,
   SudokuBattleState,
   SudokuProgress,
   SudokuSession,
   SudokuSide,
+  SokobanPlayerState,
+  SokobanPosition,
+  SokobanSession,
+  SokobanSide,
 } from './games.types';
 
 const GOMOKU_SIZE = 15;
+const OTHELLO_SIZE = 8;
 const ALKKAGI_BOARD_SIZE = 1000;
 const MATCH_READY_DELAY_MS = 4_000;
 const GOMOKU_TURN_LIMIT_MS = 15_000;
@@ -91,6 +98,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       { key: 'sudoku', title: 'Sudoku', modes: ['solo', 'friend_match'], status: 'playable' },
       { key: 'gomoku', title: 'Gomoku', modes: ['local_ai', 'friend_match'], status: 'playable' },
       { key: 'alkkagi', title: 'Alkkagi', modes: ['local_ai', 'friend_match'], status: 'playable' },
+      { key: 'othello', title: 'Othello', modes: ['local_ai', 'friend_match'], status: 'playable' },
+      { key: 'sokoban', title: 'Sokoban', modes: ['solo', 'friend_match'], status: 'playable' },
     ];
   }
 
@@ -518,6 +527,183 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return saved;
   }
 
+  async createOthelloSession(
+    user: AuthAccount,
+    opponentAccountId?: string,
+    mode?: 'local_ai' | 'friend_match',
+    difficulty: Difficulty = 'easy',
+  ): Promise<OthelloSession> {
+    this.assertDifficulty(difficulty);
+    const resolvedMode = opponentAccountId ? 'friend_match' : mode ?? 'local_ai';
+    const state: OthelloSession = {
+      id: '',
+      mode: resolvedMode,
+      aiDifficulty: resolvedMode === 'local_ai' ? difficulty : undefined,
+      board: initialOthelloBoard(),
+      currentTurn: 'black',
+      status: 'playing',
+      players: {
+        black: user.accountId,
+        white: opponentAccountId || LOCAL_AI_ACCOUNT_ID,
+      },
+      moves: [],
+      createdAt: '',
+      updatedAt: '',
+    };
+    if (resolvedMode === 'friend_match') {
+      state.pause = { active: false, counts: { [user.accountId]: 0, [opponentAccountId!]: 0 } } as MatchPauseState;
+    }
+    const row = await this.insertGame('othello', resolvedMode, user.accountId, opponentAccountId ?? null, 'playing', 'black', null, state);
+    const session = this.othelloFromRow(row);
+    this.emitSessionEvent(session, 'game.session.created', session);
+    return session;
+  }
+
+  async getOthelloSession(id: string, user: AuthAccount): Promise<OthelloSession> {
+    const session = this.othelloFromRow(await this.requireGameRow(id, 'othello'));
+    this.assertGameParticipant(user, session.players.black, session.players.white);
+    return session;
+  }
+
+  async playOthelloMove(id: string, user: AuthAccount, row: number, col: number): Promise<OthelloSession> {
+    validateOthelloIndex(row, 'row');
+    validateOthelloIndex(col, 'col');
+    const session = this.othelloFromRow(await this.requireGameRow(id, 'othello'));
+    this.assertGameParticipant(user, session.players.black, session.players.white);
+    if (session.status !== 'playing') {
+      throw new BadRequestException('game is already finished');
+    }
+    this.assertNotPaused(session);
+    const color = session.currentTurn;
+    if (isLocalAiAccount(session.players[color])) {
+      throw new ForbiddenException('not your turn');
+    }
+    if (!this.canActAs(user, session.players[color])) {
+      throw new ForbiddenException('not your turn');
+    }
+    applyOthelloMove(session, user.accountId, row, col, 'manual');
+    const saved = this.othelloFromRow(await this.updateGame(id, session.status, session.currentTurn, session.winner ?? null, session));
+    this.emitSessionEvent(saved, 'othello.move.played', saved);
+    if (saved.mode === 'local_ai' && saved.status === 'playing' && isLocalAiAccount(saved.players[saved.currentTurn])) {
+      this.scheduleLocalOthelloAiTurn(saved.id);
+    }
+    return saved;
+  }
+
+  async sendOthelloEmote(id: string, user: AuthAccount, slot: number): Promise<unknown> {
+    const session = this.othelloFromRow(await this.requireGameRow(id, 'othello'));
+    this.assertGameParticipant(user, session.players.black, session.players.white);
+    return this.sendSessionEmote('othello', session, user, slot);
+  }
+
+  async forfeitOthello(id: string, user: AuthAccount): Promise<OthelloSession> {
+    const session = this.othelloFromRow(await this.requireGameRow(id, 'othello'));
+    this.assertGameParticipant(user, session.players.black, session.players.white);
+    if (session.status !== 'playing') {
+      return session;
+    }
+    const loser = this.participantSide(session.players, user.accountId, session.currentTurn);
+    session.status = 'finished';
+    session.winner = loser === 'black' ? 'white' : 'black';
+    session.finishReason = 'forfeit';
+    session.updatedAt = new Date().toISOString();
+    const saved = this.othelloFromRow(await this.updateGame(id, session.status, session.currentTurn, session.winner, session));
+    this.emitSessionEvent(saved, 'othello.move.played', saved);
+    this.emitSessionEvent(saved, 'game.session.finished', saved);
+    return saved;
+  }
+
+  async createSokobanSession(
+    user: AuthAccount,
+    difficulty: Difficulty,
+    opponentAccountId?: string,
+  ): Promise<SokobanSession> {
+    this.assertDifficulty(difficulty);
+    const map = sokobanMapForDifficulty(difficulty);
+    const initial = parseSokobanMap(map);
+    const resolvedMode = opponentAccountId ? 'friend_match' : 'solo';
+    const state: SokobanSession = {
+      id: '',
+      mode: resolvedMode,
+      ownerAccountId: user.accountId,
+      difficulty,
+      mapKey: map.key,
+      walls: initial.walls,
+      goals: initial.goals,
+      initialPlayer: initial.player,
+      initialBoxes: initial.boxes,
+      state: createSokobanPlayerState(initial),
+      status: 'playing',
+      createdAt: '',
+      updatedAt: '',
+    };
+    if (opponentAccountId) {
+      state.players = { challenger: user.accountId, opponent: opponentAccountId };
+      state.states = {
+        challenger: createSokobanPlayerState(initial),
+        opponent: createSokobanPlayerState(initial),
+      };
+      state.pause = { active: false, counts: { [user.accountId]: 0, [opponentAccountId]: 0 } } as MatchPauseState;
+    }
+    const row = await this.insertGame('sokoban', resolvedMode, user.accountId, opponentAccountId ?? null, state.status, null, null, state);
+    const session = this.sokobanFromRow(row);
+    this.emitSokobanEvent(session, 'game.session.created');
+    return session;
+  }
+
+  async getSokobanSession(id: string, user: AuthAccount): Promise<SokobanSession> {
+    const session = this.sokobanFromRow(await this.requireGameRow(id, 'sokoban'));
+    this.assertSokobanParticipant(user, session);
+    return sessionForSokobanUser(session, user);
+  }
+
+  async moveSokoban(id: string, user: AuthAccount, direction: string): Promise<SokobanSession> {
+    const session = this.sokobanFromRow(await this.requireGameRow(id, 'sokoban'));
+    this.assertSokobanParticipant(user, session);
+    if (session.status !== 'playing') {
+      throw new BadRequestException('game is already finished');
+    }
+    this.assertNotPaused(session);
+    const side = this.sokobanSideForUser(session, user);
+    const playerState = side ? ensureSokobanPlayerState(session, side) : session.state;
+    applySokobanMove(session, playerState, direction);
+    if (playerState.solved) {
+      session.status = 'finished';
+      session.solvedAt = new Date().toISOString();
+      session.winnerSide = side ?? 'challenger';
+      session.winnerAccountId = side ? session.players?.[side] : session.ownerAccountId;
+      session.finishReason = side ? 'first_clear' : 'solo_clear';
+    }
+    session.updatedAt = new Date().toISOString();
+    const saved = this.sokobanFromRow(await this.updateGame(id, session.status, null, session.winnerSide ?? null, session));
+    this.emitSokobanEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'sokoban.move.played');
+    return sessionForSokobanUser(saved, user);
+  }
+
+  async sendSokobanEmote(id: string, user: AuthAccount, slot: number): Promise<unknown> {
+    const session = this.sokobanFromRow(await this.requireGameRow(id, 'sokoban'));
+    this.assertSokobanParticipant(user, session);
+    return this.sendSessionEmote('sokoban', session, user, slot);
+  }
+
+  async forfeitSokoban(id: string, user: AuthAccount): Promise<SokobanSession> {
+    const session = this.sokobanFromRow(await this.requireGameRow(id, 'sokoban'));
+    this.assertSokobanParticipant(user, session);
+    if (session.status !== 'playing' || !session.players) {
+      return sessionForSokobanUser(session, user);
+    }
+    const loser = this.sokobanSideForUser(session, user) ?? 'challenger';
+    const winner = loser === 'challenger' ? 'opponent' : 'challenger';
+    session.status = 'finished';
+    session.winnerSide = winner;
+    session.winnerAccountId = session.players[winner];
+    session.finishReason = 'forfeit';
+    session.updatedAt = new Date().toISOString();
+    const saved = this.sokobanFromRow(await this.updateGame(id, session.status, null, session.winnerSide, session));
+    this.emitSokobanEvent(saved, 'game.session.finished');
+    return sessionForSokobanUser(saved, user);
+  }
+
   async pauseMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
     if (gameKey === 'sudoku') {
       const session = this.sudokuFromRow(await this.requireGameRow(id, 'sudoku'));
@@ -545,7 +731,23 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitSessionEvent(saved, 'game.session.paused', saved);
       return saved;
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, or alkkagi');
+    if (gameKey === 'othello') {
+      const session = this.othelloFromRow(await this.requireGameRow(id, 'othello'));
+      this.assertGameParticipant(user, session.players.black, session.players.white);
+      this.applyPause(session, user);
+      const saved = this.othelloFromRow(await this.updateGame(id, session.status, session.currentTurn, session.winner ?? null, session));
+      this.emitSessionEvent(saved, 'game.session.paused', saved);
+      return saved;
+    }
+    if (gameKey === 'sokoban') {
+      const session = this.sokobanFromRow(await this.requireGameRow(id, 'sokoban'));
+      this.assertSokobanParticipant(user, session);
+      this.applyPause(session, user);
+      const saved = this.sokobanFromRow(await this.updateGame(id, session.status, null, session.winnerSide ?? null, session));
+      this.emitSokobanEvent(saved, 'game.session.paused');
+      return sessionForSokobanUser(saved, user);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, or sokoban');
   }
 
   async resumeMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
@@ -575,7 +777,23 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitSessionEvent(saved, 'game.session.resumed', saved);
       return saved;
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, or alkkagi');
+    if (gameKey === 'othello') {
+      const session = this.othelloFromRow(await this.requireGameRow(id, 'othello'));
+      this.assertGameParticipant(user, session.players.black, session.players.white);
+      this.applyResume(session);
+      const saved = this.othelloFromRow(await this.updateGame(id, session.status, session.currentTurn, session.winner ?? null, session));
+      this.emitSessionEvent(saved, 'game.session.resumed', saved);
+      return saved;
+    }
+    if (gameKey === 'sokoban') {
+      const session = this.sokobanFromRow(await this.requireGameRow(id, 'sokoban'));
+      this.assertSokobanParticipant(user, session);
+      this.applyResume(session);
+      const saved = this.sokobanFromRow(await this.updateGame(id, session.status, null, session.winnerSide ?? null, session));
+      this.emitSokobanEvent(saved, 'game.session.resumed');
+      return sessionForSokobanUser(saved, user);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, or sokoban');
   }
 
   async createSessionFromMatch(gameKey: string, requesterAccountId: string, opponentAccountId: string): Promise<string> {
@@ -595,7 +813,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'alkkagi') {
       return (await this.createAlkkagiSession(fakeUser, opponentAccountId, 'friend_match')).id;
     }
-    throw new BadRequestException('match requests support sudoku, gomoku, or alkkagi');
+    if (gameKey === 'othello') {
+      return (await this.createOthelloSession(fakeUser, opponentAccountId, 'friend_match')).id;
+    }
+    if (gameKey === 'sokoban') {
+      return (await this.createSokobanSession(fakeUser, 'medium', opponentAccountId)).id;
+    }
+    throw new BadRequestException('match requests support sudoku, gomoku, alkkagi, othello, or sokoban');
   }
 
   private async insertGame(
@@ -652,6 +876,14 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return withRowDates(row.state_json as AlkkagiSession, row);
   }
 
+  private othelloFromRow(row: GameRow): OthelloSession {
+    return withRowDates(row.state_json as OthelloSession, row);
+  }
+
+  private sokobanFromRow(row: GameRow): SokobanSession {
+    return withRowDates(row.state_json as SokobanSession, row);
+  }
+
   private assertDifficulty(difficulty: Difficulty): void {
     if (!['easy', 'medium', 'hard'].includes(difficulty)) {
       throw new BadRequestException('difficulty must be easy, medium, or hard');
@@ -691,13 +923,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return undefined;
   }
 
-  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession): void {
+  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession): void {
     if (session.pause?.active) {
       throw new BadRequestException('game is paused');
     }
   }
 
-  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession, user: AuthAccount): void {
+  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession, user: AuthAccount): void {
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('pause is only available during matched games');
     }
@@ -721,7 +953,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     session.updatedAt = new Date(now).toISOString();
   }
 
-  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession): void {
+  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession): void {
     const pause = session.pause;
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('resume is only available during matched games');
@@ -748,9 +980,30 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return user.accountId === accountId || user.permission === 'superadmin';
   }
 
+  private assertSokobanParticipant(user: AuthAccount, session: SokobanSession): void {
+    if (session.players) {
+      this.assertGameParticipant(user, session.players.challenger, session.players.opponent);
+      return;
+    }
+    this.assertParticipant(user, session.ownerAccountId);
+  }
+
+  private sokobanSideForUser(session: SokobanSession, user: AuthAccount): SokobanSide | undefined {
+    if (!session.players) {
+      return undefined;
+    }
+    if (this.canActAs(user, session.players.challenger)) {
+      return 'challenger';
+    }
+    if (this.canActAs(user, session.players.opponent)) {
+      return 'opponent';
+    }
+    return undefined;
+  }
+
   private async sendSessionEmote(
-    gameKey: 'sudoku' | 'gomoku' | 'alkkagi',
-    session: SudokuSession | GomokuSession | AlkkagiSession,
+    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban',
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession,
     user: AuthAccount,
     slot: number,
   ): Promise<unknown> {
@@ -851,6 +1104,38 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     }
     const saved = this.gomokuFromRow(await this.updateGame(session.id, session.status, session.currentTurn, session.winner ?? null, session));
     this.emitSessionEvent(saved, 'gomoku.move.played', saved);
+    if (saved.status === 'finished') {
+      this.emitSessionEvent(saved, 'game.session.finished', saved);
+    }
+  }
+
+  private scheduleLocalOthelloAiTurn(id: string): void {
+    setTimeout(() => {
+      void this.runLocalOthelloAiTurn(id).catch((error) => {
+        // Local AI failures should not crash the API process.
+        console.error(error);
+      });
+    }, LOCAL_AI_RESPONSE_DELAY_MS);
+  }
+
+  private async runLocalOthelloAiTurn(id: string): Promise<void> {
+    const session = this.othelloFromRow(await this.requireGameRow(id, 'othello'));
+    if (session.mode !== 'local_ai' || session.status !== 'playing' || !isLocalAiAccount(session.players[session.currentTurn])) {
+      return;
+    }
+    const move = chooseOthelloAiMove(session);
+    if (!move) {
+      const next = oppositeOthello(session.currentTurn);
+      if (othelloLegalMoves(session.board, next).length === 0) {
+        finishOthello(session);
+      } else {
+        session.currentTurn = next;
+      }
+    } else {
+      applyOthelloMove(session, LOCAL_AI_ACCOUNT_ID, move.row, move.col, 'ai');
+    }
+    const saved = this.othelloFromRow(await this.updateGame(session.id, session.status, session.currentTurn, session.winner ?? null, session));
+    this.emitSessionEvent(saved, 'othello.move.played', saved);
     if (saved.status === 'finished') {
       this.emitSessionEvent(saved, 'game.session.finished', saved);
     }
@@ -1167,13 +1452,19 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return fallback;
   }
 
-  private emitSessionEvent(session: SudokuSession | GomokuSession | AlkkagiSession, event: string, payload: unknown): void {
+  private emitSessionEvent(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession, event: string, payload: unknown): void {
     this.realtime.emitToAccounts(sessionAccountIds(session), event, payload);
   }
 
   private emitSudokuEvent(session: SudokuSession, event: string): void {
     for (const accountId of sessionAccountIds(session)) {
       this.realtime.emitToAccounts([accountId], event, hideSudokuSolutionForAccount(session, accountId));
+    }
+  }
+
+  private emitSokobanEvent(session: SokobanSession, event: string): void {
+    for (const accountId of sessionAccountIds(session)) {
+      this.realtime.emitToAccounts([accountId], event, sessionForSokobanAccount(session, accountId));
     }
   }
 }
@@ -1379,7 +1670,7 @@ function hashText(value: string): number {
   return hash;
 }
 
-function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession): string[] {
+function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession): string[] {
   if ('players' in session && session.players) {
     return [...new Set(Object.values(session.players).filter((accountId) => !isLocalAiAccount(accountId)))];
   }
@@ -1393,10 +1684,15 @@ function isLocalAiAccount(accountId: string): boolean {
   return accountId === LOCAL_AI_ACCOUNT_ID;
 }
 
-function shiftDeadline(session: SudokuSession | GomokuSession | AlkkagiSession, key: 'turnStartedAt' | 'turnDeadlineAt' | 'networkGraceStartedAt' | 'networkGraceDeadlineAt', deltaMs: number): void {
-  const value = session[key];
+function shiftDeadline(
+  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession,
+  key: 'turnStartedAt' | 'turnDeadlineAt' | 'networkGraceStartedAt' | 'networkGraceDeadlineAt',
+  deltaMs: number,
+): void {
+  const target = session as unknown as Record<string, string | undefined>;
+  const value = target[key];
   if (!value || deltaMs <= 0) return;
-  session[key] = new Date(Date.parse(value) + deltaMs).toISOString();
+  target[key] = new Date(Date.parse(value) + deltaMs).toISOString();
 }
 
 function validateEmoteSlot(slot: number): void {
@@ -1455,6 +1751,12 @@ function validateSudokuIndex(value: number, name: string): void {
 function validateGomokuIndex(value: number, name: string): void {
   if (!Number.isInteger(value) || value < 0 || value >= GOMOKU_SIZE) {
     throw new BadRequestException(`${name} must be an integer from 0 to ${GOMOKU_SIZE - 1}`);
+  }
+}
+
+function validateOthelloIndex(value: number, name: string): void {
+  if (!Number.isInteger(value) || value < 0 || value >= OTHELLO_SIZE) {
+    throw new BadRequestException(`${name} must be an integer from 0 to ${OTHELLO_SIZE - 1}`);
   }
 }
 
@@ -1672,6 +1974,240 @@ function gomokuWindowScore(own: number, enemy: number): number {
 
 function oppositeGomokuColor(color: PlayerColor): PlayerColor {
   return color === 'black' ? 'white' : 'black';
+}
+
+function initialOthelloBoard(): (OthelloColor | null)[][] {
+  const board: (OthelloColor | null)[][] = Array.from({ length: OTHELLO_SIZE }, () =>
+    Array.from({ length: OTHELLO_SIZE }, () => null as OthelloColor | null),
+  );
+  board[3][3] = 'white';
+  board[3][4] = 'black';
+  board[4][3] = 'black';
+  board[4][4] = 'white';
+  return board;
+}
+
+function oppositeOthello(color: OthelloColor): OthelloColor {
+  return color === 'black' ? 'white' : 'black';
+}
+
+function othelloFlips(board: (OthelloColor | null)[][], row: number, col: number, color: OthelloColor): Array<[number, number]> {
+  if (board[row]?.[col] !== null) {
+    return [];
+  }
+  const enemy = oppositeOthello(color);
+  const flips: Array<[number, number]> = [];
+  for (const [dr, dc] of [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0], [1, 1]]) {
+    const line: Array<[number, number]> = [];
+    let r = row + dr;
+    let c = col + dc;
+    while (r >= 0 && r < OTHELLO_SIZE && c >= 0 && c < OTHELLO_SIZE && board[r][c] === enemy) {
+      line.push([r, c]);
+      r += dr;
+      c += dc;
+    }
+    if (line.length > 0 && r >= 0 && r < OTHELLO_SIZE && c >= 0 && c < OTHELLO_SIZE && board[r][c] === color) {
+      flips.push(...line);
+    }
+  }
+  return flips;
+}
+
+function othelloLegalMoves(board: (OthelloColor | null)[][], color: OthelloColor): Array<{ row: number; col: number; flips: number }> {
+  const moves: Array<{ row: number; col: number; flips: number }> = [];
+  for (let row = 0; row < OTHELLO_SIZE; row += 1) {
+    for (let col = 0; col < OTHELLO_SIZE; col += 1) {
+      const flips = othelloFlips(board, row, col, color).length;
+      if (flips > 0) {
+        moves.push({ row, col, flips });
+      }
+    }
+  }
+  return moves;
+}
+
+function applyOthelloMove(session: OthelloSession, accountId: string, row: number, col: number, source: 'manual' | 'ai'): void {
+  const color = session.currentTurn;
+  const flips = othelloFlips(session.board, row, col, color);
+  if (flips.length === 0) {
+    throw new BadRequestException('not a legal othello move');
+  }
+  session.board[row][col] = color;
+  for (const [r, c] of flips) {
+    session.board[r][c] = color;
+  }
+  session.moves.push({ row, col, color, accountId, flipped: flips.length, createdAt: new Date().toISOString(), source });
+  const next = oppositeOthello(color);
+  if (othelloLegalMoves(session.board, next).length > 0) {
+    session.currentTurn = next;
+  } else if (othelloLegalMoves(session.board, color).length > 0) {
+    session.currentTurn = color;
+  } else {
+    finishOthello(session);
+  }
+  session.updatedAt = new Date().toISOString();
+}
+
+function finishOthello(session: OthelloSession): void {
+  const score = othelloScore(session.board);
+  session.status = 'finished';
+  session.finishReason = score.black === score.white ? 'draw' : 'board_complete';
+  if (score.black !== score.white) {
+    session.winner = score.black > score.white ? 'black' : 'white';
+  }
+}
+
+function othelloScore(board: (OthelloColor | null)[][]): Record<OthelloColor, number> {
+  let black = 0;
+  let white = 0;
+  for (const row of board) {
+    for (const cell of row) {
+      if (cell === 'black') black += 1;
+      if (cell === 'white') white += 1;
+    }
+  }
+  return { black, white };
+}
+
+function chooseOthelloAiMove(session: OthelloSession): { row: number; col: number } | undefined {
+  const moves = othelloLegalMoves(session.board, session.currentTurn);
+  if (moves.length === 0) {
+    return undefined;
+  }
+  const difficulty = session.aiDifficulty ?? 'easy';
+  if (difficulty === 'easy') {
+    return moves[Math.floor(Math.random() * moves.length)];
+  }
+  const scored = moves.map((move) => {
+    const corner = (move.row === 0 || move.row === 7) && (move.col === 0 || move.col === 7) ? 20 : 0;
+    const edge = move.row === 0 || move.row === 7 || move.col === 0 || move.col === 7 ? 4 : 0;
+    return { ...move, score: move.flips + corner + edge };
+  }).sort((a, b) => b.score - a.score);
+  if (difficulty === 'medium' && Math.random() < 0.28) {
+    return scored[Math.floor(Math.random() * Math.min(scored.length, 3))];
+  }
+  return scored[0];
+}
+
+const SOKOBAN_MAPS = {
+  easy: {
+    key: 'easy-1',
+    rows: ['#####', '#@$.#', '#   #', '#####'],
+  },
+  medium: {
+    key: 'medium-1',
+    rows: ['#######', '#  .  #', '# $$  #', '#  @  #', '#######'],
+  },
+  hard: {
+    key: 'hard-1',
+    rows: ['########', '#  .   #', '#  $   #', '# .$@  #', '#  $   #', '#  .   #', '########'],
+  },
+} as const;
+
+function sokobanMapForDifficulty(difficulty: Difficulty) {
+  return SOKOBAN_MAPS[difficulty];
+}
+
+function parseSokobanMap(map: { key: string; rows: readonly string[] }): {
+  walls: SokobanPosition[];
+  goals: SokobanPosition[];
+  player: SokobanPosition;
+  boxes: SokobanPosition[];
+} {
+  const walls: SokobanPosition[] = [];
+  const goals: SokobanPosition[] = [];
+  const boxes: SokobanPosition[] = [];
+  let player: SokobanPosition | undefined;
+  map.rows.forEach((line, row) => {
+    [...line].forEach((cell, col) => {
+      if (cell === '#') walls.push({ row, col });
+      if (cell === '.' || cell === '*' || cell === '+') goals.push({ row, col });
+      if (cell === '$' || cell === '*') boxes.push({ row, col });
+      if (cell === '@' || cell === '+') player = { row, col };
+    });
+  });
+  if (!player) {
+    throw new BadRequestException('sokoban map is missing player');
+  }
+  return { walls, goals, player, boxes };
+}
+
+function createSokobanPlayerState(input: { player: SokobanPosition; boxes: SokobanPosition[] }): SokobanPlayerState {
+  return {
+    player: { ...input.player },
+    boxes: input.boxes.map((box) => ({ ...box })),
+    moves: 0,
+    solved: false,
+  };
+}
+
+function ensureSokobanPlayerState(session: SokobanSession, side: SokobanSide): SokobanPlayerState {
+  session.states ??= {
+    challenger: createSokobanPlayerState({ player: session.initialPlayer, boxes: session.initialBoxes }),
+    opponent: createSokobanPlayerState({ player: session.initialPlayer, boxes: session.initialBoxes }),
+  };
+  return session.states[side];
+}
+
+function sessionForSokobanUser(session: SokobanSession, user: AuthAccount): SokobanSession {
+  const side = session.players
+    ? (user.accountId === session.players.challenger || user.permission === 'superadmin' ? 'challenger' : 'opponent')
+    : undefined;
+  if (!side) {
+    return session;
+  }
+  return {
+    ...session,
+    state: ensureSokobanPlayerState(session, side),
+  };
+}
+
+function sessionForSokobanAccount(session: SokobanSession, accountId: string): SokobanSession {
+  const side = session.players
+    ? (accountId === session.players.challenger ? 'challenger' : 'opponent')
+    : undefined;
+  if (!side) {
+    return session;
+  }
+  return {
+    ...session,
+    state: ensureSokobanPlayerState(session, side),
+  };
+}
+
+function applySokobanMove(session: SokobanSession, state: SokobanPlayerState, direction: string): void {
+  const delta = sokobanDelta(direction);
+  const next = { row: state.player.row + delta.row, col: state.player.col + delta.col };
+  if (hasPosition(session.walls, next)) {
+    return;
+  }
+  const boxIndex = state.boxes.findIndex((box) => samePosition(box, next));
+  if (boxIndex >= 0) {
+    const pushed = { row: next.row + delta.row, col: next.col + delta.col };
+    if (hasPosition(session.walls, pushed) || state.boxes.some((box, index) => index !== boxIndex && samePosition(box, pushed))) {
+      return;
+    }
+    state.boxes[boxIndex] = pushed;
+  }
+  state.player = next;
+  state.moves += 1;
+  state.solved = state.boxes.every((box) => hasPosition(session.goals, box));
+}
+
+function sokobanDelta(direction: string): SokobanPosition {
+  if (direction === 'up') return { row: -1, col: 0 };
+  if (direction === 'down') return { row: 1, col: 0 };
+  if (direction === 'left') return { row: 0, col: -1 };
+  if (direction === 'right') return { row: 0, col: 1 };
+  throw new BadRequestException('direction must be up, down, left, or right');
+}
+
+function samePosition(left: SokobanPosition, right: SokobanPosition): boolean {
+  return left.row === right.row && left.col === right.col;
+}
+
+function hasPosition(items: SokobanPosition[], target: SokobanPosition): boolean {
+  return items.some((item) => samePosition(item, target));
 }
 
 function initialAlkkagiPieces(): AlkkagiPiece[] {

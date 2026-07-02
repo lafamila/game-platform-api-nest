@@ -1,7 +1,9 @@
 export type Difficulty = 'easy' | 'medium' | 'hard';
 export type PlayerColor = 'black' | 'white';
+export type OthelloColor = 'black' | 'white';
 export type PieceTeam = 'red' | 'blue';
 export type SudokuSide = 'challenger' | 'opponent';
+export type SokobanSide = 'challenger' | 'opponent';
 export type GameMode = 'solo' | 'local_ai' | 'friend_match';
 
 export interface MatchPauseState {
@@ -132,6 +134,57 @@ export interface AlkkagiShotResult {
     frameMs: number;
     frames: AlkkagiPiece[][];
   };
+}
+
+export interface OthelloSession {
+  id: string;
+  mode?: GameMode;
+  aiDifficulty?: Difficulty;
+  board: (OthelloColor | null)[][];
+  currentTurn: OthelloColor;
+  winner?: OthelloColor;
+  status: 'playing' | 'finished';
+  players: Record<OthelloColor, string>;
+  moves: Array<{ row: number; col: number; color: OthelloColor; accountId: string; flipped: number; createdAt: string; source?: 'manual' | 'ai' }>;
+  pause?: MatchPauseState;
+  finishReason?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SokobanPosition {
+  row: number;
+  col: number;
+}
+
+export interface SokobanPlayerState {
+  player: SokobanPosition;
+  boxes: SokobanPosition[];
+  moves: number;
+  solved: boolean;
+}
+
+export interface SokobanSession {
+  id: string;
+  mode?: GameMode;
+  ownerAccountId: string;
+  difficulty: Difficulty;
+  mapKey: string;
+  walls: SokobanPosition[];
+  goals: SokobanPosition[];
+  initialPlayer: SokobanPosition;
+  initialBoxes: SokobanPosition[];
+  state: SokobanPlayerState;
+  players?: Record<SokobanSide, string>;
+  states?: Record<SokobanSide, SokobanPlayerState>;
+  winnerAccountId?: string;
+  winnerSide?: SokobanSide;
+  pause?: MatchPauseState;
+  status: 'playing' | 'finished';
+  finishReason?: string;
+  createdAt: string;
+  updatedAt: string;
+  solvedAt?: string;
 }
 
 export interface CustomEmote {

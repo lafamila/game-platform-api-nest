@@ -133,4 +133,54 @@ export class GamesController {
   forfeitAlkkagi(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
     return this.games.forfeitAlkkagi(id, user);
   }
+
+  @Post('othello/sessions')
+  createOthello(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
+    return this.games.createOthelloSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'easy');
+  }
+
+  @Get('othello/sessions/:id')
+  getOthello(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.getOthelloSession(id, user);
+  }
+
+  @Post('othello/sessions/:id/moves')
+  playOthelloMove(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { row: number; col: number }) {
+    return this.games.playOthelloMove(id, user, Number(body.row), Number(body.col));
+  }
+
+  @Post('othello/sessions/:id/emotes')
+  sendOthelloEmote(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { slot: number }) {
+    return this.games.sendOthelloEmote(id, user, Number(body.slot));
+  }
+
+  @Post('othello/sessions/:id/forfeit')
+  forfeitOthello(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.forfeitOthello(id, user);
+  }
+
+  @Post('sokoban/sessions')
+  createSokoban(@CurrentUser() user: AuthAccount, @Body() body: { difficulty?: Difficulty; opponentAccountId?: string }) {
+    return this.games.createSokobanSession(user, body.difficulty ?? 'easy', body.opponentAccountId);
+  }
+
+  @Get('sokoban/sessions/:id')
+  getSokoban(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.getSokobanSession(id, user);
+  }
+
+  @Post('sokoban/sessions/:id/moves')
+  moveSokoban(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { direction: string }) {
+    return this.games.moveSokoban(id, user, body.direction);
+  }
+
+  @Post('sokoban/sessions/:id/emotes')
+  sendSokobanEmote(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { slot: number }) {
+    return this.games.sendSokobanEmote(id, user, Number(body.slot));
+  }
+
+  @Post('sokoban/sessions/:id/forfeit')
+  forfeitSokoban(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.forfeitSokoban(id, user);
+  }
 }
