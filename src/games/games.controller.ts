@@ -31,7 +31,7 @@ export class GamesController {
 
   @Post('sudoku/sessions')
   createSudoku(@CurrentUser() user: AuthAccount, @Body() body: { difficulty?: Difficulty; opponentAccountId?: string }) {
-    return this.games.createSudokuSession(user, body.difficulty ?? 'easy', body.opponentAccountId);
+    return this.games.createSudokuSession(user, body.difficulty ?? 'medium', body.opponentAccountId);
   }
 
   @Get('sudoku/sessions/:id')
@@ -66,7 +66,7 @@ export class GamesController {
 
   @Post('gomoku/sessions')
   createGomoku(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
-    return this.games.createGomokuSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'easy');
+    return this.games.createGomokuSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium');
   }
 
   @Get('gomoku/sessions/:id')
@@ -91,7 +91,7 @@ export class GamesController {
 
   @Post('alkkagi/sessions')
   createAlkkagi(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
-    return this.games.createAlkkagiSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'easy');
+    return this.games.createAlkkagiSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium');
   }
 
   @Get('alkkagi/sessions/:id')
@@ -136,7 +136,7 @@ export class GamesController {
 
   @Post('othello/sessions')
   createOthello(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
-    return this.games.createOthelloSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'easy');
+    return this.games.createOthelloSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium');
   }
 
   @Get('othello/sessions/:id')
@@ -161,7 +161,7 @@ export class GamesController {
 
   @Post('sokoban/sessions')
   createSokoban(@CurrentUser() user: AuthAccount, @Body() body: { difficulty?: Difficulty; opponentAccountId?: string }) {
-    return this.games.createSokobanSession(user, body.difficulty ?? 'easy', body.opponentAccountId);
+    return this.games.createSokobanSession(user, body.difficulty ?? 'medium', body.opponentAccountId);
   }
 
   @Get('sokoban/sessions/:id')

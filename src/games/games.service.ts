@@ -4,6 +4,7 @@ import { AuthAccount } from '../auth/auth.types';
 import { emoteGridSizeFor, hasPlayerAccess } from '../auth/roles';
 import { RealtimeService } from '../realtime/realtime.service';
 import { createSudoku, isSolvedSudoku } from './sudoku-generator';
+import { createSokobanMap, createVerifiedSokobanMap, GeneratedSokobanMap } from './sokoban-generator';
 import {
   AlkkagiPiece,
   AlkkagiShotResult,
@@ -69,6 +70,15 @@ interface CustomEmoteRow {
   updated_at: Date;
 }
 
+interface SokobanMapRow {
+  id: string;
+  difficulty: Difficulty;
+  map_key: string;
+  map_json: unknown;
+  metrics_json: unknown;
+  created_at: Date;
+}
+
 @Injectable()
 export class GamesService implements OnModuleInit, OnModuleDestroy {
   private readonly turnTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -79,11 +89,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     private readonly realtime: RealtimeService,
   ) {}
 
-  onModuleInit(): void {
-    void this.db
-      .ready()
-      .then(() => this.restoreActiveTurnTimers())
-      .catch((error) => console.error(error));
+  async onModuleInit(): Promise<void> {
+    await this.db.ready();
+    await this.prepareSokobanMapPool();
+    await this.restoreActiveTurnTimers();
   }
 
   onModuleDestroy(): void {
@@ -280,7 +289,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     user: AuthAccount,
     opponentAccountId?: string,
     mode?: 'local_ai' | 'friend_match',
-    difficulty: Difficulty = 'easy',
+    difficulty: Difficulty = 'medium',
   ): Promise<GomokuSession> {
     this.assertDifficulty(difficulty);
     const resolvedMode = opponentAccountId ? 'friend_match' : mode ?? 'local_ai';
@@ -372,7 +381,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     user: AuthAccount,
     opponentAccountId?: string,
     mode?: 'local_ai' | 'friend_match',
-    difficulty: Difficulty = 'easy',
+    difficulty: Difficulty = 'medium',
   ): Promise<AlkkagiSession> {
     this.assertDifficulty(difficulty);
     const resolvedMode = opponentAccountId ? 'friend_match' : mode ?? 'local_ai';
@@ -531,7 +540,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     user: AuthAccount,
     opponentAccountId?: string,
     mode?: 'local_ai' | 'friend_match',
-    difficulty: Difficulty = 'easy',
+    difficulty: Difficulty = 'medium',
   ): Promise<OthelloSession> {
     this.assertDifficulty(difficulty);
     const resolvedMode = opponentAccountId ? 'friend_match' : mode ?? 'local_ai';
@@ -619,15 +628,14 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     opponentAccountId?: string,
   ): Promise<SokobanSession> {
     this.assertDifficulty(difficulty);
-    const map = sokobanMapForDifficulty(difficulty);
-    const initial = parseSokobanMap(map);
+    const initial = await this.selectSokobanMap(difficulty);
     const resolvedMode = opponentAccountId ? 'friend_match' : 'solo';
     const state: SokobanSession = {
       id: '',
       mode: resolvedMode,
       ownerAccountId: user.accountId,
       difficulty,
-      mapKey: map.key,
+      mapKey: initial.key,
       walls: initial.walls,
       goals: initial.goals,
       initialPlayer: initial.player,
@@ -872,6 +880,70 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return row;
   }
 
+  private async prepareSokobanMapPool(): Promise<void> {
+    if (process.env.GENERATE_MAP !== 'true') {
+      return;
+    }
+    const difficulties: Difficulty[] = ['easy', 'medium', 'hard'];
+    for (const difficulty of difficulties) {
+      for (let index = 0; index < 30; index += 1) {
+        const startedAt = Date.now();
+        const map = createVerifiedSokobanMap(difficulty);
+        this.validateGeneratedSokobanMap(map, difficulty);
+        await this.db.query(
+          `INSERT INTO sokoban_maps (difficulty, map_key, map_json, metrics_json)
+           VALUES ($1, $2, $3::jsonb, $4::jsonb)
+           ON CONFLICT (map_key) DO NOTHING`,
+          [difficulty, map.key, JSON.stringify(map), JSON.stringify(map.metrics)],
+        );
+        console.log(
+          `[sokoban-map] generated ${difficulty} ${index + 1}/30 ${map.key} in ${Date.now() - startedAt}ms`,
+        );
+      }
+    }
+  }
+
+  private async selectSokobanMap(difficulty: Difficulty): Promise<GeneratedSokobanMap> {
+    const result = await this.db.query<SokobanMapRow>(
+      `SELECT id, difficulty, map_key, map_json, metrics_json, created_at
+       FROM sokoban_maps
+       WHERE difficulty = $1
+       ORDER BY random()
+       LIMIT 1`,
+      [difficulty],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      return createSokobanMap(difficulty);
+    }
+    return generatedSokobanMapFromRow(row);
+  }
+
+  private validateGeneratedSokobanMap(map: GeneratedSokobanMap, difficulty: Difficulty): void {
+    const expectedBoxes = difficulty === 'easy' ? 1 : difficulty === 'medium' ? 2 : 3;
+    if (map.boxes.length !== expectedBoxes || map.goals.length !== expectedBoxes) {
+      throw new Error(`generated ${difficulty} sokoban map has invalid box/goal count`);
+    }
+    const session: SokobanSession = {
+      id: 'validation',
+      mode: 'solo',
+      ownerAccountId: 'validation',
+      difficulty,
+      mapKey: map.key,
+      walls: map.walls,
+      goals: map.goals,
+      initialPlayer: map.player,
+      initialBoxes: map.boxes,
+      state: createSokobanPlayerState(map),
+      status: 'playing',
+      createdAt: '',
+      updatedAt: '',
+    };
+    if (!isSokobanStateSolvable(session, session.state)) {
+      throw new Error(`generated ${difficulty} sokoban map is not solvable: ${map.key}`);
+    }
+  }
+
   private sudokuFromRow(row: GameRow): SudokuSession {
     return withRowDates(row.state_json as SudokuSession, row);
   }
@@ -1077,7 +1149,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private applyGomokuAiMove(session: GomokuSession): void {
-    const move = chooseGomokuAiMove(session, session.aiDifficulty ?? 'easy', Date.now() + GOMOKU_AI_BUDGET_MS);
+    const move = chooseGomokuAiMove(session, session.aiDifficulty ?? 'medium', Date.now() + GOMOKU_AI_BUDGET_MS);
     if (!move) {
       session.status = 'finished';
       session.finishReason = 'draw';
@@ -1102,7 +1174,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     const deadline = Date.now() + GOMOKU_AI_BUDGET_MS;
-    const move = chooseGomokuAiMove(session, session.aiDifficulty ?? 'easy', deadline) ?? randomGomokuMove(session.board);
+    const move = chooseGomokuAiMove(session, session.aiDifficulty ?? 'medium', deadline) ?? randomGomokuMove(session.board);
     if (!move) {
       session.status = 'finished';
       session.finishReason = 'draw';
@@ -1198,7 +1270,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     const deadline = Date.now() + ALKKAGI_AI_BUDGET_MS;
-    const shot = chooseAlkkagiAiShot(session, session.aiDifficulty ?? 'easy', deadline) ?? randomAlkkagiShot(session);
+    const shot = chooseAlkkagiAiShot(session, session.aiDifficulty ?? 'medium', deadline) ?? randomAlkkagiShot(session);
     if (!shot) {
       session.status = 'finished';
       session.winner = session.currentTurn === 'red' ? 'blue' : 'red';
@@ -1485,6 +1557,26 @@ function withRowDates<T extends { id: string; createdAt: string; updatedAt: stri
     status: row.status as T['status'],
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
+  };
+}
+
+function generatedSokobanMapFromRow(row: SokobanMapRow): GeneratedSokobanMap {
+  const value = row.map_json;
+  if (!value || typeof value !== 'object') {
+    throw new Error(`stored sokoban map is invalid: ${row.map_key}`);
+  }
+  const map = value as GeneratedSokobanMap;
+  return {
+    key: map.key || row.map_key,
+    walls: Array.isArray(map.walls) ? map.walls : [],
+    goals: Array.isArray(map.goals) ? map.goals : [],
+    player: map.player,
+    boxes: Array.isArray(map.boxes) ? map.boxes : [],
+    metrics: map.metrics ?? {
+      pushes: Number((row.metrics_json as Record<string, unknown> | undefined)?.pushes ?? 0),
+      boxLines: Number((row.metrics_json as Record<string, unknown> | undefined)?.boxLines ?? 0),
+      boxChanges: Number((row.metrics_json as Record<string, unknown> | undefined)?.boxChanges ?? 0),
+    },
   };
 }
 
@@ -2082,7 +2174,7 @@ function chooseOthelloAiMove(session: OthelloSession): { row: number; col: numbe
   if (moves.length === 0) {
     return undefined;
   }
-  const difficulty = session.aiDifficulty ?? 'easy';
+  const difficulty = session.aiDifficulty ?? 'medium';
   if (difficulty === 'easy') {
     return moves[Math.floor(Math.random() * moves.length)];
   }
@@ -2095,49 +2187,6 @@ function chooseOthelloAiMove(session: OthelloSession): { row: number; col: numbe
     return scored[Math.floor(Math.random() * Math.min(scored.length, 3))];
   }
   return scored[0];
-}
-
-const SOKOBAN_MAPS = {
-  easy: {
-    key: 'easy-1',
-    rows: ['#####', '#@$.#', '#   #', '#####'],
-  },
-  medium: {
-    key: 'medium-1',
-    rows: ['#######', '#  .  #', '# $$  #', '#  @  #', '#######'],
-  },
-  hard: {
-    key: 'hard-1',
-    rows: ['########', '#  .   #', '#  $   #', '# .$@  #', '#  $   #', '#  .   #', '########'],
-  },
-} as const;
-
-function sokobanMapForDifficulty(difficulty: Difficulty) {
-  return SOKOBAN_MAPS[difficulty];
-}
-
-function parseSokobanMap(map: { key: string; rows: readonly string[] }): {
-  walls: SokobanPosition[];
-  goals: SokobanPosition[];
-  player: SokobanPosition;
-  boxes: SokobanPosition[];
-} {
-  const walls: SokobanPosition[] = [];
-  const goals: SokobanPosition[] = [];
-  const boxes: SokobanPosition[] = [];
-  let player: SokobanPosition | undefined;
-  map.rows.forEach((line, row) => {
-    [...line].forEach((cell, col) => {
-      if (cell === '#') walls.push({ row, col });
-      if (cell === '.' || cell === '*' || cell === '+') goals.push({ row, col });
-      if (cell === '$' || cell === '*') boxes.push({ row, col });
-      if (cell === '@' || cell === '+') player = { row, col };
-    });
-  });
-  if (!player) {
-    throw new BadRequestException('sokoban map is missing player');
-  }
-  return { walls, goals, player, boxes };
 }
 
 function createSokobanPlayerState(input: { player: SokobanPosition; boxes: SokobanPosition[] }): SokobanPlayerState {

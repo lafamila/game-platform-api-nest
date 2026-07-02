@@ -162,5 +162,17 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       )
     `);
     await this.query(`CREATE INDEX IF NOT EXISTS idx_client_error_reports_account ON client_error_reports(account_id, created_at DESC)`);
+
+    await this.query(`
+      CREATE TABLE IF NOT EXISTS sokoban_maps (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        difficulty text NOT NULL,
+        map_key text NOT NULL UNIQUE,
+        map_json jsonb NOT NULL,
+        metrics_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+        created_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_sokoban_maps_difficulty ON sokoban_maps(difficulty, created_at DESC)`);
   }
 }
