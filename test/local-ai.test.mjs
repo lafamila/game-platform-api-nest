@@ -136,7 +136,7 @@ test('sokoban solo sessions finish as a loss when the puzzle becomes unsolvable'
   const service = new GamesService(db, new FakeRealtime());
 
   const session = await service.createSokobanSession(user, 'easy');
-  applySokobanDeadlockFixture(db.rows.get(session.id).state_json);
+  applySokobanPushDeadlockFixture(db.rows.get(session.id).state_json);
 
   const moved = await service.moveSokoban(session.id, user, 'right');
   assert.equal(moved.state.solved, false);
@@ -145,12 +145,27 @@ test('sokoban solo sessions finish as a loss when the puzzle becomes unsolvable'
   assert.equal(moved.winnerSide, undefined);
 });
 
+test('sokoban solo sessions skip deadlock checks for player-only moves', async () => {
+  const db = new FakeDb();
+  const service = new GamesService(db, new FakeRealtime());
+
+  const session = await service.createSokobanSession(user, 'easy');
+  applySokobanDeadlockFixture(db.rows.get(session.id).state_json);
+  db.rows.get(session.id).state_json.state.player = { row: 2, col: 2 };
+
+  const moved = await service.moveSokoban(session.id, user, 'left');
+  assert.equal(moved.state.moves, 1);
+  assert.equal(moved.state.solved, false);
+  assert.equal(moved.status, 'playing');
+  assert.equal(moved.finishReason, undefined);
+});
+
 test('sokoban matched sessions award the opponent when a player deadlocks', async () => {
   const db = new FakeDb();
   const service = new GamesService(db, new FakeRealtime());
 
   const session = await service.createSokobanSession(user, 'easy', opponent.accountId);
-  applySokobanDeadlockFixture(db.rows.get(session.id).state_json, true);
+  applySokobanPushDeadlockFixture(db.rows.get(session.id).state_json, true);
 
   const moved = await service.moveSokoban(session.id, user, 'right');
   assert.equal(moved.state.solved, false);
@@ -264,6 +279,42 @@ function applySokobanDeadlockFixture(session, matched = false) {
   const state = {
     player: { row: 2, col: 1 },
     boxes: [{ row: 1, col: 1 }],
+    moves: 0,
+    solved: false,
+  };
+  if (matched) {
+    session.states.challenger = state;
+  } else {
+    session.state = state;
+  }
+}
+
+function applySokobanPushDeadlockFixture(session, matched = false) {
+  session.mapKey = 'test-push-deadlock';
+  session.walls = [
+    { row: 0, col: 0 },
+    { row: 0, col: 1 },
+    { row: 0, col: 2 },
+    { row: 0, col: 3 },
+    { row: 0, col: 4 },
+    { row: 1, col: 0 },
+    { row: 1, col: 4 },
+    { row: 2, col: 0 },
+    { row: 2, col: 4 },
+    { row: 3, col: 0 },
+    { row: 3, col: 4 },
+    { row: 4, col: 0 },
+    { row: 4, col: 1 },
+    { row: 4, col: 2 },
+    { row: 4, col: 3 },
+    { row: 4, col: 4 },
+  ];
+  session.goals = [{ row: 3, col: 1 }];
+  session.initialPlayer = { row: 2, col: 1 };
+  session.initialBoxes = [{ row: 2, col: 2 }];
+  const state = {
+    player: { row: 2, col: 1 },
+    boxes: [{ row: 2, col: 2 }],
     moves: 0,
     solved: false,
   };

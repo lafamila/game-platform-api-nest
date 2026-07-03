@@ -674,14 +674,21 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.assertNotPaused(session);
     const side = this.sokobanSideForUser(session, user);
     const playerState = side ? ensureSokobanPlayerState(session, side) : session.state;
-    const moved = applySokobanMove(session, playerState, direction);
-    if (moved && playerState.solved) {
+    const moveResult = applySokobanMove(session, playerState, direction);
+    if (!moveResult.moved) {
+      return sessionForSokobanUser(session, user);
+    }
+    if (playerState.solved) {
       session.status = 'finished';
       session.solvedAt = new Date().toISOString();
       session.winnerSide = side ?? 'challenger';
       session.winnerAccountId = side ? session.players?.[side] : session.ownerAccountId;
       session.finishReason = side ? 'first_clear' : 'solo_clear';
-    } else if (moved && !isSokobanStateSolvable(session, playerState)) {
+    } else if (
+      moveResult.pushedBox &&
+      isSokobanBoxTouchingWall(session, moveResult.pushedBox) &&
+      !isSokobanStateSolvable(session, playerState)
+    ) {
       session.status = 'finished';
       session.finishReason = 'deadlock';
       if (side && session.players) {
@@ -2234,24 +2241,34 @@ function sessionForSokobanAccount(session: SokobanSession, accountId: string): S
   };
 }
 
-function applySokobanMove(session: SokobanSession, state: SokobanPlayerState, direction: string): boolean {
+function applySokobanMove(
+  session: SokobanSession,
+  state: SokobanPlayerState,
+  direction: string,
+): { moved: boolean; pushedBox?: SokobanPosition } {
   const delta = sokobanDelta(direction);
   const next = { row: state.player.row + delta.row, col: state.player.col + delta.col };
   if (!isSokobanFloor(session, next) || hasPosition(session.walls, next)) {
-    return false;
+    return { moved: false };
   }
   const boxIndex = state.boxes.findIndex((box) => samePosition(box, next));
+  let pushedBox: SokobanPosition | undefined;
   if (boxIndex >= 0) {
     const pushed = { row: next.row + delta.row, col: next.col + delta.col };
     if (!isSokobanFloor(session, pushed) || hasPosition(session.walls, pushed) || state.boxes.some((box, index) => index !== boxIndex && samePosition(box, pushed))) {
-      return false;
+      return { moved: false };
     }
     state.boxes[boxIndex] = pushed;
+    pushedBox = pushed;
   }
   state.player = next;
   state.moves += 1;
   state.solved = state.boxes.every((box) => hasPosition(session.goals, box));
-  return true;
+  return { moved: true, pushedBox };
+}
+
+function isSokobanBoxTouchingWall(session: SokobanSession, box: SokobanPosition): boolean {
+  return SOKOBAN_DELTAS.some((delta) => hasPosition(session.walls, { row: box.row + delta.row, col: box.col + delta.col }));
 }
 
 function isSokobanStateSolvable(session: SokobanSession, state: SokobanPlayerState): boolean {
