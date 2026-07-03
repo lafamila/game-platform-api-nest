@@ -9,6 +9,7 @@ import { GamePlatformSessionGuard } from './auth/session.guard';
 import { SessionController } from './auth/session.controller';
 import { RealtimeController } from './realtime/realtime.controller';
 import { RealtimeService } from './realtime/realtime.service';
+import { PresenceService } from './realtime/presence.service';
 import { SocialController } from './social/social.controller';
 import { SocialService } from './social/social.service';
 import { DiagnosticsController } from './diagnostics/diagnostics.controller';
@@ -25,6 +26,7 @@ import { DiagnosticsService } from './diagnostics/diagnostics.service';
     SocialService,
     DiagnosticsService,
     RealtimeService,
+    PresenceService,
   ],
 })
 export class AppModule {}

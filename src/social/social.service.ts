@@ -1,10 +1,12 @@
-import { BadRequestException, ForbiddenException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException, OnModuleDestroy, OnModuleInit, UnauthorizedException } from '@nestjs/common';
+import { Subscription } from 'rxjs';
 import { DatabaseService } from '../database/database.service';
 import { env } from '../config/env';
 import { AuthAccount, GamePlatformSession } from '../auth/auth.types';
 import { hasPlayerAccess } from '../auth/roles';
 import { GamesService } from '../games/games.service';
 import { RealtimeService } from '../realtime/realtime.service';
+import { PresenceService } from '../realtime/presence.service';
 
 interface FriendRequestRow {
   id: string;
@@ -59,12 +61,25 @@ export interface SocialAccountView {
 const SHADOW_PENDING_MS = 5 * 60 * 1000;
 
 @Injectable()
-export class SocialService {
+export class SocialService implements OnModuleInit, OnModuleDestroy {
+  private presenceSubscription?: Subscription;
+
   constructor(
     private readonly db: DatabaseService,
     private readonly games: GamesService,
     private readonly realtime: RealtimeService,
+    private readonly presence: PresenceService,
   ) {}
+
+  onModuleInit(): void {
+    this.presenceSubscription = this.realtime.presenceChanges().subscribe((change) => {
+      void this.emitPresenceToFriends(change.accountId, change.online);
+    });
+  }
+
+  onModuleDestroy(): void {
+    this.presenceSubscription?.unsubscribe();
+  }
 
   async searchAccounts(q: string) {
     if (!q || q.trim().length < 1) {
@@ -159,6 +174,7 @@ export class SocialService {
       row.requester_account_id === user.accountId ? row.recipient_account_id : row.requester_account_id,
     );
     const accounts = await this.accountMap(accountIds);
+    const onlineMap = await this.presence.onlineMap(accountIds);
     return {
       friends: result.rows.map((row) => {
         const accountId = row.requester_account_id === user.accountId ? row.recipient_account_id : row.requester_account_id;
@@ -166,6 +182,7 @@ export class SocialService {
           requestId: row.id,
           accountId,
           account: accounts.get(accountId) ?? accountViewFallback(accountId),
+          online: onlineMap.get(accountId) ?? false,
           createdAt: row.created_at.toISOString(),
           updatedAt: row.updated_at.toISOString(),
         };
@@ -334,6 +351,9 @@ export class SocialService {
       throw new BadRequestException('opponent must be another account');
     }
     await this.assertAreFriends(user.accountId, input.opponentAccountId);
+    if (!(await this.presence.isOnline(input.opponentAccountId))) {
+      throw new BadRequestException('opponent is offline');
+    }
     const result = await this.db.query<MatchRequestRow>(
       `INSERT INTO match_requests (game_key, requester_account_id, opponent_account_id, status)
        VALUES ($1, $2, $3, 'pending')
@@ -460,6 +480,26 @@ export class SocialService {
       [leftAccountId, rightAccountId],
     );
     return Boolean(row);
+  }
+
+  private async friendAccountIds(accountId: string): Promise<string[]> {
+    const result = await this.db.query<FriendRequestRow>(
+      `SELECT * FROM friend_requests
+       WHERE status = 'accepted'
+         AND (requester_account_id = $1 OR recipient_account_id = $1)`,
+      [accountId],
+    );
+    return result.rows.map((row) =>
+      row.requester_account_id === accountId ? row.recipient_account_id : row.requester_account_id,
+    );
+  }
+
+  private async emitPresenceToFriends(accountId: string, online: boolean): Promise<void> {
+    const friendIds = await this.friendAccountIds(accountId);
+    this.realtime.emitToAccounts(friendIds, 'friend.presence.changed', {
+      accountId,
+      online,
+    });
   }
 
   private async isBlocked(blockerAccountId: string, blockedAccountId: string): Promise<boolean> {

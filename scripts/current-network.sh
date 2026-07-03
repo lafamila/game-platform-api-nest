@@ -14,6 +14,9 @@ Environment:
   AUTH_PORT=3032
   API_HOST=<override detected host>
   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/game_platform
+  REDIS_URL=redis://127.0.0.1:6379
+  PRESENCE_REDIS_PREFIX=game-platform:presence
+  PRESENCE_TTL_SECONDS=75
   AUTH_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/teddy_auth
 
 Notes:
@@ -96,6 +99,9 @@ print_env() {
 PORT=${API_PORT:-3035}
 HOST=0.0.0.0
 DATABASE_URL=${DATABASE_URL:-postgres://postgres:postgres@127.0.0.1:5432/game_platform}
+REDIS_URL=${REDIS_URL:-redis://127.0.0.1:6379}
+PRESENCE_REDIS_PREFIX=${PRESENCE_REDIS_PREFIX:-game-platform:presence}
+PRESENCE_TTL_SECONDS=${PRESENCE_TTL_SECONDS:-75}
 AUTH_DATABASE_URL=${AUTH_DATABASE_URL:-postgres://postgres:postgres@127.0.0.1:5432/teddy_auth}
 AUTH_ISSUER_URL=${AUTH_ISSUER_URL:-http://localhost:${AUTH_PORT:-3032}}
 AUTH_API_BASE_URL=$(auth_base_url)
@@ -130,6 +136,9 @@ start_api() {
   export PORT="${PORT:-${API_PORT:-3035}}"
   export HOST="${HOST:-0.0.0.0}"
   export DATABASE_URL="${DATABASE_URL:-postgres://postgres:postgres@127.0.0.1:5432/game_platform}"
+  export REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}"
+  export PRESENCE_REDIS_PREFIX="${PRESENCE_REDIS_PREFIX:-game-platform:presence}"
+  export PRESENCE_TTL_SECONDS="${PRESENCE_TTL_SECONDS:-75}"
   export AUTH_ISSUER_URL="${AUTH_ISSUER_URL:-http://localhost:${AUTH_PORT:-3032}}"
   export AUTH_API_BASE_URL="${AUTH_API_BASE_URL:-$(auth_base_url)}"
   export AUTH_JWKS_URL="${AUTH_JWKS_URL:-http://localhost:${AUTH_PORT:-3032}/oauth/jwks}"
@@ -146,6 +155,7 @@ start_api() {
   export GAME_PLATFORM_ALLOWED_ORIGINS="${GAME_PLATFORM_ALLOWED_ORIGINS:-http://localhost:3036,http://127.0.0.1:3036}"
 
   echo "AUTH_API_BASE_URL=$AUTH_API_BASE_URL"
+  echo "REDIS_URL=$REDIS_URL"
   echo "GAME_PLATFORM_OIDC_REDIRECT_URI=$GAME_PLATFORM_OIDC_REDIRECT_URI"
   npm run start:dev
 }

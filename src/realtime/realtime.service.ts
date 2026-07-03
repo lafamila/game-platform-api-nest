@@ -1,11 +1,21 @@
 import { Injectable } from '@nestjs/common';
 import { MessageEvent } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { Observable, Subject, interval, map, merge } from 'rxjs';
+import { PresenceService } from './presence.service';
+
+export interface PresenceChange {
+  accountId: string;
+  online: boolean;
+}
 
 @Injectable()
 export class RealtimeService {
   private readonly accountStreams = new Map<string, Subject<MessageEvent>>();
   private readonly connectionCounts = new Map<string, number>();
+  private readonly presenceSubject = new Subject<PresenceChange>();
+
+  constructor(private readonly presence: PresenceService) {}
 
   streamForAccount(accountId: string): Observable<MessageEvent> {
     const subject = this.subjectFor(accountId);
@@ -16,11 +26,26 @@ export class RealtimeService {
       })),
     );
     return new Observable<MessageEvent>((subscriber) => {
+      const connectionId = randomUUID();
       this.setConnectionCount(accountId, 1);
+      void this.presence.connect(accountId, connectionId).then((changed) => {
+        if (changed) {
+          this.presenceSubject.next({ accountId, online: true });
+        }
+      });
+      const refreshTimer = setInterval(() => {
+        void this.presence.refresh(accountId, connectionId);
+      }, 25_000);
       const subscription = merge(subject.asObservable(), heartbeat).subscribe(subscriber);
       return () => {
+        clearInterval(refreshTimer);
         subscription.unsubscribe();
         this.setConnectionCount(accountId, -1);
+        void this.presence.disconnect(accountId, connectionId).then((changed) => {
+          if (changed) {
+            this.presenceSubject.next({ accountId, online: false });
+          }
+        });
       };
     });
   }
@@ -39,6 +64,10 @@ export class RealtimeService {
       return false;
     }
     return (this.connectionCounts.get(accountId) ?? 0) > 0;
+  }
+
+  presenceChanges(): Observable<PresenceChange> {
+    return this.presenceSubject.asObservable();
   }
 
   private subjectFor(accountId: string): Subject<MessageEvent> {
