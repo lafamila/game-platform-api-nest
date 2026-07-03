@@ -30,14 +30,17 @@ import {
   applyFortressMove,
   applyFortressShot,
   createFortressState,
+  ensureFortressRuntimeState,
   fortressClientSession,
   FortressFloatingPlatform,
+  FortressItemKey,
   FortressPosition,
   FortressSession,
   FortressShotResult,
   FortressSide,
   fortressSideForAccount,
   selectFortressTank,
+  updateFortressAim,
 } from './fortress-engine';
 import {
   AlkkagiPiece,
@@ -72,7 +75,7 @@ const FORTRESS_TURN_LIMIT_MS = 20_000;
 const GOMOKU_AI_BUDGET_MS = 900;
 const ALKKAGI_AI_BUDGET_MS = 1_400;
 const LOCAL_AI_RESPONSE_DELAY_MS = 180;
-const FORTRESS_AI_RESPONSE_DELAY_MS = LOCAL_AI_RESPONSE_DELAY_MS;
+const FORTRESS_AI_RESPONSE_DELAY_MS = 1_000;
 const FORTRESS_SHOT_ANIMATION_MS = 2_800;
 const DISCONNECT_GRACE_MS = 10_000;
 const EMOTE_COOLDOWN_MS = 3_000;
@@ -919,8 +922,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (session.mode === 'local_ai') {
       applyFortressAiTurn(session);
     }
-    if (session.mode === 'friend_match' && session.status === 'playing') {
-      this.startFortressTimedTurn(session, MATCH_READY_DELAY_MS);
+    if (session.status === 'playing') {
+      this.startFortressTimedTurn(session, session.mode === 'friend_match' ? MATCH_READY_DELAY_MS : 0);
     }
     const saved = await this.saveFortressSession(session);
     this.scheduleFortressTurnTimer(saved);
@@ -945,18 +948,36 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return fortressClientSession(saved, user.accountId);
   }
 
+  async updateFortressAim(
+    id: string,
+    user: AuthAccount,
+    angle: number,
+    power: number,
+    charging: boolean,
+  ): Promise<ReturnType<typeof fortressClientSession>> {
+    const session = this.fortressFromRow(await this.requireGameRow(id, 'fortress'));
+    this.assertFortressParticipant(user, session);
+    this.assertNotPaused(session);
+    const side = this.fortressSideForUser(session, user);
+    updateFortressAim(session, side, angle, power, charging);
+    const saved = await this.saveFortressSession(session);
+    this.emitSessionEvent(saved, 'fortress.state.changed', fortressClientSession(saved));
+    return fortressClientSession(saved, user.accountId);
+  }
+
   async shootFortress(
     id: string,
     user: AuthAccount,
     angle: number,
     power: number,
+    item?: FortressItemKey,
   ): Promise<FortressShotResult & { session: ReturnType<typeof fortressClientSession> }> {
     const session = this.fortressFromRow(await this.requireGameRow(id, 'fortress'));
     this.assertFortressParticipant(user, session);
     this.assertNotPaused(session);
     const side = this.fortressSideForUser(session, user);
-    const result = applyFortressShot(session, side, user.accountId, angle, power);
-    if (result.session.mode === 'friend_match' && result.session.status === 'playing') {
+    const result = applyFortressShot(session, side, user.accountId, angle, power, 'manual', item);
+    if (result.session.status === 'playing') {
       this.startFortressTimedTurn(result.session, FORTRESS_SHOT_ANIMATION_MS);
     }
     const saved = await this.saveFortressSession(result.session);
@@ -1173,6 +1194,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
           ? current.players[optionalFortressSide(snapshot.winnerSide)!]
           : undefined,
         movementRemaining: fortressMovementRemainingFromSnapshot(snapshot.movementRemaining, current.movementRemaining),
+        aim: fortressAimFromSnapshot(snapshot.aim, current.aim),
+        itemsUsed: fortressItemsUsedFromSnapshot(snapshot.itemsUsed, current.itemsUsed),
         floatingPlatforms: fortressFloatingPlatformsFromSnapshot(snapshot.floatingPlatforms),
         turnStartPositions: fortressPositionsFromSnapshot(snapshot.turnStartPositions, tanks),
         terrain: numberArrayFromSnapshot(snapshot.terrain, current.terrain),
@@ -1482,10 +1505,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
 
   private fortressFromRow(row: GameRow): FortressSession {
     const session = withRowDates(row.state_json as FortressSession, row);
-    session.movementRemaining ??= { challenger: 0, opponent: 0 };
-    session.floatingPlatforms ??= [];
-    session.turnStartPositions ??= currentFortressPositions(session);
-    return session;
+    return ensureFortressRuntimeState(session);
   }
 
   private async saveSplendorSession(session: SplendorSession): Promise<SplendorSession> {
@@ -1772,33 +1792,42 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (session.mode !== 'local_ai' || session.status !== 'playing' || session.currentTurn !== 'opponent') {
       return;
     }
-    setTimeout(async () => {
+    const timer = setTimeout(async () => {
       try {
         const current = this.fortressFromRow(await this.requireGameRow(session.id, 'fortress'));
         if (current.status !== 'playing' || current.mode !== 'local_ai' || current.currentTurn !== 'opponent') {
           return;
         }
         const result = applyFortressAiTurn(current);
+        if (result?.session.status === 'playing') {
+          this.startFortressTimedTurn(result.session, FORTRESS_SHOT_ANIMATION_MS);
+        }
         const saved = await this.saveFortressSession(current);
+        this.scheduleFortressTurnTimer(saved);
         if (result) {
           this.emitSessionEvent(saved, 'fortress.shot.played', {
             ...result,
             session: fortressClientSession(saved),
           });
-          if (saved.status === 'finished') {
-            this.emitSessionEvent(saved, 'game.session.finished', fortressClientSession(saved));
-          }
-        } else {
-          this.emitSessionEvent(saved, 'fortress.state.changed', fortressClientSession(saved));
+        if (saved.status === 'finished') {
+          this.emitSessionEvent(saved, 'game.session.finished', fortressClientSession(saved));
         }
+      } else {
+        this.emitSessionEvent(
+          saved,
+          saved.status === 'finished' ? 'game.session.finished' : 'fortress.state.changed',
+          fortressClientSession(saved),
+        );
+      }
       } catch (error) {
         console.warn('[fortress-ai]', error);
       }
     }, FORTRESS_AI_RESPONSE_DELAY_MS);
+    timer.unref?.();
   }
 
   private startFortressTimedTurn(session: FortressSession, delayMs = 0): void {
-    if (session.mode !== 'friend_match' || session.status !== 'playing' || session.pause?.active) {
+    if (!['friend_match', 'local_ai'].includes(session.mode ?? '') || session.status !== 'playing' || session.pause?.active) {
       return;
     }
     const now = Date.now();
@@ -1808,7 +1837,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
 
   private scheduleFortressTurnTimer(session: FortressSession): void {
     this.clearTurnTimer(session.id);
-    if (session.mode !== 'friend_match' || session.status !== 'playing' || session.pause?.active) {
+    if (!['friend_match', 'local_ai'].includes(session.mode ?? '') || session.status !== 'playing' || session.pause?.active) {
       return;
     }
     if (!session.turnDeadlineAt) {
@@ -1819,17 +1848,19 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     const delay = Math.max(100, Date.parse(deadline) - Date.now());
-    this.turnTimers.set(session.id, setTimeout(() => {
+    const timer = setTimeout(() => {
       void this.handleFortressTimer(session.id).catch((error) => {
         // Timer failures should not crash the API process.
         console.error(error);
       });
-    }, delay));
+    }, delay);
+    timer.unref?.();
+    this.turnTimers.set(session.id, timer);
   }
 
   private async handleFortressTimer(id: string): Promise<void> {
     const row = await this.requireGameRow(id, 'fortress');
-    if (row.mode !== 'friend_match' || row.status !== 'playing') {
+    if (!['friend_match', 'local_ai'].includes(row.mode) || row.status !== 'playing') {
       this.clearTurnTimer(id);
       return;
     }
@@ -1859,6 +1890,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (saved.status === 'finished') {
       this.emitSessionEvent(saved, 'game.session.finished', fortressClientSession(saved));
     }
+    this.scheduleFortressAi(saved);
   }
 
   private scheduleLocalGomokuAiTurn(id: string): void {
@@ -2633,6 +2665,59 @@ function fortressMovementRemainingFromSnapshot(
   };
 }
 
+function fortressAimFromSnapshot(
+  value: unknown,
+  fallback: FortressSession['aim'],
+): NonNullable<FortressSession['aim']> {
+  const source = isRecord(value) ? value : {};
+  return {
+    challenger: fortressAimSideFromSnapshot(source.challenger, fallback?.challenger, 'challenger'),
+    opponent: fortressAimSideFromSnapshot(source.opponent, fallback?.opponent, 'opponent'),
+  };
+}
+
+function fortressAimSideFromSnapshot(
+  value: unknown,
+  fallback: NonNullable<FortressSession['aim']>[FortressSide] | undefined,
+  side: FortressSide,
+): NonNullable<FortressSession['aim']>[FortressSide] {
+  const source = isRecord(value) ? value : {};
+  return {
+    angle: Math.max(-20, Math.min(85, finiteNumber(source.angle, fallback?.angle ?? 45))),
+    power: Math.max(0, Math.min(100, finiteNumber(source.power, fallback?.power ?? 0))),
+    charging: source.charging === true,
+    facing: source.facing === -1 || source.facing === 1
+      ? source.facing
+      : fallback?.facing ?? (side === 'challenger' ? 1 : -1),
+    lastPower: typeof source.lastPower === 'number'
+      ? Math.max(0, Math.min(100, finiteNumber(source.lastPower, 0)))
+      : fallback?.lastPower,
+    updatedAt: typeof source.updatedAt === 'string' ? source.updatedAt : fallback?.updatedAt,
+  };
+}
+
+function fortressItemsUsedFromSnapshot(
+  value: unknown,
+  fallback: FortressSession['itemsUsed'],
+): NonNullable<FortressSession['itemsUsed']> {
+  const source = isRecord(value) ? value : {};
+  return {
+    challenger: fortressItemsSideFromSnapshot(source.challenger, fallback?.challenger),
+    opponent: fortressItemsSideFromSnapshot(source.opponent, fallback?.opponent),
+  };
+}
+
+function fortressItemsSideFromSnapshot(
+  value: unknown,
+  fallback: NonNullable<FortressSession['itemsUsed']>[FortressSide] | undefined,
+): NonNullable<FortressSession['itemsUsed']>[FortressSide] {
+  const source = isRecord(value) ? value : {};
+  return {
+    doubleShot: source.doubleShot === true || fallback?.doubleShot === true,
+    airStrike: source.airStrike === true || fallback?.airStrike === true,
+  };
+}
+
 function fortressFloatingPlatformsFromSnapshot(value: unknown): FortressFloatingPlatform[] {
   if (!Array.isArray(value)) {
     return [];
@@ -2720,6 +2805,9 @@ function fortressShotsFromSnapshot(value: unknown): FortressSession['shots'] {
       source: item.source === 'ai' ? 'ai' as const : item.source === 'timeout' ? 'timeout' as const : 'manual' as const,
       tankKey: typeof item.tankKey === 'string' && ['balance', 'heavy', 'scout', 'bomber'].includes(item.tankKey)
         ? item.tankKey as FortressSession['shots'][number]['tankKey']
+        : undefined,
+      item: item.item === 'doubleShot' || item.item === 'airStrike'
+        ? item.item as FortressSession['shots'][number]['item']
         : undefined,
       hit,
       damage: typeof item.damage === 'number' ? item.damage : undefined,

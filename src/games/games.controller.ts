@@ -275,9 +275,14 @@ export class GamesController {
     return this.games.moveFortress(id, user, Number(body.distance));
   }
 
+  @Post('fortress/sessions/:id/aim')
+  updateFortressAim(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { angle: number; power: number; charging?: boolean }) {
+    return this.games.updateFortressAim(id, user, Number(body.angle), Number(body.power), body.charging === true);
+  }
+
   @Post('fortress/sessions/:id/shots')
-  shootFortress(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { angle: number; power: number }) {
-    return this.games.shootFortress(id, user, Number(body.angle), Number(body.power));
+  shootFortress(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { angle: number; power: number; item?: 'doubleShot' | 'airStrike' }) {
+    return this.games.shootFortress(id, user, Number(body.angle), Number(body.power), body.item);
   }
 
   @Post('fortress/sessions/:id/emotes')

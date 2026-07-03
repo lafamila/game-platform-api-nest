@@ -172,7 +172,7 @@ test('fortress local sessions use a long world and answer player shots', async (
   assert.equal(result.session.shots[0].source, 'manual');
 
   if (result.session.status === 'playing') {
-    await wait(350);
+    await wait(1_150);
     const answered = await service.getFortressSession(session.id, user);
     assert.equal(answered.shots.length, 2);
     assert.equal(answered.shots[1].source, 'ai');

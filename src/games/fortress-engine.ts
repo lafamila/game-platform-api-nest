@@ -3,6 +3,7 @@ import { Difficulty, GameMode, MatchPauseState } from './games.types';
 
 export type FortressSide = 'challenger' | 'opponent';
 export type FortressTankKey = 'balance' | 'heavy' | 'scout' | 'bomber';
+export type FortressItemKey = 'doubleShot' | 'airStrike';
 
 export interface FortressTankDefinition {
   key: FortressTankKey;
@@ -34,6 +35,20 @@ export interface FortressPosition {
   y: number;
 }
 
+export interface FortressAimState {
+  angle: number;
+  power: number;
+  charging: boolean;
+  facing: -1 | 1;
+  lastPower?: number;
+  updatedAt?: string;
+}
+
+export interface FortressItemState {
+  doubleShot: boolean;
+  airStrike: boolean;
+}
+
 export interface FortressFloatingPlatform {
   id: string;
   x1: number;
@@ -47,6 +62,7 @@ export interface FortressShot {
   accountId: string;
   angle: number;
   power: number;
+  item?: FortressItemKey;
   createdAt: string;
   source?: 'manual' | 'ai' | 'timeout';
   tankKey?: FortressTankKey;
@@ -61,6 +77,8 @@ export interface FortressSession {
   currentTurn: FortressSide;
   movementRemaining: Record<FortressSide, number>;
   turnStartPositions?: Record<FortressSide, FortressPosition>;
+  aim?: Record<FortressSide, FortressAimState>;
+  itemsUsed?: Record<FortressSide, FortressItemState>;
   winnerSide?: FortressSide;
   winnerAccountId?: string;
   status: 'selecting' | 'playing' | 'finished';
@@ -83,12 +101,21 @@ export interface FortressShotResult {
   animation: {
     frameMs: number;
     projectile: Array<{ x: number; y: number }>;
+    sequences?: FortressShotAnimationSequence[];
     terrainBefore: number[];
     terrainAfter: number[];
     tanksBefore: Record<FortressSide, FortressTankState>;
     tanksAfter: Record<FortressSide, FortressTankState>;
     impact?: { x: number; y: number; radius: number };
   };
+}
+
+interface FortressShotAnimationSequence {
+  kind: 'shot' | 'airStrike';
+  projectile: Array<{ x: number; y: number }>;
+  terrainBefore: number[];
+  terrainAfter: number[];
+  impact?: { x: number; y: number; radius: number };
 }
 
 const WORLD_WIDTH = 1800;
@@ -103,6 +130,11 @@ const FORTRESS_POWER_MIN = 16;
 const FORTRESS_POWER_MAX = 78;
 const FORTRESS_DEFAULT_POWER = 46;
 const FORTRESS_PROJECTILE_POWER_SCALE = 0.3;
+const FORTRESS_UI_POWER_MIN = 0;
+const FORTRESS_UI_POWER_MAX = 100;
+const FORTRESS_ANGLE_MIN = -20;
+const FORTRESS_ANGLE_MAX = 85;
+const FORTRESS_DEFAULT_ANGLE = 45;
 
 export const FORTRESS_TANKS: Record<FortressTankKey, FortressTankDefinition> = {
   balance: {
@@ -184,6 +216,14 @@ export function createFortressState(
       challenger: 0,
       opponent: 0,
     },
+    aim: {
+      challenger: defaultFortressAim('challenger'),
+      opponent: defaultFortressAim('opponent'),
+    },
+    itemsUsed: {
+      challenger: defaultFortressItems(),
+      opponent: defaultFortressItems(),
+    },
     turnStartPositions: {
       challenger: {
         x: challengerX,
@@ -247,6 +287,7 @@ export function fortressClientSession(
   tankDefinitions: FortressTankDefinition[];
   world: { width: number; height: number };
 } {
+  ensureFortressRuntimeState(session);
   return {
     ...session,
     mySide: accountId ? fortressSideForAccount(session, accountId) : undefined,
@@ -255,11 +296,31 @@ export function fortressClientSession(
   };
 }
 
+export function ensureFortressRuntimeState(session: FortressSession): FortressSession {
+  session.movementRemaining ??= { challenger: 0, opponent: 0 };
+  session.turnStartPositions ??= currentFortressPositions(session);
+  session.floatingPlatforms ??= [];
+  session.aim ??= {
+    challenger: defaultFortressAim('challenger'),
+    opponent: defaultFortressAim('opponent'),
+  };
+  session.aim.challenger = normalizeFortressAim(session.aim.challenger, 'challenger');
+  session.aim.opponent = normalizeFortressAim(session.aim.opponent, 'opponent');
+  session.itemsUsed ??= {
+    challenger: defaultFortressItems(),
+    opponent: defaultFortressItems(),
+  };
+  session.itemsUsed.challenger = normalizeFortressItems(session.itemsUsed.challenger);
+  session.itemsUsed.opponent = normalizeFortressItems(session.itemsUsed.opponent);
+  return session;
+}
+
 export function selectFortressTank(
   session: FortressSession,
   side: FortressSide,
   tankKey: string,
 ): void {
+  ensureFortressRuntimeState(session);
   if (session.status !== 'selecting') {
     throw new BadRequestException('tank selection is closed');
   }
@@ -276,11 +337,34 @@ export function selectFortressTank(
   session.updatedAt = new Date().toISOString();
 }
 
+export function updateFortressAim(
+  session: FortressSession,
+  side: FortressSide,
+  angle: number,
+  power: number,
+  charging: boolean,
+): FortressSession {
+  assertFortressTurn(session, side);
+  ensureFortressRuntimeState(session);
+  const current = session.aim![side];
+  session.aim![side] = {
+    angle: sanitizeFortressAngle(angle),
+    power: sanitizeFortressUiPower(power),
+    charging,
+    facing: current.facing,
+    lastPower: current.lastPower,
+    updatedAt: new Date().toISOString(),
+  };
+  session.updatedAt = new Date().toISOString();
+  return session;
+}
+
 export function applyFortressMove(
   session: FortressSession,
   side: FortressSide,
   distance: number,
 ): FortressSession {
+  ensureFortressRuntimeState(session);
   assertFortressTurn(session, side);
   const tank = session.tanks[side];
   ensureFortressMovementBudget(session, side);
@@ -291,7 +375,15 @@ export function applyFortressMove(
   const requested = finiteNumber(distance, 0);
   const clamped = Math.sign(requested) * Math.min(Math.abs(requested), remaining);
   const previousY = tank.y;
-  tank.x = Math.max(60, Math.min(WORLD_WIDTH - 60, tank.x + (side === 'opponent' ? -clamped : clamped)));
+  const worldDelta = side === 'opponent' ? -clamped : clamped;
+  tank.x = Math.max(60, Math.min(WORLD_WIDTH - 60, tank.x + worldDelta));
+  if (Math.abs(worldDelta) > 0.01) {
+    session.aim![side] = {
+      ...session.aim![side],
+      facing: worldDelta >= 0 ? 1 : -1,
+      updatedAt: new Date().toISOString(),
+    };
+  }
   session.movementRemaining[side] = Math.max(0, remaining - Math.abs(clamped));
   tank.y = fortressSurfaceHeightAt(session.terrain, session.floatingPlatforms, tank.x);
   applyFortressFallDamage(tank, tank.y - previousY);
@@ -314,32 +406,57 @@ export function applyFortressShot(
   angle: number,
   power: number,
   source: 'manual' | 'ai' | 'timeout' = 'manual',
+  item?: FortressItemKey,
 ): FortressShotResult {
+  ensureFortressRuntimeState(session);
   assertFortressTurn(session, side);
   const terrainBefore = [...session.terrain];
   const tanksBefore = cloneFortressTanks(session.tanks);
   const shooter = session.tanks[side];
   const definition = fortressTank(shooter.tankKey);
-  const sanitizedAngle = Math.max(5, Math.min(85, finiteNumber(angle, 45)));
-  const sanitizedPower = Math.max(FORTRESS_POWER_MIN, Math.min(FORTRESS_POWER_MAX, finiteNumber(power, FORTRESS_DEFAULT_POWER)));
-  const projectile = simulateProjectile(session, side, sanitizedAngle, sanitizedPower, definition);
-  const last = projectile[projectile.length - 1] ?? { x: shooter.x, y: shooter.y - 24 };
-  const hit = projectileHit(session, projectile, side);
-  let damage = 0;
-  if (hit.kind !== 'out') {
-    damage = applyFortressExplosion(session, hit.x, hit.y, definition);
+  const sanitizedAngle = sanitizeFortressAngle(angle);
+  const sanitizedPower = sanitizeFortressUiPower(power);
+  const projectilePower = fortressUiPowerToProjectilePower(sanitizedPower);
+  const itemKey = normalizeFortressItemKey(item);
+  if (itemKey) {
+    const items = session.itemsUsed![side];
+    if (items[itemKey]) {
+      throw new BadRequestException('fortress item is already used');
+    }
+    items[itemKey] = true;
   }
-  settleFortressTank(session, session.tanks.challenger);
-  settleFortressTank(session, session.tanks.opponent);
-  if (!session.tanks.challenger.alive || session.tanks.challenger.y >= WORLD_HEIGHT - 1) {
-    finishFortress(session, 'opponent', 'fall');
-  } else if (!session.tanks.opponent.alive || session.tanks.opponent.y >= WORLD_HEIGHT - 1) {
-    finishFortress(session, 'challenger', 'fall');
-  } else if (session.tanks.challenger.hp <= 0) {
-    finishFortress(session, 'opponent', 'hp');
-  } else if (session.tanks.opponent.hp <= 0) {
-    finishFortress(session, 'challenger', 'hp');
-  } else {
+  session.aim![side] = {
+    ...session.aim![side],
+    angle: sanitizedAngle,
+    power: FORTRESS_UI_POWER_MIN,
+    charging: false,
+    lastPower: sanitizedPower,
+    updatedAt: new Date().toISOString(),
+  };
+  const sequences: FortressShotAnimationSequence[] = [];
+  const first = applyFortressShotSequence(session, side, sanitizedAngle, projectilePower, definition, 'shot');
+  sequences.push(first.sequence);
+  let damage = first.damage;
+  let hit = first.hit;
+  let last = first.projectile[first.projectile.length - 1] ?? { x: shooter.x, y: shooter.y - 24 };
+  if (!settleAndFinishFortressIfNeeded(session)) {
+    if (itemKey === 'doubleShot') {
+      const second = applyFortressShotSequence(session, side, sanitizedAngle, projectilePower, definition, 'shot');
+      sequences.push(second.sequence);
+      damage = Math.max(damage, second.damage);
+      hit = second.hit;
+      last = second.projectile[second.projectile.length - 1] ?? last;
+      settleAndFinishFortressIfNeeded(session);
+    } else if (itemKey === 'airStrike' && hit.kind !== 'out') {
+      const strike = applyFortressAirStrikeSequence(session, side, hit.x, definition);
+      sequences.push(strike.sequence);
+      damage = Math.max(damage, strike.damage);
+      hit = strike.hit;
+      last = strike.projectile[strike.projectile.length - 1] ?? last;
+      settleAndFinishFortressIfNeeded(session);
+    }
+  }
+  if (session.status !== 'finished') {
     advanceFortressTurn(session, side);
   }
   session.shots.push({
@@ -347,6 +464,7 @@ export function applyFortressShot(
     accountId,
     angle: sanitizedAngle,
     power: sanitizedPower,
+    item: itemKey,
     createdAt: new Date().toISOString(),
     source,
     tankKey: definition.key,
@@ -358,12 +476,15 @@ export function applyFortressShot(
     session,
     animation: {
       frameMs: 24,
-      projectile,
+      projectile: first.projectile,
+      sequences,
       terrainBefore,
       terrainAfter: [...session.terrain],
       tanksBefore,
       tanksAfter: cloneFortressTanks(session.tanks),
-      impact: hit.kind === 'out' ? { x: last.x, y: last.y, radius: 0 } : { x: hit.x, y: hit.y, radius: definition.explosionRadius },
+      impact: hit.kind === 'out'
+        ? { x: last.x, y: last.y, radius: 0 }
+        : { x: hit.x, y: hit.y, radius: itemKey === 'airStrike' ? definition.explosionRadius * 1.5 : definition.explosionRadius },
     },
   };
 }
@@ -379,8 +500,15 @@ export function applyFortressAiTurn(session: FortressSession): FortressShotResul
   if (session.currentTurn !== 'opponent') {
     return undefined;
   }
+  const moveDistance = chooseFortressAiMove(session, session.aiDifficulty ?? 'medium');
+  if (Math.abs(moveDistance) > 0.1) {
+    applyFortressMove(session, 'opponent', moveDistance);
+    if (session.winnerSide) {
+      return undefined;
+    }
+  }
   const choice = chooseFortressAiShot(session, session.aiDifficulty ?? 'medium');
-  return applyFortressShot(session, 'opponent', session.players.opponent, choice.angle, choice.power, 'ai');
+  return applyFortressShot(session, 'opponent', session.players.opponent, choice.angle, fortressProjectilePowerToUiPower(choice.power), 'ai');
 }
 
 export function applyFortressForfeit(session: FortressSession, side: FortressSide): void {
@@ -554,11 +682,12 @@ function simulateProjectile(
   power: number,
   definition: FortressTankDefinition,
 ): Array<{ x: number; y: number }> {
+  ensureFortressRuntimeState(session);
   const shooter = session.tanks[side];
-  const direction = side === 'challenger' ? 1 : -1;
+  const direction = session.aim![side].facing;
   const radians = angle / 180 * Math.PI;
   const slope = fortressSurfaceSlopeAt(session, shooter.x);
-  const muzzle = tankMuzzlePoint(session, shooter, side, angle);
+  const muzzle = tankMuzzlePoint(session, shooter, direction, angle);
   const velocity = rotateScreenVector(
     {
       x: Math.cos(radians) * direction,
@@ -598,6 +727,98 @@ function simulateProjectile(
   return frames;
 }
 
+function applyFortressShotSequence(
+  session: FortressSession,
+  side: FortressSide,
+  angle: number,
+  projectilePower: number,
+  definition: FortressTankDefinition,
+  kind: FortressShotAnimationSequence['kind'],
+): {
+  projectile: Array<{ x: number; y: number }>;
+  sequence: FortressShotAnimationSequence;
+  hit: { kind: 'terrain' | 'tank' | 'out'; x: number; y: number; tankSide?: FortressSide };
+  damage: number;
+} {
+  const terrainBefore = [...session.terrain];
+  const projectile = simulateProjectile(session, side, angle, projectilePower, definition);
+  const hit = projectileHit(session, projectile, side);
+  let damage = 0;
+  if (hit.kind !== 'out') {
+    damage = applyFortressExplosion(session, hit.x, hit.y, definition);
+  }
+  const last = projectile[projectile.length - 1] ?? { x: session.tanks[side].x, y: session.tanks[side].y - 24 };
+  return {
+    projectile,
+    hit,
+    damage,
+    sequence: {
+      kind,
+      projectile,
+      terrainBefore,
+      terrainAfter: [...session.terrain],
+      impact: hit.kind === 'out' ? { x: last.x, y: last.y, radius: 0 } : { x: hit.x, y: hit.y, radius: definition.explosionRadius },
+    },
+  };
+}
+
+function applyFortressAirStrikeSequence(
+  session: FortressSession,
+  side: FortressSide,
+  x: number,
+  definition: FortressTankDefinition,
+): {
+  projectile: Array<{ x: number; y: number }>;
+  sequence: FortressShotAnimationSequence;
+  hit: { kind: 'terrain' | 'tank' | 'out'; x: number; y: number; tankSide?: FortressSide };
+  damage: number;
+} {
+  const terrainBefore = [...session.terrain];
+  const projectile = simulateAirStrike(session, x);
+  const hit = projectileHit(session, projectile, side);
+  let damage = 0;
+  const radiusScale = 1.5;
+  if (hit.kind !== 'out') {
+    damage = applyFortressExplosion(session, hit.x, hit.y, definition, radiusScale);
+  }
+  const last = projectile[projectile.length - 1] ?? { x, y: 0 };
+  return {
+    projectile,
+    hit,
+    damage,
+    sequence: {
+      kind: 'airStrike',
+      projectile,
+      terrainBefore,
+      terrainAfter: [...session.terrain],
+      impact: hit.kind === 'out'
+        ? { x: last.x, y: last.y, radius: 0 }
+        : { x: hit.x, y: hit.y, radius: definition.explosionRadius * radiusScale },
+    },
+  };
+}
+
+function simulateAirStrike(session: FortressSession, x: number): Array<{ x: number; y: number }> {
+  const clampedX = Math.max(0, Math.min(WORLD_WIDTH, x));
+  const frames: Array<{ x: number; y: number }> = [];
+  let previous = { x: clampedX, y: -88 };
+  for (let y = -70; y <= WORLD_HEIGHT + 80; y += 20) {
+    const point = { x: clampedX, y };
+    frames.push(point);
+    const surfaceHit = projectileSurfaceHit(session, previous, point);
+    if (surfaceHit) {
+      frames[frames.length - 1] = { x: surfaceHit.x, y: surfaceHit.y };
+      break;
+    }
+    const hitTank = tankHitAt(session, point, 'challenger', 999);
+    if (hitTank) {
+      break;
+    }
+    previous = point;
+  }
+  return frames;
+}
+
 function projectileHit(
   session: FortressSession,
   projectile: Array<{ x: number; y: number }>,
@@ -631,8 +852,9 @@ function applyFortressExplosion(
   x: number,
   y: number,
   definition: FortressTankDefinition,
+  radiusScale = 1,
 ): number {
-  const radius = definition.explosionRadius;
+  const radius = definition.explosionRadius * radiusScale;
   for (let index = 0; index < session.terrain.length; index++) {
     const terrainX = indexToWorldX(index);
     const dx = Math.abs(terrainX - x);
@@ -666,6 +888,21 @@ function settleFortressTank(session: FortressSession, tank: FortressTankState): 
   }
 }
 
+function settleAndFinishFortressIfNeeded(session: FortressSession): boolean {
+  settleFortressTank(session, session.tanks.challenger);
+  settleFortressTank(session, session.tanks.opponent);
+  if (!session.tanks.challenger.alive || session.tanks.challenger.y >= WORLD_HEIGHT - 1) {
+    finishFortress(session, 'opponent', 'fall');
+  } else if (!session.tanks.opponent.alive || session.tanks.opponent.y >= WORLD_HEIGHT - 1) {
+    finishFortress(session, 'challenger', 'fall');
+  } else if (session.tanks.challenger.hp <= 0) {
+    finishFortress(session, 'opponent', 'hp');
+  } else if (session.tanks.opponent.hp <= 0) {
+    finishFortress(session, 'challenger', 'hp');
+  }
+  return session.status === 'finished';
+}
+
 function advanceFortressTurn(session: FortressSession, side: FortressSide): void {
   beginFortressTurn(session, otherFortressSide(side));
   session.wind = nextFortressWind(session.wind);
@@ -673,6 +910,7 @@ function advanceFortressTurn(session: FortressSession, side: FortressSide): void
 }
 
 function beginFortressTurn(session: FortressSession, side: FortressSide): void {
+  ensureFortressRuntimeState(session);
   session.currentTurn = side;
   session.movementRemaining ??= { challenger: 0, opponent: 0 };
   session.movementRemaining[side] = fortressTank(session.tanks[side].tankKey).movement;
@@ -681,6 +919,12 @@ function beginFortressTurn(session: FortressSession, side: FortressSide): void {
   session.turnStartPositions[side] = {
     x: session.tanks[side].x,
     y: session.tanks[side].y,
+  };
+  session.aim![side] = {
+    ...session.aim![side],
+    power: FORTRESS_UI_POWER_MIN,
+    charging: false,
+    updatedAt: new Date().toISOString(),
   };
 }
 
@@ -697,6 +941,39 @@ function finishFortress(session: FortressSession, winnerSide: FortressSide, reas
   session.winnerAccountId = session.players[winnerSide];
   session.finishReason = reason;
   session.updatedAt = new Date().toISOString();
+}
+
+function chooseFortressAiMove(session: FortressSession, difficulty: Difficulty): number {
+  ensureFortressRuntimeState(session);
+  const remaining = Math.max(0, session.movementRemaining.opponent ?? 0);
+  if (remaining <= 1) {
+    return 0;
+  }
+  if (difficulty === 'easy' && Math.random() < 0.55) {
+    return randomBetween(-remaining * 0.34, remaining * 0.34);
+  }
+  const shooter = session.tanks.opponent;
+  const target = session.tanks.challenger;
+  const currentDistance = Math.abs(target.x - shooter.x);
+  const desiredDistance = difficulty === 'hard'
+    ? randomBetween(580, 760)
+    : difficulty === 'medium'
+      ? randomBetween(650, 850)
+      : randomBetween(560, 920);
+  const tolerance = difficulty === 'hard' ? 55 : difficulty === 'medium' ? 90 : 145;
+  let worldDelta = 0;
+  const towardTarget = target.x > shooter.x ? 1 : -1;
+  if (currentDistance > desiredDistance + tolerance) {
+    worldDelta = towardTarget * Math.min(remaining, (currentDistance - desiredDistance) * 0.42);
+  } else if (currentDistance < desiredDistance - tolerance) {
+    worldDelta = -towardTarget * Math.min(remaining, (desiredDistance - currentDistance) * 0.36);
+  } else {
+    const wiggle = difficulty === 'hard' ? 0.18 : difficulty === 'medium' ? 0.28 : 0.42;
+    worldDelta = randomBetween(-remaining * wiggle, remaining * wiggle);
+  }
+  worldDelta += randomBetween(-remaining * 0.08, remaining * 0.08);
+  const clampedWorldDelta = Math.max(-remaining, Math.min(remaining, worldDelta));
+  return -clampedWorldDelta;
 }
 
 function chooseFortressAiShot(session: FortressSession, difficulty: Difficulty): { angle: number; power: number } {
@@ -717,7 +994,7 @@ function chooseFortressAiShot(session: FortressSession, difficulty: Difficulty):
   const definition = fortressTank(shooter.tankKey);
   const angleStep = difficulty === 'hard' ? 2 : 4;
   const powerStep = difficulty === 'hard' ? 3 : 5;
-  const angleMin = difficulty === 'hard' ? 10 : 14;
+  const angleMin = difficulty === 'hard' ? FORTRESS_ANGLE_MIN : -8;
   const angleMax = difficulty === 'hard' ? 82 : 78;
   const powerMin = difficulty === 'hard' ? FORTRESS_POWER_MIN : FORTRESS_POWER_MIN + 4;
   const powerMax = FORTRESS_POWER_MAX;
@@ -797,7 +1074,7 @@ function perturbFortressAiShot(
   const angleJitter = difficulty === 'hard' ? 0.7 : 2.2;
   const powerJitter = difficulty === 'hard' ? 1.4 : 4;
   return {
-    angle: Math.max(8, Math.min(84, shot.angle + randomBetween(-angleJitter, angleJitter))),
+    angle: Math.max(FORTRESS_ANGLE_MIN, Math.min(84, shot.angle + randomBetween(-angleJitter, angleJitter))),
     power: Math.max(FORTRESS_POWER_MIN, Math.min(FORTRESS_POWER_MAX, shot.power + randomBetween(-powerJitter, powerJitter))),
   };
 }
@@ -896,17 +1173,17 @@ function rotateScreenVector(vector: { x: number; y: number }, radians: number): 
 function tankMuzzlePoint(
   session: FortressSession,
   tank: FortressTankState,
-  side: FortressSide,
+  direction: -1 | 1,
   angle: number,
 ): { x: number; y: number } {
   const slope = fortressSurfaceSlopeAt(session, tank.x);
-  const direction = side === 'challenger' ? 1 : -1;
   const radians = angle / 180 * Math.PI;
-  const turret = rotateScreenVector({ x: 0, y: -31 }, slope);
+  const geometry = fortressTankVisualGeometry(tank.tankKey);
+  const turret = rotateScreenVector({ x: 0, y: -geometry.bodyHeight - 4 }, slope);
   const barrel = rotateScreenVector(
     {
-      x: Math.cos(radians) * 38 * direction,
-      y: -Math.sin(radians) * 38,
+      x: Math.cos(radians) * geometry.barrelLength * direction,
+      y: -Math.sin(radians) * geometry.barrelLength,
     },
     slope,
   );
@@ -914,6 +1191,19 @@ function tankMuzzlePoint(
     x: tank.x + turret.x + barrel.x,
     y: tank.y + turret.y + barrel.y,
   };
+}
+
+function fortressTankVisualGeometry(tankKey: FortressTankKey | undefined): { bodyHeight: number; barrelLength: number } {
+  if (tankKey === 'heavy') {
+    return { bodyHeight: 30, barrelLength: 45 };
+  }
+  if (tankKey === 'scout') {
+    return { bodyHeight: 24, barrelLength: 36 };
+  }
+  if (tankKey === 'bomber') {
+    return { bodyHeight: 28, barrelLength: 50 };
+  }
+  return { bodyHeight: 26, barrelLength: 40 };
 }
 
 function carveFortressPlatforms(
@@ -1001,6 +1291,64 @@ function rotatedTankBodyHit(
 
 function indexToWorldX(index: number): number {
   return index / (TERRAIN_SAMPLES - 1) * WORLD_WIDTH;
+}
+
+function defaultFortressAim(side: FortressSide): FortressAimState {
+  return {
+    angle: FORTRESS_DEFAULT_ANGLE,
+    power: FORTRESS_UI_POWER_MIN,
+    charging: false,
+    facing: side === 'challenger' ? 1 : -1,
+  };
+}
+
+function defaultFortressItems(): FortressItemState {
+  return {
+    doubleShot: false,
+    airStrike: false,
+  };
+}
+
+function normalizeFortressAim(value: FortressAimState | undefined, side: FortressSide): FortressAimState {
+  const fallback = defaultFortressAim(side);
+  return {
+    angle: sanitizeFortressAngle(value?.angle ?? fallback.angle),
+    power: sanitizeFortressUiPower(value?.power ?? fallback.power),
+    charging: value?.charging === true,
+    facing: value?.facing === -1 || value?.facing === 1 ? value.facing : fallback.facing,
+    lastPower: value?.lastPower === undefined ? undefined : sanitizeFortressUiPower(value.lastPower),
+    updatedAt: value?.updatedAt,
+  };
+}
+
+function normalizeFortressItems(value: FortressItemState | undefined): FortressItemState {
+  return {
+    doubleShot: value?.doubleShot === true,
+    airStrike: value?.airStrike === true,
+  };
+}
+
+function normalizeFortressItemKey(value: FortressItemKey | undefined): FortressItemKey | undefined {
+  return value === 'doubleShot' || value === 'airStrike' ? value : undefined;
+}
+
+function sanitizeFortressAngle(value: number): number {
+  return Math.max(FORTRESS_ANGLE_MIN, Math.min(FORTRESS_ANGLE_MAX, finiteNumber(value, FORTRESS_DEFAULT_ANGLE)));
+}
+
+function sanitizeFortressUiPower(value: number): number {
+  return Math.max(FORTRESS_UI_POWER_MIN, Math.min(FORTRESS_UI_POWER_MAX, finiteNumber(value, FORTRESS_UI_POWER_MIN)));
+}
+
+function fortressUiPowerToProjectilePower(value: number): number {
+  const ratio = sanitizeFortressUiPower(value) / FORTRESS_UI_POWER_MAX;
+  return FORTRESS_POWER_MIN + ratio * (FORTRESS_POWER_MAX - FORTRESS_POWER_MIN);
+}
+
+function fortressProjectilePowerToUiPower(value: number): number {
+  const ratio = (Math.max(FORTRESS_POWER_MIN, Math.min(FORTRESS_POWER_MAX, finiteNumber(value, FORTRESS_DEFAULT_POWER))) - FORTRESS_POWER_MIN)
+    / (FORTRESS_POWER_MAX - FORTRESS_POWER_MIN);
+  return Math.max(FORTRESS_UI_POWER_MIN, Math.min(FORTRESS_UI_POWER_MAX, ratio * FORTRESS_UI_POWER_MAX));
 }
 
 function nextFortressWind(previous?: number): number {
