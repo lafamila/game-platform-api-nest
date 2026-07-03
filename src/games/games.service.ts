@@ -6,11 +6,31 @@ import { RealtimeService } from '../realtime/realtime.service';
 import { createSudoku, isSolvedSudoku } from './sudoku-generator';
 import { createSokobanMap, createVerifiedSokobanMap, GeneratedSokobanMap } from './sokoban-generator';
 import {
+  applySplendorAiTurn,
+  applySplendorBuy,
+  applySplendorForfeit,
+  applySplendorReserve,
+  applySplendorTakeTokens,
+  createSplendorDecks,
+  createSplendorState,
+  splendorClientSession,
+  SplendorCard,
+  SplendorClientSession,
+  SplendorNoble,
+  SplendorPlayerState,
+  SplendorSession,
+  SplendorSide,
+  SPLENDOR_TIERS,
+  splendorSideForAccount,
+  SplendorToken,
+} from './splendor-engine';
+import {
   AlkkagiPiece,
   AlkkagiShotResult,
   AlkkagiSession,
   CustomEmote,
   Difficulty,
+  GameMode,
   GomokuSession,
   MatchPauseState,
   OthelloColor,
@@ -109,6 +129,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       { key: 'alkkagi', title: 'Alkkagi', modes: ['local_ai', 'friend_match'], status: 'playable' },
       { key: 'othello', title: 'Othello', modes: ['local_ai', 'friend_match'], status: 'playable' },
       { key: 'sokoban', title: 'Sokoban', modes: ['solo', 'friend_match'], status: 'playable' },
+      { key: 'splendor', title: 'Splendor', modes: ['local_ai', 'friend_match'], status: 'playable' },
     ];
   }
 
@@ -727,6 +748,284 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return sessionForSokobanUser(saved, user);
   }
 
+  async createSplendorSession(
+    user: AuthAccount,
+    opponentAccountId?: string,
+    forcedMode?: GameMode,
+    difficulty: Difficulty = 'medium',
+  ): Promise<SplendorClientSession> {
+    this.assertDifficulty(difficulty);
+    const resolvedMode = forcedMode ?? (opponentAccountId ? 'friend_match' : 'local_ai');
+    const opponent = opponentAccountId ?? LOCAL_AI_ACCOUNT_ID;
+    const state = createSplendorState(user.accountId, opponent, resolvedMode, difficulty);
+    const row = await this.insertGame('splendor', resolvedMode, user.accountId, opponentAccountId ?? null, 'playing', 'challenger', null, state);
+    const session = this.splendorFromRow(row);
+    this.emitSessionEvent(session, 'game.session.created', splendorClientSession(session));
+    return splendorClientSession(session, user.accountId);
+  }
+
+  async getSplendorSession(id: string, user: AuthAccount): Promise<SplendorClientSession> {
+    const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
+    this.assertSplendorParticipant(user, session);
+    return splendorClientSession(session, user.accountId);
+  }
+
+  async takeSplendorTokens(
+    id: string,
+    user: AuthAccount,
+    tokens: Partial<Record<SplendorToken, number>>,
+    discardTokens: Partial<Record<SplendorToken, number>> = {},
+  ): Promise<SplendorClientSession> {
+    const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
+    this.assertSplendorParticipant(user, session);
+    const side = this.splendorSideForUser(session, user);
+    applySplendorTakeTokens(session, side, user.accountId, tokens, discardTokens);
+    const saved = await this.saveSplendorSession(session);
+    this.emitSessionEvent(saved, 'splendor.action.played', splendorClientSession(saved));
+    this.scheduleSplendorAi(saved);
+    return splendorClientSession(saved, user.accountId);
+  }
+
+  async reserveSplendorCard(
+    id: string,
+    user: AuthAccount,
+    input: { cardId?: string; tier?: string; discardTokens?: Partial<Record<SplendorToken, number>> },
+  ): Promise<SplendorClientSession> {
+    const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
+    this.assertSplendorParticipant(user, session);
+    const side = this.splendorSideForUser(session, user);
+    applySplendorReserve(session, side, user.accountId, input);
+    const saved = await this.saveSplendorSession(session);
+    this.emitSessionEvent(saved, 'splendor.action.played', splendorClientSession(saved));
+    this.scheduleSplendorAi(saved);
+    return splendorClientSession(saved, user.accountId);
+  }
+
+  async buySplendorCard(id: string, user: AuthAccount, cardId: string): Promise<SplendorClientSession> {
+    const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
+    this.assertSplendorParticipant(user, session);
+    const side = this.splendorSideForUser(session, user);
+    applySplendorBuy(session, side, user.accountId, cardId);
+    const saved = await this.saveSplendorSession(session);
+    this.emitSessionEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'splendor.action.played', splendorClientSession(saved));
+    this.scheduleSplendorAi(saved);
+    return splendorClientSession(saved, user.accountId);
+  }
+
+  async previewSplendorSelection(
+    id: string,
+    user: AuthAccount,
+    input: { cardId?: string | null; tokens?: Record<string, number> },
+  ): Promise<{ ok: true }> {
+    const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
+    this.assertSplendorParticipant(user, session);
+    if (session.mode !== 'friend_match' || session.status !== 'playing') {
+      return { ok: true };
+    }
+    const side = this.splendorSideForUser(session, user);
+    const tokens = input.tokens && typeof input.tokens === 'object'
+      ? Object.fromEntries(Object.entries(input.tokens).map(([key, value]) => [key, Number(value) || 0]))
+      : {};
+    const recipients = sessionAccountIds(session).filter((accountId) => accountId !== user.accountId);
+    this.realtime.emitToAccounts(recipients, 'splendor.selection.preview', {
+      gameKey: 'splendor',
+      sessionId: session.id,
+      accountId: user.accountId,
+      side,
+      cardId: input.cardId ?? null,
+      tokens,
+    });
+    return { ok: true };
+  }
+
+  async sendSplendorEmote(id: string, user: AuthAccount, slot: number): Promise<unknown> {
+    const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
+    this.assertSplendorParticipant(user, session);
+    return this.sendSessionEmote('splendor', session, user, slot);
+  }
+
+  async forfeitSplendor(id: string, user: AuthAccount): Promise<SplendorClientSession> {
+    const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
+    this.assertSplendorParticipant(user, session);
+    const side = this.splendorSideForUser(session, user);
+    applySplendorForfeit(session, side, user.accountId);
+    const saved = await this.saveSplendorSession(session);
+    this.emitSessionEvent(saved, 'game.session.finished', splendorClientSession(saved));
+    return splendorClientSession(saved, user.accountId);
+  }
+
+  async restoreLocalSaveSnapshot(
+    gameKey: string,
+    id: string,
+    user: AuthAccount,
+    snapshot: Record<string, unknown>,
+  ): Promise<unknown> {
+    if (gameKey === 'gomoku') {
+      const row = await this.requireGameRow(id, 'gomoku');
+      this.assertLocalSaveOwner(row, user);
+      const current = this.gomokuFromRow(row);
+      this.assertGameParticipant(user, current.players.black, current.players.white);
+      this.assertLocalSaveMode(current.mode, 'local_ai');
+      const board = gomokuBoardSnapshot(snapshot.board);
+      const currentTurn = playerColorFromSnapshot(snapshot.currentTurn, 'black');
+      const status = playingStatusFromSnapshot(snapshot.status);
+      const winner = status === 'finished' ? optionalPlayerColor(snapshot.winner) : undefined;
+      const restored: GomokuSession = {
+        ...current,
+        aiDifficulty: difficultyFromSnapshot(snapshot.aiDifficulty, current.aiDifficulty ?? 'medium'),
+        board,
+        currentTurn,
+        status,
+        winner,
+        moves: gomokuMovesFromSnapshot(board, current.players, snapshot.lastMove),
+        turnStartedAt: undefined,
+        turnDeadlineAt: undefined,
+        networkGraceStartedAt: undefined,
+        networkGraceDeadlineAt: undefined,
+        networkGraceAccountId: undefined,
+        pause: undefined,
+        finishReason: undefined,
+      };
+      this.clearTurnTimer(id);
+      const saved = this.gomokuFromRow(await this.updateGame(id, restored.status, restored.currentTurn, restored.winner ?? null, restored));
+      if (saved.mode === 'local_ai' && saved.status === 'playing' && isLocalAiAccount(saved.players[saved.currentTurn])) {
+        this.scheduleLocalGomokuAiTurn(saved.id);
+      }
+      return saved;
+    }
+
+    if (gameKey === 'alkkagi') {
+      const row = await this.requireGameRow(id, 'alkkagi');
+      this.assertLocalSaveOwner(row, user);
+      const current = this.alkkagiFromRow(row);
+      this.assertGameParticipant(user, current.players.red, current.players.blue);
+      this.assertLocalSaveMode(current.mode, 'local_ai');
+      const currentTurn = pieceTeamFromSnapshot(snapshot.currentTurn, 'red');
+      const status = playingStatusFromSnapshot(snapshot.status);
+      const winner = status === 'finished' ? optionalPieceTeam(snapshot.winner) : undefined;
+      const restored: AlkkagiSession = {
+        ...current,
+        aiDifficulty: difficultyFromSnapshot(snapshot.aiDifficulty, current.aiDifficulty ?? 'medium'),
+        pieces: alkkagiPiecesFromSnapshot(snapshot.pieces),
+        currentTurn,
+        status,
+        winner,
+        shots: alkkagiShotsFromSnapshot(snapshot.shotCount, current.players),
+        turnStartedAt: undefined,
+        turnDeadlineAt: undefined,
+        networkGraceStartedAt: undefined,
+        networkGraceDeadlineAt: undefined,
+        networkGraceAccountId: undefined,
+        pause: undefined,
+        lastAim: undefined,
+        finishReason: undefined,
+      };
+      this.clearTurnTimer(id);
+      const saved = this.alkkagiFromRow(await this.updateGame(id, restored.status, restored.currentTurn, restored.winner ?? null, restored));
+      if (saved.mode === 'local_ai' && saved.status === 'playing' && isLocalAiAccount(saved.players[saved.currentTurn])) {
+        this.scheduleLocalAlkkagiAiTurn(saved.id);
+      }
+      return saved;
+    }
+
+    if (gameKey === 'othello') {
+      const row = await this.requireGameRow(id, 'othello');
+      this.assertLocalSaveOwner(row, user);
+      const current = this.othelloFromRow(row);
+      this.assertGameParticipant(user, current.players.black, current.players.white);
+      this.assertLocalSaveMode(current.mode, 'local_ai');
+      const currentTurn = othelloColorFromSnapshot(snapshot.currentTurn, 'black');
+      const status = playingStatusFromSnapshot(snapshot.status);
+      const winner = status === 'finished' ? optionalOthelloColor(snapshot.winner) : undefined;
+      const restored: OthelloSession = {
+        ...current,
+        aiDifficulty: difficultyFromSnapshot(snapshot.aiDifficulty, current.aiDifficulty ?? 'medium'),
+        board: othelloBoardSnapshot(snapshot.board),
+        currentTurn,
+        status,
+        winner,
+        moves: [],
+        pause: undefined,
+        finishReason: undefined,
+      };
+      const saved = this.othelloFromRow(await this.updateGame(id, restored.status, restored.currentTurn, restored.winner ?? null, restored));
+      if (saved.mode === 'local_ai' && saved.status === 'playing' && isLocalAiAccount(saved.players[saved.currentTurn])) {
+        this.scheduleLocalOthelloAiTurn(saved.id);
+      }
+      return saved;
+    }
+
+    if (gameKey === 'sokoban') {
+      const row = await this.requireGameRow(id, 'sokoban');
+      this.assertLocalSaveOwner(row, user);
+      const current = this.sokobanFromRow(row);
+      this.assertLocalSaveMode(current.mode, 'solo');
+      const walls = sokobanPositionsFromSnapshot(snapshot.walls);
+      const goals = sokobanPositionsFromSnapshot(snapshot.goals);
+      const boxes = sokobanPositionsFromSnapshot(snapshot.boxes);
+      const player = sokobanPositionFromSnapshot(snapshot.player);
+      const solved = boxes.length > 0 && boxes.every((box) => hasPosition(goals, box));
+      const restored: SokobanSession = {
+        ...current,
+        difficulty: difficultyFromSnapshot(snapshot.difficulty, current.difficulty),
+        mapKey: stringFromSnapshot(snapshot.mapKey, current.mapKey),
+        walls,
+        goals,
+        state: {
+          player,
+          boxes,
+          moves: nonNegativeIntFromSnapshot(snapshot.moves),
+          solved,
+        },
+        status: playingStatusFromSnapshot(snapshot.status),
+        winnerSide: undefined,
+        winnerAccountId: undefined,
+        finishReason: undefined,
+        pause: undefined,
+        solvedAt: undefined,
+      };
+      const saved = this.sokobanFromRow(await this.updateGame(id, restored.status, null, null, restored));
+      return sessionForSokobanUser(saved, user);
+    }
+
+    if (gameKey === 'splendor') {
+      const row = await this.requireGameRow(id, 'splendor');
+      this.assertLocalSaveOwner(row, user);
+      const current = this.splendorFromRow(row);
+      this.assertSplendorParticipant(user, current);
+      this.assertLocalSaveMode(current.mode, 'local_ai');
+      const playerStates = splendorPlayerStatesFromSnapshot(snapshot.playerStates, current.playerStates);
+      const market = splendorMarketFromSnapshot(snapshot.market, current.market);
+      const nobles = splendorNoblesFromSnapshot(snapshot.nobles, current.nobles);
+      const decks = splendorDecksFromVisibleCards(market, playerStates);
+      const currentTurn = splendorSideFromSnapshot(snapshot.currentTurn, 'challenger');
+      const status = playingStatusFromSnapshot(snapshot.status);
+      const winnerSide = status === 'finished' ? optionalSplendorSide(snapshot.winnerSide) : undefined;
+      const restored: SplendorSession = {
+        ...current,
+        aiDifficulty: difficultyFromSnapshot(snapshot.difficulty, current.aiDifficulty as Difficulty | undefined ?? 'medium'),
+        currentTurn,
+        status,
+        winnerSide,
+        winnerAccountId: winnerSide ? current.players[winnerSide] : undefined,
+        bank: splendorTokenMapFromSnapshot(snapshot.bank, current.bank),
+        market,
+        decks,
+        nobles,
+        playerStates,
+        moves: splendorMovesFromSnapshot(snapshot.moves),
+        finalRoundStartedBy: optionalSplendorSide(snapshot.finalRoundStartedBy),
+        pause: undefined,
+        finishReason: undefined,
+      };
+      const saved = await this.saveSplendorSession(restored);
+      this.scheduleSplendorAi(saved);
+      return splendorClientSession(saved, user.accountId);
+    }
+
+    throw new BadRequestException('gameKey must be gomoku, alkkagi, othello, sokoban, or splendor');
+  }
+
   async pauseMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
     if (gameKey === 'sudoku') {
       const session = this.sudokuFromRow(await this.requireGameRow(id, 'sudoku'));
@@ -770,7 +1069,15 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitSokobanEvent(saved, 'game.session.paused');
       return sessionForSokobanUser(saved, user);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, or sokoban');
+    if (gameKey === 'splendor') {
+      const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
+      this.assertSplendorParticipant(user, session);
+      this.applyPause(session, user);
+      const saved = await this.saveSplendorSession(session);
+      this.emitSessionEvent(saved, 'game.session.paused', splendorClientSession(saved));
+      return splendorClientSession(saved, user.accountId);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, or splendor');
   }
 
   async resumeMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
@@ -816,7 +1123,15 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitSokobanEvent(saved, 'game.session.resumed');
       return sessionForSokobanUser(saved, user);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, or sokoban');
+    if (gameKey === 'splendor') {
+      const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
+      this.assertSplendorParticipant(user, session);
+      this.applyResume(session);
+      const saved = await this.saveSplendorSession(session);
+      this.emitSessionEvent(saved, 'game.session.resumed', splendorClientSession(saved));
+      return splendorClientSession(saved, user.accountId);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, or splendor');
   }
 
   async createSessionFromMatch(gameKey: string, requesterAccountId: string, opponentAccountId: string): Promise<string> {
@@ -842,7 +1157,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'sokoban') {
       return (await this.createSokobanSession(fakeUser, 'medium', opponentAccountId)).id;
     }
-    throw new BadRequestException('match requests support sudoku, gomoku, alkkagi, othello, or sokoban');
+    if (gameKey === 'splendor') {
+      return (await this.createSplendorSession(fakeUser, opponentAccountId, 'friend_match')).id;
+    }
+    throw new BadRequestException('match requests support sudoku, gomoku, alkkagi, othello, sokoban, or splendor');
   }
 
   private async insertGame(
@@ -971,9 +1289,35 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return withRowDates(row.state_json as SokobanSession, row);
   }
 
+  private splendorFromRow(row: GameRow): SplendorSession {
+    return withRowDates(row.state_json as SplendorSession, row);
+  }
+
+  private async saveSplendorSession(session: SplendorSession): Promise<SplendorSession> {
+    return this.splendorFromRow(await this.updateGame(
+      session.id,
+      session.status,
+      session.currentTurn,
+      session.winnerSide ?? null,
+      session,
+    ));
+  }
+
   private assertDifficulty(difficulty: Difficulty): void {
     if (!['easy', 'medium', 'hard'].includes(difficulty)) {
       throw new BadRequestException('difficulty must be easy, medium, or hard');
+    }
+  }
+
+  private assertLocalSaveOwner(row: GameRow, user: AuthAccount): void {
+    if (row.owner_account_id !== user.accountId) {
+      throw new ForbiddenException('local save restore is only available to the session owner');
+    }
+  }
+
+  private assertLocalSaveMode(mode: GameMode | undefined, expected: 'local_ai' | 'solo'): void {
+    if (mode !== expected) {
+      throw new BadRequestException('local save restore is not available for matched games');
     }
   }
 
@@ -1010,13 +1354,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return undefined;
   }
 
-  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession): void {
+  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession): void {
     if (session.pause?.active) {
       throw new BadRequestException('game is paused');
     }
   }
 
-  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession, user: AuthAccount): void {
+  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession, user: AuthAccount): void {
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('pause is only available during matched games');
     }
@@ -1040,7 +1384,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     session.updatedAt = new Date(now).toISOString();
   }
 
-  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession): void {
+  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession): void {
     const pause = session.pause;
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('resume is only available during matched games');
@@ -1075,6 +1419,21 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.assertParticipant(user, session.ownerAccountId);
   }
 
+  private assertSplendorParticipant(user: AuthAccount, session: SplendorSession): void {
+    this.assertGameParticipant(user, session.players.challenger, session.players.opponent);
+  }
+
+  private splendorSideForUser(session: SplendorSession, user: AuthAccount): SplendorSide {
+    const side = splendorSideForAccount(session, user.accountId);
+    if (side) {
+      return side;
+    }
+    if (user.permission === 'superadmin') {
+      return session.currentTurn;
+    }
+    throw new ForbiddenException('not a participant');
+  }
+
   private sokobanSideForUser(session: SokobanSession, user: AuthAccount): SokobanSide | undefined {
     if (!session.players) {
       return undefined;
@@ -1089,8 +1448,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async sendSessionEmote(
-    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban',
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession,
+    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor',
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession,
     user: AuthAccount,
     slot: number,
   ): Promise<unknown> {
@@ -1164,6 +1523,29 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     this.applyGomokuMove(session, LOCAL_AI_ACCOUNT_ID, move.row, move.col, 'ai');
+  }
+
+  private scheduleSplendorAi(session: SplendorSession): void {
+    if (session.mode !== 'local_ai' || session.status !== 'playing' || session.currentTurn !== 'opponent') {
+      return;
+    }
+    setTimeout(async () => {
+      try {
+        const current = this.splendorFromRow(await this.requireGameRow(session.id, 'splendor'));
+        if (current.status !== 'playing' || current.mode !== 'local_ai' || current.currentTurn !== 'opponent') {
+          return;
+        }
+        applySplendorAiTurn(current);
+        const saved = await this.saveSplendorSession(current);
+        this.emitSessionEvent(
+          saved,
+          saved.status === 'finished' ? 'game.session.finished' : 'splendor.action.played',
+          splendorClientSession(saved),
+        );
+      } catch (error) {
+        console.warn('[splendor-ai]', error);
+      }
+    }, LOCAL_AI_RESPONSE_DELAY_MS);
   }
 
   private scheduleLocalGomokuAiTurn(id: string): void {
@@ -1539,7 +1921,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return fallback;
   }
 
-  private emitSessionEvent(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession, event: string, payload: unknown): void {
+  private emitSessionEvent(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession, event: string, payload: unknown): void {
     this.realtime.emitToAccounts(sessionAccountIds(session), event, payload);
   }
 
@@ -1554,6 +1936,351 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.realtime.emitToAccounts([accountId], event, sessionForSokobanAccount(session, accountId));
     }
   }
+}
+
+function playingStatusFromSnapshot(value: unknown): 'playing' | 'finished' {
+  return value === 'finished' ? 'finished' : 'playing';
+}
+
+function difficultyFromSnapshot(value: unknown, fallback: Difficulty): Difficulty {
+  return value === 'easy' || value === 'medium' || value === 'hard' ? value : fallback;
+}
+
+function stringFromSnapshot(value: unknown, fallback: string): string {
+  return typeof value === 'string' && value.length > 0 ? value : fallback;
+}
+
+function nonNegativeIntFromSnapshot(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function playerColorFromSnapshot(value: unknown, fallback: PlayerColor): PlayerColor {
+  return value === 'black' || value === 'white' ? value : fallback;
+}
+
+function optionalPlayerColor(value: unknown): PlayerColor | undefined {
+  return value === 'black' || value === 'white' ? value : undefined;
+}
+
+function pieceTeamFromSnapshot(value: unknown, fallback: PieceTeam): PieceTeam {
+  return value === 'red' || value === 'blue' ? value : fallback;
+}
+
+function optionalPieceTeam(value: unknown): PieceTeam | undefined {
+  return value === 'red' || value === 'blue' ? value : undefined;
+}
+
+function othelloColorFromSnapshot(value: unknown, fallback: OthelloColor): OthelloColor {
+  return value === 'black' || value === 'white' ? value : fallback;
+}
+
+function optionalOthelloColor(value: unknown): OthelloColor | undefined {
+  return value === 'black' || value === 'white' ? value : undefined;
+}
+
+function splendorSideFromSnapshot(value: unknown, fallback: SplendorSide): SplendorSide {
+  return value === 'challenger' || value === 'opponent' ? value : fallback;
+}
+
+function optionalSplendorSide(value: unknown): SplendorSide | undefined {
+  return value === 'challenger' || value === 'opponent' ? value : undefined;
+}
+
+function gomokuBoardSnapshot(value: unknown): (PlayerColor | null)[][] {
+  return boardSnapshot(value, GOMOKU_SIZE, playerColorFromCell, 'gomoku board');
+}
+
+function othelloBoardSnapshot(value: unknown): (OthelloColor | null)[][] {
+  return boardSnapshot(value, OTHELLO_SIZE, playerColorFromCell, 'othello board');
+}
+
+function boardSnapshot<T extends string>(
+  value: unknown,
+  size: number,
+  cellMapper: (value: unknown) => T | null,
+  label: string,
+): (T | null)[][] {
+  if (!Array.isArray(value) || value.length !== size) {
+    throw new BadRequestException(`invalid ${label}`);
+  }
+  return value.map((row) => {
+    if (!Array.isArray(row) || row.length !== size) {
+      throw new BadRequestException(`invalid ${label}`);
+    }
+    return row.map(cellMapper);
+  });
+}
+
+function playerColorFromCell(value: unknown): PlayerColor | null {
+  if (value === 'black' || value === 'white') {
+    return value;
+  }
+  if (value === null) {
+    return null;
+  }
+  throw new BadRequestException('invalid board cell');
+}
+
+function gomokuMovesFromSnapshot(
+  board: (PlayerColor | null)[][],
+  players: Record<PlayerColor, string>,
+  lastMoveValue: unknown,
+): GomokuSession['moves'] {
+  const now = new Date().toISOString();
+  const lastMove = isRecord(lastMoveValue)
+    ? {
+        row: typeof lastMoveValue.row === 'number' ? lastMoveValue.row : -1,
+        col: typeof lastMoveValue.col === 'number' ? lastMoveValue.col : -1,
+      }
+    : null;
+  const moves: GomokuSession['moves'] = [];
+  for (let row = 0; row < board.length; row += 1) {
+    for (let col = 0; col < board[row].length; col += 1) {
+      const color = board[row][col];
+      if (!color) {
+        continue;
+      }
+      if (lastMove && lastMove.row === row && lastMove.col === col) {
+        continue;
+      }
+      moves.push({ row, col, color, accountId: players[color], createdAt: now, source: 'manual' });
+    }
+  }
+  if (
+    lastMove &&
+    lastMove.row >= 0 &&
+    lastMove.row < board.length &&
+    lastMove.col >= 0 &&
+    lastMove.col < board[lastMove.row].length
+  ) {
+    const color = board[lastMove.row][lastMove.col];
+    if (color) {
+      moves.push({ row: lastMove.row, col: lastMove.col, color, accountId: players[color], createdAt: now, source: 'manual' });
+    }
+  }
+  return moves;
+}
+
+function alkkagiPiecesFromSnapshot(value: unknown): AlkkagiPiece[] {
+  if (!Array.isArray(value)) {
+    throw new BadRequestException('invalid alkkagi pieces');
+  }
+  return value.map((item) => {
+    if (!isRecord(item)) {
+      throw new BadRequestException('invalid alkkagi piece');
+    }
+    const id = stringFromSnapshot(item.id, '');
+    if (!id) {
+      throw new BadRequestException('invalid alkkagi piece id');
+    }
+    return {
+      id,
+      team: pieceTeamFromSnapshot(item.team, 'red'),
+      rank: typeof item.rank === 'string' ? item.rank : undefined,
+      x: finiteNumber(item.x, 0),
+      y: finiteNumber(item.y, 0),
+      vx: finiteNumber(item.vx, 0),
+      vy: finiteNumber(item.vy, 0),
+      radius: typeof item.radius === 'number' ? item.radius : undefined,
+      mass: typeof item.mass === 'number' ? item.mass : undefined,
+      active: item.active !== false,
+    };
+  });
+}
+
+function alkkagiShotsFromSnapshot(value: unknown, players: Record<PieceTeam, string>): AlkkagiSession['shots'] {
+  const count = Math.min(nonNegativeIntFromSnapshot(value), 500);
+  const now = new Date().toISOString();
+  return Array.from({ length: count }, (_, index) => {
+    const team: PieceTeam = index % 2 === 0 ? 'red' : 'blue';
+    return { pieceId: `restored-${index}`, team, vx: 0, vy: 0, accountId: players[team], createdAt: now, source: 'manual' };
+  });
+}
+
+function sokobanPositionFromSnapshot(value: unknown): SokobanPosition {
+  if (!isRecord(value)) {
+    throw new BadRequestException('invalid sokoban position');
+  }
+  return {
+    row: finiteInteger(value.row, 0),
+    col: finiteInteger(value.col, 0),
+  };
+}
+
+function sokobanPositionsFromSnapshot(value: unknown): SokobanPosition[] {
+  if (!Array.isArray(value)) {
+    throw new BadRequestException('invalid sokoban positions');
+  }
+  return value.map(sokobanPositionFromSnapshot);
+}
+
+function splendorTokenMapFromSnapshot(value: unknown, fallback: Record<SplendorToken, number>): Record<SplendorToken, number> {
+  const source = isRecord(value) ? value : fallback;
+  return {
+    white: nonNegativeIntFromSnapshot(source.white),
+    blue: nonNegativeIntFromSnapshot(source.blue),
+    green: nonNegativeIntFromSnapshot(source.green),
+    red: nonNegativeIntFromSnapshot(source.red),
+    black: nonNegativeIntFromSnapshot(source.black),
+    gold: nonNegativeIntFromSnapshot(source.gold),
+  };
+}
+
+function splendorGemCostFromSnapshot(value: unknown): Record<'white' | 'blue' | 'green' | 'red' | 'black', number> {
+  const source = isRecord(value) ? value : {};
+  return {
+    white: nonNegativeIntFromSnapshot(source.white),
+    blue: nonNegativeIntFromSnapshot(source.blue),
+    green: nonNegativeIntFromSnapshot(source.green),
+    red: nonNegativeIntFromSnapshot(source.red),
+    black: nonNegativeIntFromSnapshot(source.black),
+  };
+}
+
+function splendorCardFromSnapshot(value: unknown): SplendorCard | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const tier = value.tier === '1' || value.tier === '2' || value.tier === '3' ? value.tier : null;
+  const color = value.color === 'white' || value.color === 'blue' || value.color === 'green' || value.color === 'red' || value.color === 'black'
+    ? value.color
+    : null;
+  if (typeof value.id !== 'string' || !tier || !color) {
+    return null;
+  }
+  return {
+    id: value.id,
+    tier,
+    color,
+    points: nonNegativeIntFromSnapshot(value.points),
+    cost: splendorGemCostFromSnapshot(value.cost),
+    art: typeof value.art === 'string' ? value.art : 'card',
+  };
+}
+
+function splendorCardsFromSnapshot(value: unknown): SplendorCard[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map(splendorCardFromSnapshot).filter((item): item is SplendorCard => item !== null);
+}
+
+function splendorNobleFromSnapshot(value: unknown): SplendorNoble | null {
+  if (!isRecord(value) || typeof value.id !== 'string') {
+    return null;
+  }
+  return {
+    id: value.id,
+    points: nonNegativeIntFromSnapshot(value.points),
+    cost: splendorGemCostFromSnapshot(value.cost),
+    art: typeof value.art === 'string' ? value.art : 'noble',
+  };
+}
+
+function splendorNoblesFromSnapshot(value: unknown, fallback: SplendorNoble[]): SplendorNoble[] {
+  if (!Array.isArray(value)) {
+    return fallback;
+  }
+  return value.map(splendorNobleFromSnapshot).filter((item): item is SplendorNoble => item !== null);
+}
+
+function splendorMarketFromSnapshot(
+  value: unknown,
+  fallback: Record<'1' | '2' | '3', SplendorCard[]>,
+): Record<'1' | '2' | '3', SplendorCard[]> {
+  const source = isRecord(value) ? value : {};
+  const tier1 = splendorCardsFromSnapshot(source['1']);
+  const tier2 = splendorCardsFromSnapshot(source['2']);
+  const tier3 = splendorCardsFromSnapshot(source['3']);
+  return {
+    '1': tier1.length > 0 ? tier1 : fallback['1'],
+    '2': tier2.length > 0 ? tier2 : fallback['2'],
+    '3': tier3.length > 0 ? tier3 : fallback['3'],
+  };
+}
+
+function splendorPlayerStateFromSnapshot(value: unknown, fallback: SplendorPlayerState): SplendorPlayerState {
+  const source = isRecord(value) ? value : {};
+  return {
+    tokens: splendorTokenMapFromSnapshot(source.tokens, fallback.tokens),
+    bonuses: splendorGemCostFromSnapshot(source.bonuses),
+    reserved: splendorCardsFromSnapshot(source.reserved),
+    purchased: splendorCardsFromSnapshot(source.purchased),
+    nobles: splendorNoblesFromSnapshot(source.nobles, fallback.nobles),
+    score: nonNegativeIntFromSnapshot(source.score),
+  };
+}
+
+function splendorPlayerStatesFromSnapshot(
+  value: unknown,
+  fallback: Record<SplendorSide, SplendorPlayerState>,
+): Record<SplendorSide, SplendorPlayerState> {
+  const source = isRecord(value) ? value : {};
+  return {
+    challenger: splendorPlayerStateFromSnapshot(source.challenger, fallback.challenger),
+    opponent: splendorPlayerStateFromSnapshot(source.opponent, fallback.opponent),
+  };
+}
+
+function splendorDecksFromVisibleCards(
+  market: Record<'1' | '2' | '3', SplendorCard[]>,
+  playerStates: Record<SplendorSide, SplendorPlayerState>,
+): Record<'1' | '2' | '3', SplendorCard[]> {
+  const usedCardIds = new Set<string>();
+  for (const tier of SPLENDOR_TIERS) {
+    for (const cardItem of market[tier]) {
+      usedCardIds.add(cardItem.id);
+    }
+  }
+  for (const player of Object.values(playerStates)) {
+    for (const cardItem of [...player.reserved, ...player.purchased]) {
+      usedCardIds.add(cardItem.id);
+    }
+  }
+  const decks = createSplendorDecks();
+  return {
+    '1': decks['1'].filter((cardItem) => !usedCardIds.has(cardItem.id)),
+    '2': decks['2'].filter((cardItem) => !usedCardIds.has(cardItem.id)),
+    '3': decks['3'].filter((cardItem) => !usedCardIds.has(cardItem.id)),
+  };
+}
+
+function splendorMovesFromSnapshot(value: unknown): SplendorSession['moves'] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((item) => {
+    if (!isRecord(item)) {
+      return [];
+    }
+    const action = item.action === 'take_tokens' || item.action === 'reserve' || item.action === 'buy' || item.action === 'forfeit'
+      ? item.action
+      : null;
+    const side = optionalSplendorSide(item.side);
+    if (!action || !side || typeof item.accountId !== 'string') {
+      return [];
+    }
+    return [{
+      action,
+      side,
+      accountId: item.accountId,
+      createdAt: typeof item.createdAt === 'string' ? item.createdAt : new Date().toISOString(),
+      detail: item.detail,
+      source: item.source === 'ai' ? 'ai' as const : 'manual' as const,
+    }];
+  });
+}
+
+function finiteNumber(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function finiteInteger(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.trunc(value) : fallback;
 }
 
 function withRowDates<T extends { id: string; createdAt: string; updatedAt: string; status: string }>(state: T, row: GameRow): T {
@@ -1777,7 +2504,7 @@ function hashText(value: string): number {
   return hash;
 }
 
-function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession): string[] {
+function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession): string[] {
   if ('players' in session && session.players) {
     return [...new Set(Object.values(session.players).filter((accountId) => !isLocalAiAccount(accountId)))];
   }
@@ -1792,7 +2519,7 @@ function isLocalAiAccount(accountId: string): boolean {
 }
 
 function shiftDeadline(
-  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession,
+  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession,
   key: 'turnStartedAt' | 'turnDeadlineAt' | 'networkGraceStartedAt' | 'networkGraceDeadlineAt',
   deltaMs: number,
 ): void {

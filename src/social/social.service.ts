@@ -196,6 +196,7 @@ export class SocialService {
       alkkagi: { wins: 0, losses: 0 },
       othello: { wins: 0, losses: 0 },
       sokoban: { wins: 0, losses: 0 },
+      splendor: { wins: 0, losses: 0 },
     };
     for (const row of result.rows) {
       const gameKey = row.game_key as keyof typeof stats;
@@ -217,6 +218,7 @@ export class SocialService {
         { gameKey: 'alkkagi', label: '알까기', ...stats.alkkagi },
         { gameKey: 'othello', label: '오델로', ...stats.othello },
         { gameKey: 'sokoban', label: '소코반', ...stats.sokoban },
+        { gameKey: 'splendor', label: '스플렌더', ...stats.splendor },
       ],
       total: {
         wins: Object.values(stats).reduce((total, item) => total + item.wins, 0),
@@ -325,8 +327,8 @@ export class SocialService {
 
   async createMatchRequest(user: AuthAccount, input: { gameKey: string; opponentAccountId: string }) {
     this.assertCanMatch(user);
-    if (!['sudoku', 'gomoku', 'alkkagi', 'othello', 'sokoban'].includes(input.gameKey)) {
-      throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, or sokoban');
+    if (!['sudoku', 'gomoku', 'alkkagi', 'othello', 'sokoban', 'splendor'].includes(input.gameKey)) {
+      throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, or splendor');
     }
     if (input.opponentAccountId === user.accountId) {
       throw new BadRequestException('opponent must be another account');
@@ -615,6 +617,9 @@ function winnerAccountForRow(gameKey: string, state: Record<string, unknown>): s
     return typeof state.winnerAccountId === 'string' ? state.winnerAccountId : undefined;
   }
   if (gameKey === 'sokoban') {
+    return typeof state.winnerAccountId === 'string' ? state.winnerAccountId : undefined;
+  }
+  if (gameKey === 'splendor') {
     return typeof state.winnerAccountId === 'string' ? state.winnerAccountId : undefined;
   }
   const winner = typeof state.winner === 'string' ? state.winner : undefined;

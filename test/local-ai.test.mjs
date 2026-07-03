@@ -2,6 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { GamesService } from '../dist/games/games.service.js';
+import {
+  applySplendorAiTurn,
+  applySplendorReserve,
+  applySplendorTakeTokens,
+  createSplendorState,
+} from '../dist/games/splendor-engine.js';
 
 const user = {
   accountId: 'player-1',
@@ -34,6 +40,34 @@ test('gomoku local sessions are AI games and answer player moves', async () => {
   assert.equal(answered.moves.length, 2);
   assert.equal(answered.moves[1].source, 'ai');
   assert.equal(answered.currentTurn, 'black');
+});
+
+test('gomoku local save restore rolls the server session back to the saved snapshot', async () => {
+  const service = new GamesService(new FakeDb(), new FakeRealtime());
+
+  const session = await service.createGomokuSession(user, undefined, undefined, 'medium');
+  const savedPoint = await service.playGomokuMove(session.id, user, 7, 7);
+  const savedSnapshot = JSON.parse(JSON.stringify(savedPoint));
+  await wait(350);
+  const serverLatest = await service.getGomokuSession(session.id, user);
+  assert.equal(serverLatest.moves.length, 2);
+
+  const restored = await service.restoreLocalSaveSnapshot('gomoku', session.id, user, {
+    sessionId: session.id,
+    board: savedSnapshot.board,
+    players: savedSnapshot.players,
+    aiDifficulty: savedSnapshot.aiDifficulty,
+    currentTurn: savedSnapshot.currentTurn,
+    mode: savedSnapshot.mode,
+    status: savedSnapshot.status,
+    winner: savedSnapshot.winner,
+    moveCount: savedSnapshot.moves.length,
+    lastMove: { row: 7, col: 7 },
+  });
+
+  assert.equal(restored.moves.length, 1);
+  assert.equal(restored.currentTurn, 'white');
+  assert.equal(restored.board[7][7], 'black');
 });
 
 test('alkkagi local sessions are AI games and answer player shots', async () => {
@@ -77,6 +111,133 @@ test('othello local sessions are AI games and answer player moves', async () => 
   assert.equal(answered.moves.length, 2);
   assert.equal(answered.moves[1].source, 'ai');
   assert.equal(answered.currentTurn, 'black');
+});
+
+test('splendor local sessions follow token turns and answer with AI', async () => {
+  const service = new GamesService(new FakeDb(), new FakeRealtime());
+
+  const session = await service.createSplendorSession(user, undefined, undefined, 'medium');
+  assert.equal(session.mode, 'local_ai');
+  assert.equal(session.mySide, 'challenger');
+  assert.equal(session.currentTurn, 'challenger');
+  assert.equal(session.market['1'].length, 4);
+  assert.equal(session.market['2'].length, 4);
+  assert.equal(session.market['3'].length, 4);
+  assert.equal(session.deckCounts['1'], 36);
+  assert.equal(session.deckCounts['2'], 26);
+  assert.equal(session.deckCounts['3'], 16);
+  assert.equal(session.nobles.length, 3);
+
+  const moved = await service.takeSplendorTokens(session.id, user, {
+    white: 1,
+    blue: 1,
+    green: 1,
+  });
+  assert.equal(moved.playerStates.challenger.tokens.white, 1);
+  assert.equal(moved.moves[0].action, 'take_tokens');
+  assert.equal(moved.currentTurn, 'opponent');
+
+  await wait(350);
+  const answered = await service.getSplendorSession(session.id, user);
+  assert.equal(answered.currentTurn, 'challenger');
+  assert.equal(answered.moves.length, 2);
+  assert.equal(answered.moves[1].source, 'ai');
+});
+
+test('splendor hard AI buys an immediate winning card', () => {
+  const session = createSplendorState(user.accountId, 'ai-player', 'local_ai', 'hard');
+  const winningCard = {
+    id: 'test-winning-card',
+    tier: '1',
+    color: 'white',
+    points: 1,
+    cost: { white: 0, blue: 0, green: 0, red: 0, black: 0 },
+    art: 'crown',
+  };
+  session.currentTurn = 'opponent';
+  session.playerStates.opponent.score = 14;
+  session.market = { '1': [winningCard], '2': [], '3': [] };
+  session.decks = { '1': [], '2': [], '3': [] };
+
+  applySplendorAiTurn(session);
+
+  assert.equal(session.status, 'finished');
+  assert.equal(session.winnerSide, 'opponent');
+  assert.equal(session.moves.at(-1).action, 'buy');
+  assert.equal(session.moves.at(-1).source, 'ai');
+});
+
+test('splendor token gain requires exact discard only when token limit is exceeded', () => {
+  const session = createSplendorState(user.accountId, 'ai-player', 'local_ai', 'medium');
+  session.currentTurn = 'challenger';
+  session.playerStates.challenger.tokens = {
+    white: 2,
+    blue: 2,
+    green: 2,
+    red: 2,
+    black: 2,
+    gold: 0,
+  };
+
+  assert.throws(
+    () =>
+      applySplendorTakeTokens(session, 'challenger', user.accountId, {
+        blue: 1,
+        green: 1,
+        red: 1,
+      }),
+    /discard 3 token/,
+  );
+
+  applySplendorTakeTokens(
+    session,
+    'challenger',
+    user.accountId,
+    { blue: 1, green: 1, red: 1 },
+    { white: 1, blue: 1, green: 1 },
+  );
+
+  assert.equal(session.playerStates.challenger.tokens.white, 1);
+  assert.equal(session.playerStates.challenger.tokens.blue, 2);
+  assert.equal(session.playerStates.challenger.tokens.green, 2);
+  assert.equal(session.playerStates.challenger.tokens.red, 3);
+  assert.equal(session.playerStates.challenger.tokens.black, 2);
+  assert.equal(session.moves.at(-1).detail.discardTokens.white, 1);
+  assert.equal(session.moves.at(-1).detail.discardTokens.blue, 1);
+  assert.equal(session.moves.at(-1).detail.discardTokens.green, 1);
+});
+
+test('splendor reserve gold can overflow only with an exact discard', () => {
+  const session = createSplendorState(user.accountId, 'ai-player', 'local_ai', 'medium');
+  const card = session.market['1'][0];
+  session.currentTurn = 'challenger';
+  session.playerStates.challenger.tokens = {
+    white: 2,
+    blue: 2,
+    green: 2,
+    red: 2,
+    black: 2,
+    gold: 0,
+  };
+
+  assert.throws(
+    () => applySplendorReserve(session, 'challenger', user.accountId, { cardId: card.id }),
+    /discard 1 token/,
+  );
+
+  applySplendorReserve(session, 'challenger', user.accountId, {
+    cardId: card.id,
+    discardTokens: { white: 1 },
+  });
+
+  assert.equal(session.playerStates.challenger.tokens.white, 1);
+  assert.equal(session.playerStates.challenger.tokens.blue, 2);
+  assert.equal(session.playerStates.challenger.tokens.green, 2);
+  assert.equal(session.playerStates.challenger.tokens.red, 2);
+  assert.equal(session.playerStates.challenger.tokens.black, 2);
+  assert.equal(session.playerStates.challenger.tokens.gold, 1);
+  assert.equal(session.playerStates.challenger.reserved[0].id, card.id);
+  assert.equal(session.moves.at(-1).detail.discardTokens.white, 1);
 });
 
 test('sokoban solo sessions generate solvable difficulty maps', async () => {

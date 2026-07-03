@@ -64,6 +64,16 @@ export class GamesController {
     return this.games.resumeMatchedGame(gameKey, id, user);
   }
 
+  @Post('games/:gameKey/sessions/:id/local-save-restore')
+  restoreLocalSave(
+    @Param('gameKey') gameKey: string,
+    @Param('id') id: string,
+    @CurrentUser() user: AuthAccount,
+    @Body() body: Record<string, unknown>,
+  ) {
+    return this.games.restoreLocalSaveSnapshot(gameKey, id, user, body);
+  }
+
   @Post('gomoku/sessions')
   createGomoku(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
     return this.games.createGomokuSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium');
@@ -182,5 +192,66 @@ export class GamesController {
   @Post('sokoban/sessions/:id/forfeit')
   forfeitSokoban(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
     return this.games.forfeitSokoban(id, user);
+  }
+
+  @Post('splendor/sessions')
+  createSplendor(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
+    return this.games.createSplendorSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium');
+  }
+
+  @Get('splendor/sessions/:id')
+  getSplendor(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.getSplendorSession(id, user);
+  }
+
+  @Post('splendor/sessions/:id/tokens')
+  takeSplendorTokens(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthAccount,
+    @Body()
+    body: {
+      tokens?: Record<string, number>;
+      discardTokens?: Record<string, number>;
+    },
+  ) {
+    return this.games.takeSplendorTokens(id, user, body.tokens ?? {}, body.discardTokens ?? {});
+  }
+
+  @Post('splendor/sessions/:id/reserve')
+  reserveSplendorCard(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthAccount,
+    @Body()
+    body: {
+      cardId?: string;
+      tier?: string;
+      discardTokens?: Record<string, number>;
+    },
+  ) {
+    return this.games.reserveSplendorCard(id, user, body);
+  }
+
+  @Post('splendor/sessions/:id/buy')
+  buySplendorCard(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { cardId: string }) {
+    return this.games.buySplendorCard(id, user, body.cardId);
+  }
+
+  @Post('splendor/sessions/:id/preview')
+  previewSplendorSelection(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthAccount,
+    @Body() body: { cardId?: string | null; tokens?: Record<string, number> },
+  ) {
+    return this.games.previewSplendorSelection(id, user, body);
+  }
+
+  @Post('splendor/sessions/:id/emotes')
+  sendSplendorEmote(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { slot: number }) {
+    return this.games.sendSplendorEmote(id, user, Number(body.slot));
+  }
+
+  @Post('splendor/sessions/:id/forfeit')
+  forfeitSplendor(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.forfeitSplendor(id, user);
   }
 }
