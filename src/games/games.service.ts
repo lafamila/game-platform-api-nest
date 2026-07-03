@@ -25,6 +25,21 @@ import {
   SplendorToken,
 } from './splendor-engine';
 import {
+  applyFortressAiTurn,
+  applyFortressForfeit,
+  applyFortressMove,
+  applyFortressShot,
+  createFortressState,
+  fortressClientSession,
+  FortressFloatingPlatform,
+  FortressPosition,
+  FortressSession,
+  FortressShotResult,
+  FortressSide,
+  fortressSideForAccount,
+  selectFortressTank,
+} from './fortress-engine';
+import {
   AlkkagiPiece,
   AlkkagiShotResult,
   AlkkagiSession,
@@ -53,9 +68,12 @@ const ALKKAGI_BOARD_SIZE = 1000;
 const MATCH_READY_DELAY_MS = 4_000;
 const GOMOKU_TURN_LIMIT_MS = 15_000;
 const ALKKAGI_TURN_LIMIT_MS = 10_000;
+const FORTRESS_TURN_LIMIT_MS = 20_000;
 const GOMOKU_AI_BUDGET_MS = 900;
 const ALKKAGI_AI_BUDGET_MS = 1_400;
 const LOCAL_AI_RESPONSE_DELAY_MS = 180;
+const FORTRESS_AI_RESPONSE_DELAY_MS = LOCAL_AI_RESPONSE_DELAY_MS;
+const FORTRESS_SHOT_ANIMATION_MS = 2_800;
 const DISCONNECT_GRACE_MS = 10_000;
 const EMOTE_COOLDOWN_MS = 3_000;
 const MATCH_PAUSE_LIMIT = 3;
@@ -130,6 +148,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       { key: 'othello', title: 'Othello', modes: ['local_ai', 'friend_match'], status: 'playable' },
       { key: 'sokoban', title: 'Sokoban', modes: ['solo', 'friend_match'], status: 'playable' },
       { key: 'splendor', title: 'Splendor', modes: ['local_ai', 'friend_match'], status: 'playable' },
+      { key: 'fortress', title: 'Fortress', modes: ['local_ai', 'friend_match'], status: 'playable' },
     ];
   }
 
@@ -854,6 +873,120 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return splendorClientSession(saved, user.accountId);
   }
 
+  async createFortressSession(
+    user: AuthAccount,
+    opponentAccountId?: string,
+    forcedMode?: GameMode,
+    difficulty: Difficulty = 'medium',
+  ): Promise<ReturnType<typeof fortressClientSession>> {
+    this.assertDifficulty(difficulty);
+    const resolvedMode = forcedMode ?? (opponentAccountId ? 'friend_match' : 'local_ai');
+    const opponent = opponentAccountId ?? LOCAL_AI_ACCOUNT_ID;
+    const state = createFortressState(user.accountId, opponent, resolvedMode, difficulty);
+    if (resolvedMode === 'local_ai') {
+      applyFortressAiTurn(state);
+    }
+    const row = await this.insertGame(
+      'fortress',
+      resolvedMode,
+      user.accountId,
+      opponentAccountId ?? null,
+      state.status,
+      state.currentTurn,
+      state.winnerSide ?? null,
+      state,
+    );
+    const session = this.fortressFromRow(row);
+    this.emitSessionEvent(session, 'game.session.created', fortressClientSession(session));
+    return fortressClientSession(session, user.accountId);
+  }
+
+  async getFortressSession(id: string, user: AuthAccount): Promise<ReturnType<typeof fortressClientSession>> {
+    const session = this.fortressFromRow(await this.requireGameRow(id, 'fortress'));
+    this.assertFortressParticipant(user, session);
+    return fortressClientSession(session, user.accountId);
+  }
+
+  async selectFortressTank(
+    id: string,
+    user: AuthAccount,
+    tankKey: string,
+  ): Promise<ReturnType<typeof fortressClientSession>> {
+    const session = this.fortressFromRow(await this.requireGameRow(id, 'fortress'));
+    this.assertFortressParticipant(user, session);
+    const side = this.fortressSideForUser(session, user);
+    selectFortressTank(session, side, tankKey);
+    if (session.mode === 'local_ai') {
+      applyFortressAiTurn(session);
+    }
+    if (session.mode === 'friend_match' && session.status === 'playing') {
+      this.startFortressTimedTurn(session, MATCH_READY_DELAY_MS);
+    }
+    const saved = await this.saveFortressSession(session);
+    this.scheduleFortressTurnTimer(saved);
+    this.emitSessionEvent(saved, 'fortress.state.changed', fortressClientSession(saved));
+    return fortressClientSession(saved, user.accountId);
+  }
+
+  async moveFortress(
+    id: string,
+    user: AuthAccount,
+    distance: number,
+  ): Promise<ReturnType<typeof fortressClientSession>> {
+    const session = this.fortressFromRow(await this.requireGameRow(id, 'fortress'));
+    this.assertFortressParticipant(user, session);
+    this.assertNotPaused(session);
+    const side = this.fortressSideForUser(session, user);
+    applyFortressMove(session, side, distance);
+    const saved = await this.saveFortressSession(session);
+    this.scheduleFortressTurnTimer(saved);
+    this.emitSessionEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'fortress.state.changed', fortressClientSession(saved));
+    this.scheduleFortressAi(saved);
+    return fortressClientSession(saved, user.accountId);
+  }
+
+  async shootFortress(
+    id: string,
+    user: AuthAccount,
+    angle: number,
+    power: number,
+  ): Promise<FortressShotResult & { session: ReturnType<typeof fortressClientSession> }> {
+    const session = this.fortressFromRow(await this.requireGameRow(id, 'fortress'));
+    this.assertFortressParticipant(user, session);
+    this.assertNotPaused(session);
+    const side = this.fortressSideForUser(session, user);
+    const result = applyFortressShot(session, side, user.accountId, angle, power);
+    if (result.session.mode === 'friend_match' && result.session.status === 'playing') {
+      this.startFortressTimedTurn(result.session, FORTRESS_SHOT_ANIMATION_MS);
+    }
+    const saved = await this.saveFortressSession(result.session);
+    this.scheduleFortressTurnTimer(saved);
+    const payload = { ...result, session: fortressClientSession(saved) };
+    this.emitSessionEvent(saved, 'fortress.shot.played', payload);
+    if (saved.status === 'finished') {
+      this.emitSessionEvent(saved, 'game.session.finished', fortressClientSession(saved));
+    }
+    this.scheduleFortressAi(saved);
+    return { ...result, session: fortressClientSession(saved, user.accountId) };
+  }
+
+  async sendFortressEmote(id: string, user: AuthAccount, slot: number): Promise<unknown> {
+    const session = this.fortressFromRow(await this.requireGameRow(id, 'fortress'));
+    this.assertFortressParticipant(user, session);
+    return this.sendSessionEmote('fortress', session, user, slot);
+  }
+
+  async forfeitFortress(id: string, user: AuthAccount): Promise<ReturnType<typeof fortressClientSession>> {
+    const session = this.fortressFromRow(await this.requireGameRow(id, 'fortress'));
+    this.assertFortressParticipant(user, session);
+    const side = this.fortressSideForUser(session, user);
+    applyFortressForfeit(session, side);
+    const saved = await this.saveFortressSession(session);
+    this.clearTurnTimer(saved.id);
+    this.emitSessionEvent(saved, 'game.session.finished', fortressClientSession(saved));
+    return fortressClientSession(saved, user.accountId);
+  }
+
   async restoreLocalSaveSnapshot(
     gameKey: string,
     id: string,
@@ -1023,7 +1156,40 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       return splendorClientSession(saved, user.accountId);
     }
 
-    throw new BadRequestException('gameKey must be gomoku, alkkagi, othello, sokoban, or splendor');
+    if (gameKey === 'fortress') {
+      const row = await this.requireGameRow(id, 'fortress');
+      this.assertLocalSaveOwner(row, user);
+      const current = this.fortressFromRow(row);
+      this.assertFortressParticipant(user, current);
+      this.assertLocalSaveMode(current.mode, 'local_ai');
+      const tanks = fortressTanksFromSnapshot(snapshot.tanks, current);
+      const restored: FortressSession = {
+        ...current,
+        aiDifficulty: difficultyFromSnapshot(snapshot.difficulty, current.aiDifficulty ?? 'medium'),
+        currentTurn: fortressSideFromSnapshot(snapshot.currentTurn, current.currentTurn),
+        status: fortressStatusFromSnapshot(snapshot.status, current.status),
+        winnerSide: optionalFortressSide(snapshot.winnerSide),
+        winnerAccountId: optionalFortressSide(snapshot.winnerSide)
+          ? current.players[optionalFortressSide(snapshot.winnerSide)!]
+          : undefined,
+        movementRemaining: fortressMovementRemainingFromSnapshot(snapshot.movementRemaining, current.movementRemaining),
+        floatingPlatforms: fortressFloatingPlatformsFromSnapshot(snapshot.floatingPlatforms),
+        turnStartPositions: fortressPositionsFromSnapshot(snapshot.turnStartPositions, tanks),
+        terrain: numberArrayFromSnapshot(snapshot.terrain, current.terrain),
+        wind: finiteNumber(snapshot.wind, current.wind),
+        tanks,
+        shots: fortressShotsFromSnapshot(snapshot.shots),
+        turnStartedAt: undefined,
+        turnDeadlineAt: undefined,
+        pause: undefined,
+        finishReason: undefined,
+      };
+      const saved = await this.saveFortressSession(restored);
+      this.scheduleFortressAi(saved);
+      return fortressClientSession(saved, user.accountId);
+    }
+
+    throw new BadRequestException('gameKey must be gomoku, alkkagi, othello, sokoban, splendor, or fortress');
   }
 
   async pauseMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
@@ -1077,7 +1243,16 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitSessionEvent(saved, 'game.session.paused', splendorClientSession(saved));
       return splendorClientSession(saved, user.accountId);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, or splendor');
+    if (gameKey === 'fortress') {
+      const session = this.fortressFromRow(await this.requireGameRow(id, 'fortress'));
+      this.assertFortressParticipant(user, session);
+      this.applyPause(session, user);
+      const saved = await this.saveFortressSession(session);
+      this.clearTurnTimer(saved.id);
+      this.emitSessionEvent(saved, 'game.session.paused', fortressClientSession(saved));
+      return fortressClientSession(saved, user.accountId);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, or fortress');
   }
 
   async resumeMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
@@ -1131,7 +1306,16 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitSessionEvent(saved, 'game.session.resumed', splendorClientSession(saved));
       return splendorClientSession(saved, user.accountId);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, or splendor');
+    if (gameKey === 'fortress') {
+      const session = this.fortressFromRow(await this.requireGameRow(id, 'fortress'));
+      this.assertFortressParticipant(user, session);
+      this.applyResume(session);
+      const saved = await this.saveFortressSession(session);
+      this.scheduleFortressTurnTimer(saved);
+      this.emitSessionEvent(saved, 'game.session.resumed', fortressClientSession(saved));
+      return fortressClientSession(saved, user.accountId);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, or fortress');
   }
 
   async createSessionFromMatch(gameKey: string, requesterAccountId: string, opponentAccountId: string): Promise<string> {
@@ -1160,7 +1344,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'splendor') {
       return (await this.createSplendorSession(fakeUser, opponentAccountId, 'friend_match')).id;
     }
-    throw new BadRequestException('match requests support sudoku, gomoku, alkkagi, othello, sokoban, or splendor');
+    if (gameKey === 'fortress') {
+      return (await this.createFortressSession(fakeUser, opponentAccountId, 'friend_match')).id;
+    }
+    throw new BadRequestException('match requests support sudoku, gomoku, alkkagi, othello, sokoban, splendor, or fortress');
   }
 
   private async insertGame(
@@ -1293,8 +1480,26 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return withRowDates(row.state_json as SplendorSession, row);
   }
 
+  private fortressFromRow(row: GameRow): FortressSession {
+    const session = withRowDates(row.state_json as FortressSession, row);
+    session.movementRemaining ??= { challenger: 0, opponent: 0 };
+    session.floatingPlatforms ??= [];
+    session.turnStartPositions ??= currentFortressPositions(session);
+    return session;
+  }
+
   private async saveSplendorSession(session: SplendorSession): Promise<SplendorSession> {
     return this.splendorFromRow(await this.updateGame(
+      session.id,
+      session.status,
+      session.currentTurn,
+      session.winnerSide ?? null,
+      session,
+    ));
+  }
+
+  private async saveFortressSession(session: FortressSession): Promise<FortressSession> {
+    return this.fortressFromRow(await this.updateGame(
       session.id,
       session.status,
       session.currentTurn,
@@ -1354,13 +1559,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return undefined;
   }
 
-  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession): void {
+  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession): void {
     if (session.pause?.active) {
       throw new BadRequestException('game is paused');
     }
   }
 
-  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession, user: AuthAccount): void {
+  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession, user: AuthAccount): void {
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('pause is only available during matched games');
     }
@@ -1384,7 +1589,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     session.updatedAt = new Date(now).toISOString();
   }
 
-  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession): void {
+  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession): void {
     const pause = session.pause;
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('resume is only available during matched games');
@@ -1423,8 +1628,23 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.assertGameParticipant(user, session.players.challenger, session.players.opponent);
   }
 
+  private assertFortressParticipant(user: AuthAccount, session: FortressSession): void {
+    this.assertGameParticipant(user, session.players.challenger, session.players.opponent);
+  }
+
   private splendorSideForUser(session: SplendorSession, user: AuthAccount): SplendorSide {
     const side = splendorSideForAccount(session, user.accountId);
+    if (side) {
+      return side;
+    }
+    if (user.permission === 'superadmin') {
+      return session.currentTurn;
+    }
+    throw new ForbiddenException('not a participant');
+  }
+
+  private fortressSideForUser(session: FortressSession, user: AuthAccount): FortressSide {
+    const side = fortressSideForAccount(session, user.accountId);
     if (side) {
       return side;
     }
@@ -1448,8 +1668,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async sendSessionEmote(
-    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor',
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession,
+    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress',
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession,
     user: AuthAccount,
     slot: number,
   ): Promise<unknown> {
@@ -1546,6 +1766,99 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         console.warn('[splendor-ai]', error);
       }
     }, LOCAL_AI_RESPONSE_DELAY_MS);
+  }
+
+  private scheduleFortressAi(session: FortressSession): void {
+    if (session.mode !== 'local_ai' || session.status !== 'playing' || session.currentTurn !== 'opponent') {
+      return;
+    }
+    setTimeout(async () => {
+      try {
+        const current = this.fortressFromRow(await this.requireGameRow(session.id, 'fortress'));
+        if (current.status !== 'playing' || current.mode !== 'local_ai' || current.currentTurn !== 'opponent') {
+          return;
+        }
+        const result = applyFortressAiTurn(current);
+        const saved = await this.saveFortressSession(current);
+        if (result) {
+          this.emitSessionEvent(saved, 'fortress.shot.played', {
+            ...result,
+            session: fortressClientSession(saved),
+          });
+          if (saved.status === 'finished') {
+            this.emitSessionEvent(saved, 'game.session.finished', fortressClientSession(saved));
+          }
+        } else {
+          this.emitSessionEvent(saved, 'fortress.state.changed', fortressClientSession(saved));
+        }
+      } catch (error) {
+        console.warn('[fortress-ai]', error);
+      }
+    }, FORTRESS_AI_RESPONSE_DELAY_MS);
+  }
+
+  private startFortressTimedTurn(session: FortressSession, delayMs = 0): void {
+    if (session.mode !== 'friend_match' || session.status !== 'playing' || session.pause?.active) {
+      return;
+    }
+    const now = Date.now();
+    session.turnStartedAt = new Date(now + delayMs).toISOString();
+    session.turnDeadlineAt = new Date(now + delayMs + FORTRESS_TURN_LIMIT_MS).toISOString();
+  }
+
+  private scheduleFortressTurnTimer(session: FortressSession): void {
+    this.clearTurnTimer(session.id);
+    if (session.mode !== 'friend_match' || session.status !== 'playing' || session.pause?.active) {
+      return;
+    }
+    if (!session.turnDeadlineAt) {
+      this.startFortressTimedTurn(session);
+    }
+    const deadline = session.turnDeadlineAt;
+    if (!deadline) {
+      return;
+    }
+    const delay = Math.max(100, Date.parse(deadline) - Date.now());
+    this.turnTimers.set(session.id, setTimeout(() => {
+      void this.handleFortressTimer(session.id).catch((error) => {
+        // Timer failures should not crash the API process.
+        console.error(error);
+      });
+    }, delay));
+  }
+
+  private async handleFortressTimer(id: string): Promise<void> {
+    const row = await this.requireGameRow(id, 'fortress');
+    if (row.mode !== 'friend_match' || row.status !== 'playing') {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const session = this.fortressFromRow(row);
+    if (session.pause?.active) {
+      this.clearTurnTimer(id);
+      return;
+    }
+    if (session.turnDeadlineAt && Date.parse(session.turnDeadlineAt) > Date.now() + 50) {
+      this.scheduleFortressTurnTimer(session);
+      return;
+    }
+    const side = session.currentTurn;
+    const accountId = session.players[side];
+    const angle = 24 + Math.random() * 48;
+    const power = 24 + Math.random() * 50;
+    const result = applyFortressShot(session, side, accountId, angle, power, 'timeout');
+    if (result.session.status === 'playing') {
+      this.startFortressTimedTurn(result.session, FORTRESS_SHOT_ANIMATION_MS);
+    }
+    const saved = await this.saveFortressSession(result.session);
+    this.scheduleFortressTurnTimer(saved);
+    this.emitSessionEvent(saved, 'fortress.shot.played', {
+      ...result,
+      session: fortressClientSession(saved),
+    });
+    if (saved.status === 'finished') {
+      this.emitSessionEvent(saved, 'game.session.finished', fortressClientSession(saved));
+    }
   }
 
   private scheduleLocalGomokuAiTurn(id: string): void {
@@ -1744,13 +2057,15 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       `SELECT * FROM game_sessions
        WHERE mode = 'friend_match'
          AND status = 'playing'
-         AND game_key IN ('gomoku', 'alkkagi')`,
+         AND game_key IN ('gomoku', 'alkkagi', 'fortress')`,
     );
     for (const row of result.rows) {
       if (row.game_key === 'gomoku') {
         this.scheduleTurnTimer(this.gomokuFromRow(row), 'gomoku');
       } else if (row.game_key === 'alkkagi') {
         this.scheduleTurnTimer(this.alkkagiFromRow(row), 'alkkagi');
+      } else if (row.game_key === 'fortress') {
+        this.scheduleFortressTurnTimer(this.fortressFromRow(row));
       }
     }
   }
@@ -1921,7 +2236,11 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return fallback;
   }
 
-  private emitSessionEvent(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession, event: string, payload: unknown): void {
+  private emitSessionEvent(
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession,
+    event: string,
+    payload: unknown,
+  ): void {
     this.realtime.emitToAccounts(sessionAccountIds(session), event, payload);
   }
 
@@ -2275,8 +2594,154 @@ function splendorMovesFromSnapshot(value: unknown): SplendorSession['moves'] {
   });
 }
 
+function fortressStatusFromSnapshot(value: unknown, fallback: FortressSession['status']): FortressSession['status'] {
+  return value === 'selecting' || value === 'playing' || value === 'finished' ? value : fallback;
+}
+
+function fortressSideFromSnapshot(value: unknown, fallback: FortressSide): FortressSide {
+  return value === 'challenger' || value === 'opponent' ? value : fallback;
+}
+
+function optionalFortressSide(value: unknown): FortressSide | undefined {
+  return value === 'challenger' || value === 'opponent' ? value : undefined;
+}
+
+function numberArrayFromSnapshot(value: unknown, fallback: number[]): number[] {
+  if (!Array.isArray(value)) {
+    return [...fallback];
+  }
+  const next = value.map((item, index) => finiteNumber(item, fallback[index] ?? 0));
+  return next.length > 0 ? next : [...fallback];
+}
+
+function fortressTanksFromSnapshot(value: unknown, current: FortressSession): FortressSession['tanks'] {
+  const source = isRecord(value) ? value : {};
+  return {
+    challenger: fortressTankFromSnapshot(source.challenger, current.tanks.challenger),
+    opponent: fortressTankFromSnapshot(source.opponent, current.tanks.opponent),
+  };
+}
+
+function fortressMovementRemainingFromSnapshot(
+  value: unknown,
+  fallback: Record<FortressSide, number> | undefined,
+): Record<FortressSide, number> {
+  const source = isRecord(value) ? value : {};
+  return {
+    challenger: Math.max(0, finiteNumber(source.challenger, fallback?.challenger ?? 0)),
+    opponent: Math.max(0, finiteNumber(source.opponent, fallback?.opponent ?? 0)),
+  };
+}
+
+function fortressFloatingPlatformsFromSnapshot(value: unknown): FortressFloatingPlatform[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((item, index) => {
+    if (!isRecord(item)) {
+      return [];
+    }
+    const x1 = finiteNumber(item.x1, 0);
+    const x2 = finiteNumber(item.x2, 0);
+    const y = finiteNumber(item.y, 0);
+    const thickness = Math.max(8, finiteNumber(item.thickness, 22));
+    if (x2 - x1 < 20 || y <= 0) {
+      return [];
+    }
+    return [{
+      id: typeof item.id === 'string' && item.id ? item.id : `platform-${index}`,
+      x1,
+      x2,
+      y,
+      thickness,
+    }];
+  });
+}
+
+function fortressPositionsFromSnapshot(
+  value: unknown,
+  fallback: FortressSession['tanks'],
+): Record<FortressSide, FortressPosition> {
+  const source = isRecord(value) ? value : {};
+  return {
+    challenger: fortressPositionFromSnapshot(source.challenger, fallback.challenger),
+    opponent: fortressPositionFromSnapshot(source.opponent, fallback.opponent),
+  };
+}
+
+function fortressPositionFromSnapshot(
+  value: unknown,
+  fallback: FortressSession['tanks'][FortressSide],
+): FortressPosition {
+  const source = isRecord(value) ? value : {};
+  return {
+    x: finiteNumber(source.x, fallback.x),
+    y: finiteNumber(source.y, fallback.y),
+  };
+}
+
+function fortressTankFromSnapshot(
+  value: unknown,
+  fallback: FortressSession['tanks'][FortressSide],
+): FortressSession['tanks'][FortressSide] {
+  const source = isRecord(value) ? value : {};
+  const tankKey = typeof source.tankKey === 'string' && ['balance', 'heavy', 'scout', 'bomber'].includes(source.tankKey)
+    ? source.tankKey as FortressSession['tanks'][FortressSide]['tankKey']
+    : fallback.tankKey;
+  return {
+    ...fallback,
+    tankKey,
+    x: finiteNumber(source.x, fallback.x),
+    y: finiteNumber(source.y, fallback.y),
+    hp: Math.max(0, finiteNumber(source.hp, fallback.hp)),
+    alive: source.alive !== false,
+  };
+}
+
+function fortressShotsFromSnapshot(value: unknown): FortressSession['shots'] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((item) => {
+    if (!isRecord(item)) {
+      return [];
+    }
+    const side = optionalFortressSide(item.side);
+    if (!side || typeof item.accountId !== 'string') {
+      return [];
+    }
+    const hit = item.hit === 'terrain' || item.hit === 'tank' || item.hit === 'out' ? item.hit : undefined;
+    return [{
+      side,
+      accountId: item.accountId,
+      angle: finiteNumber(item.angle, 45),
+      power: finiteNumber(item.power, 55),
+      createdAt: typeof item.createdAt === 'string' ? item.createdAt : new Date().toISOString(),
+      source: item.source === 'ai' ? 'ai' as const : item.source === 'timeout' ? 'timeout' as const : 'manual' as const,
+      tankKey: typeof item.tankKey === 'string' && ['balance', 'heavy', 'scout', 'bomber'].includes(item.tankKey)
+        ? item.tankKey as FortressSession['shots'][number]['tankKey']
+        : undefined,
+      hit,
+      damage: typeof item.damage === 'number' ? item.damage : undefined,
+    }];
+  });
+}
+
 function finiteNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function currentFortressPositions(session: FortressSession): Record<FortressSide, FortressPosition> {
+  return {
+    challenger: {
+      x: session.tanks.challenger.x,
+      y: session.tanks.challenger.y,
+    },
+    opponent: {
+      x: session.tanks.opponent.x,
+      y: session.tanks.opponent.y,
+    },
+  };
 }
 
 function finiteInteger(value: unknown, fallback: number): number {
@@ -2504,7 +2969,7 @@ function hashText(value: string): number {
   return hash;
 }
 
-function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession): string[] {
+function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession): string[] {
   if ('players' in session && session.players) {
     return [...new Set(Object.values(session.players).filter((accountId) => !isLocalAiAccount(accountId)))];
   }
@@ -2519,7 +2984,7 @@ function isLocalAiAccount(accountId: string): boolean {
 }
 
 function shiftDeadline(
-  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession,
+  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession,
   key: 'turnStartedAt' | 'turnDeadlineAt' | 'networkGraceStartedAt' | 'networkGraceDeadlineAt',
   deltaMs: number,
 ): void {

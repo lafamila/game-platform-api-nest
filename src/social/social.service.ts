@@ -214,6 +214,7 @@ export class SocialService implements OnModuleInit, OnModuleDestroy {
       othello: { wins: 0, losses: 0 },
       sokoban: { wins: 0, losses: 0 },
       splendor: { wins: 0, losses: 0 },
+      fortress: { wins: 0, losses: 0 },
     };
     for (const row of result.rows) {
       const gameKey = row.game_key as keyof typeof stats;
@@ -236,6 +237,7 @@ export class SocialService implements OnModuleInit, OnModuleDestroy {
         { gameKey: 'othello', label: '오델로', ...stats.othello },
         { gameKey: 'sokoban', label: '소코반', ...stats.sokoban },
         { gameKey: 'splendor', label: '스플렌더', ...stats.splendor },
+        { gameKey: 'fortress', label: '포트리스', ...stats.fortress },
       ],
       total: {
         wins: Object.values(stats).reduce((total, item) => total + item.wins, 0),
@@ -344,8 +346,8 @@ export class SocialService implements OnModuleInit, OnModuleDestroy {
 
   async createMatchRequest(user: AuthAccount, input: { gameKey: string; opponentAccountId: string }) {
     this.assertCanMatch(user);
-    if (!['sudoku', 'gomoku', 'alkkagi', 'othello', 'sokoban', 'splendor'].includes(input.gameKey)) {
-      throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, or splendor');
+    if (!['sudoku', 'gomoku', 'alkkagi', 'othello', 'sokoban', 'splendor', 'fortress'].includes(input.gameKey)) {
+      throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, or fortress');
     }
     if (input.opponentAccountId === user.accountId) {
       throw new BadRequestException('opponent must be another account');
@@ -659,7 +661,7 @@ function winnerAccountForRow(gameKey: string, state: Record<string, unknown>): s
   if (gameKey === 'sokoban') {
     return typeof state.winnerAccountId === 'string' ? state.winnerAccountId : undefined;
   }
-  if (gameKey === 'splendor') {
+  if (gameKey === 'splendor' || gameKey === 'fortress') {
     return typeof state.winnerAccountId === 'string' ? state.winnerAccountId : undefined;
   }
   const winner = typeof state.winner === 'string' ? state.winner : undefined;

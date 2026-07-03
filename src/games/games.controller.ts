@@ -254,4 +254,39 @@ export class GamesController {
   forfeitSplendor(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
     return this.games.forfeitSplendor(id, user);
   }
+
+  @Post('fortress/sessions')
+  createFortress(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
+    return this.games.createFortressSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium');
+  }
+
+  @Get('fortress/sessions/:id')
+  getFortress(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.getFortressSession(id, user);
+  }
+
+  @Post('fortress/sessions/:id/select-tank')
+  selectFortressTank(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { tankKey: string }) {
+    return this.games.selectFortressTank(id, user, body.tankKey);
+  }
+
+  @Post('fortress/sessions/:id/moves')
+  moveFortress(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { distance: number }) {
+    return this.games.moveFortress(id, user, Number(body.distance));
+  }
+
+  @Post('fortress/sessions/:id/shots')
+  shootFortress(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { angle: number; power: number }) {
+    return this.games.shootFortress(id, user, Number(body.angle), Number(body.power));
+  }
+
+  @Post('fortress/sessions/:id/emotes')
+  sendFortressEmote(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { slot: number }) {
+    return this.games.sendFortressEmote(id, user, Number(body.slot));
+  }
+
+  @Post('fortress/sessions/:id/forfeit')
+  forfeitFortress(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.forfeitFortress(id, user);
+  }
 }

@@ -144,6 +144,42 @@ test('splendor local sessions follow token turns and answer with AI', async () =
   assert.equal(answered.moves[1].source, 'ai');
 });
 
+test('fortress local sessions use a long world and answer player shots', async () => {
+  const service = new GamesService(new FakeDb(), new FakeRealtime());
+
+  const session = await service.createFortressSession(user, undefined, undefined, 'hard');
+  assert.equal(session.mode, 'local_ai');
+  assert.equal(session.aiDifficulty, 'hard');
+  assert.equal(session.status, 'selecting');
+  assert.ok(session.world.width > 1000);
+  assert.equal(session.tanks.opponent.accountId, '__game_platform_local_ai__');
+  assert.ok(session.tanks.opponent.tankKey);
+
+  const selected = await service.selectFortressTank(session.id, user, 'balance');
+  assert.equal(selected.status, 'playing');
+  assert.equal(selected.currentTurn, 'challenger');
+  assert.equal(selected.tanks.challenger.tankKey, 'balance');
+  assert.ok(selected.movementRemaining.challenger > 0);
+  const movementBefore = selected.movementRemaining.challenger;
+
+  const moved = await service.moveFortress(session.id, user, 10);
+  assert.equal(moved.currentTurn, 'challenger');
+  assert.ok(moved.movementRemaining.challenger < movementBefore);
+
+  const result = await service.shootFortress(session.id, user, 45, 82);
+  assert.ok(result.animation.projectile.length > 1);
+  assert.equal(result.session.shots.length, 1);
+  assert.equal(result.session.shots[0].source, 'manual');
+
+  if (result.session.status === 'playing') {
+    await wait(350);
+    const answered = await service.getFortressSession(session.id, user);
+    assert.equal(answered.shots.length, 2);
+    assert.equal(answered.shots[1].source, 'ai');
+    assert.equal(answered.currentTurn, 'challenger');
+  }
+});
+
 test('splendor hard AI buys an immediate winning card', () => {
   const session = createSplendorState(user.accountId, 'ai-player', 'local_ai', 'hard');
   const winningCard = {
