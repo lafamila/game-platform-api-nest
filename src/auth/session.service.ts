@@ -11,6 +11,35 @@ interface TokenResponse {
   expires_in?: number;
 }
 
+type ReadinessStatus = 'ok' | 'down';
+
+interface ReadinessProbe {
+  status: ReadinessStatus;
+  latencyMs: number;
+  url?: string;
+  httpStatus?: number;
+  error?: string;
+}
+
+interface DiscoveryReadinessProbe extends ReadinessProbe {
+  issuer?: string;
+  jwksUri?: string;
+}
+
+export interface LoginReadinessResponse {
+  status: ReadinessStatus;
+  checkedAt: string;
+  gameApi: {
+    status: ReadinessStatus;
+    database: ReadinessProbe;
+  };
+  authServer: {
+    status: ReadinessStatus;
+    discovery: DiscoveryReadinessProbe;
+    jwks: ReadinessProbe;
+  };
+}
+
 @Injectable()
 export class GamePlatformSessionService {
   private readonly refreshLocks = new Map<string, Promise<GamePlatformSession>>();
@@ -19,6 +48,36 @@ export class GamePlatformSessionService {
     private readonly db: DatabaseService,
     private readonly auth: AuthService,
   ) {}
+
+  async loginReadiness(): Promise<LoginReadinessResponse> {
+    const authBaseUrl = env('AUTH_API_BASE_URL', 'http://localhost:3032');
+    const discoveryUrl = new URL('/.well-known/openid-configuration', authBaseUrl).toString();
+    const [database, discoveryResult] = await Promise.all([
+      this.checkDatabaseReadiness(),
+      fetchJsonWithTimeout(discoveryUrl, 2500),
+    ]);
+    const discovery = this.discoveryProbe(discoveryResult);
+    const configuredJwksUrl = process.env.AUTH_JWKS_URL?.trim();
+    const jwksUrl = configuredJwksUrl && configuredJwksUrl.length > 0
+      ? configuredJwksUrl
+      : discovery.jwksUri ?? new URL('/oauth/jwks', authBaseUrl).toString();
+    const jwks = await fetchJsonWithTimeout(jwksUrl, 2500);
+    const gameReady = database.status === 'ok';
+    const authReady = discovery.status === 'ok' && jwks.status === 'ok';
+    return {
+      status: gameReady && authReady ? 'ok' : 'down',
+      checkedAt: new Date().toISOString(),
+      gameApi: {
+        status: gameReady ? 'ok' : 'down',
+        database,
+      },
+      authServer: {
+        status: authReady ? 'ok' : 'down',
+        discovery,
+        jwks,
+      },
+    };
+  }
 
   async startOidcLogin(input: { returnUri?: string }): Promise<{ authorizeUrl: string; loginTransactionId: string; expiresAt: string }> {
     const verifier = randomToken(48);
@@ -415,6 +474,37 @@ export class GamePlatformSessionService {
     throw new BadRequestException('returnUri is not allowed');
   }
 
+  private async checkDatabaseReadiness(): Promise<ReadinessProbe> {
+    const startedAt = Date.now();
+    try {
+      await withTimeout(this.db.query('SELECT 1'), 1500, 'Database readiness check timed out');
+      return {
+        status: 'ok',
+        latencyMs: Date.now() - startedAt,
+      };
+    } catch (error) {
+      return {
+        status: 'down',
+        latencyMs: Date.now() - startedAt,
+        error: errorMessage(error, 'Database readiness check failed'),
+      };
+    }
+  }
+
+  private discoveryProbe(result: JsonReadinessProbe): DiscoveryReadinessProbe {
+    const issuer = typeof result.body?.issuer === 'string' ? result.body.issuer : undefined;
+    const jwksUri = typeof result.body?.jwks_uri === 'string' ? result.body.jwks_uri : undefined;
+    return {
+      status: result.status,
+      latencyMs: result.latencyMs,
+      url: result.url,
+      httpStatus: result.httpStatus,
+      error: result.error,
+      issuer,
+      jwksUri,
+    };
+  }
+
   private returnUriWithResult(transaction: LoginTransaction, status: 'success' | 'error', errorCode?: string, error?: string): string | undefined {
     if (!transaction.returnUri) {
       return undefined;
@@ -468,6 +558,83 @@ function randomToken(byteLength: number): string {
 
 function pkceChallenge(verifier: string): string {
   return createHash('sha256').update(verifier).digest('base64url');
+}
+
+interface JsonReadinessProbe extends ReadinessProbe {
+  url: string;
+  body?: Record<string, unknown>;
+}
+
+async function fetchJsonWithTimeout(url: string, timeoutMs: number): Promise<JsonReadinessProbe> {
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    const response = await fetch(url, {
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    const body = parseJsonObject(text);
+    return {
+      status: response.ok ? 'ok' : 'down',
+      url,
+      httpStatus: response.status,
+      latencyMs: Date.now() - startedAt,
+      error: response.ok ? undefined : readinessErrorMessage(body, `HTTP ${response.status}`),
+      body,
+    };
+  } catch (error) {
+    return {
+      status: 'down',
+      url,
+      latencyMs: Date.now() - startedAt,
+      error: errorMessage(error, 'Request failed'),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseJsonObject(text: string): Record<string, unknown> | undefined {
+  if (!text.trim()) {
+    return undefined;
+  }
+  try {
+    const decoded = JSON.parse(text) as unknown;
+    return decoded && typeof decoded === 'object' && !Array.isArray(decoded)
+      ? decoded as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readinessErrorMessage(body: Record<string, unknown> | undefined, fallback: string): string {
+  const message = body?.message ?? body?.detail ?? body?.error_description ?? body?.error;
+  return typeof message === 'string' && message.trim().length > 0 ? message : fallback;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message.trim().length > 0 ? error.message : fallback;
 }
 
 async function responseText(response: Response, fallback: string): Promise<string> {

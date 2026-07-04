@@ -10,6 +10,15 @@ import { GamePlatformSessionService, sessionResponse } from './session.service';
 export class SessionController {
   constructor(private readonly sessions: GamePlatformSessionService) {}
 
+  @Get('oidc/readiness')
+  async oidcReadiness(@Res({ passthrough: true }) response: Response) {
+    const readiness = await this.sessions.loginReadiness();
+    if (readiness.status !== 'ok') {
+      response.status(503);
+    }
+    return readiness;
+  }
+
   @Post('oidc/start')
   startOidcLogin(@Body() body: { returnUri?: string }) {
     return this.sessions.startOidcLogin(body);
