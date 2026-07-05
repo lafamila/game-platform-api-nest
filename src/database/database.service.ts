@@ -47,6 +47,12 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       )
     `);
     await this.query(`CREATE INDEX IF NOT EXISTS idx_app_sessions_account ON app_sessions(account_id)`);
+    // 세션 keepalive job(refresh 체인 유지)이 refresh token 발급 시각을 추적하기 위한 컬럼.
+    await this.query(`ALTER TABLE app_sessions ADD COLUMN IF NOT EXISTS refresh_token_issued_at timestamptz`);
+    await this.query(`UPDATE app_sessions SET refresh_token_issued_at = created_at WHERE refresh_token_issued_at IS NULL`);
+    await this.query(
+      `CREATE INDEX IF NOT EXISTS idx_app_sessions_refresh_issued ON app_sessions(refresh_token_issued_at) WHERE refresh_token_issued_at IS NOT NULL`,
+    );
 
     await this.query(`
       CREATE TABLE IF NOT EXISTS login_transactions (

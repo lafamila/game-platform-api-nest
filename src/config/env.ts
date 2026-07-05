@@ -9,6 +9,11 @@ export function env(key: string, fallback?: string): string {
   throw new Error(`${key} is required`);
 }
 
+export function hasEnv(key: string): boolean {
+  const value = process.env[key];
+  return value !== undefined && value !== '';
+}
+
 export function intEnv(key: string, fallback: number): number {
   const value = process.env[key];
   if (!value) {

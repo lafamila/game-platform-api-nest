@@ -1,7 +1,15 @@
-import { BadRequestException, Injectable, Logger, ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+  ServiceUnavailableException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
 import { DatabaseService } from '../database/database.service';
-import { env, intEnv, listEnv } from '../config/env';
+import { env, hasEnv, intEnv, listEnv } from '../config/env';
 import { AuthService } from './auth.service';
 import { AuthAccount, GamePlatformSession, LoginTransaction } from './auth.types';
 
@@ -47,15 +55,28 @@ const REFRESH_RETRY_DELAY_MS = 500;
 /** 만료 5분 전 선제 refresh(root §1.3-(2)). 일시 실패해도 남은 수명 동안 soft-fail 가능. */
 const PREEMPTIVE_REFRESH_MS = 5 * 60 * 1000;
 
+/** 앱 세션 sliding/absolute 기본값(root §1.3-(3), D1). */
+const DEFAULT_SESSION_IDLE_SECONDS = 2592000; // 30일
+const DEFAULT_SESSION_ABSOLUTE_MAX_AGE_SECONDS = 15552000; // 180일
+/** 슬라이딩 연장 write 증폭 방지: 마지막 연장에서 5분 이상 지난 경우에만 UPDATE. */
+const SLIDING_EXTEND_THROTTLE_MS = 5 * 60 * 1000;
+
+/** 세션 keepalive job(root §1.3-(4)) — auth per-client refresh TTL 배포 전까지 refresh 체인 유지. */
+const DEFAULT_REFRESH_TOKEN_TTL_SECONDS = 604800; // 7일 (auth 현행 하드코딩값)
+const DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 3600; // 1시간, 0 이면 비활성
+const KEEPALIVE_ROTATE_BEFORE_MS = 24 * 60 * 60 * 1000; // refresh 만료 24h 전 rotation
+const KEEPALIVE_BATCH_SIZE = 50;
+
 /** auth 가 refresh 를 영구 거절(400/401/403)했을 때. */
 class AuthRejectedError extends Error {}
 /** auth 가 일시적으로 불가(5xx·네트워크·JWKS 미로딩)일 때. */
 class AuthUnavailableError extends Error {}
 
 @Injectable()
-export class GamePlatformSessionService {
+export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy {
   private readonly refreshLocks = new Map<string, Promise<GamePlatformSession>>();
   private readonly logger = new Logger(GamePlatformSessionService.name);
+  private keepaliveTimer?: ReturnType<typeof setInterval>;
 
   /**
    * 세션 끊김 원인 배분을 위한 계측(원칙: root §1.1). 세션 삭제/refresh 실패 사유를
@@ -70,6 +91,28 @@ export class GamePlatformSessionService {
     private readonly db: DatabaseService,
     private readonly auth: AuthService,
   ) {}
+
+  async onModuleInit(): Promise<void> {
+    const intervalSeconds = intEnv('GAME_PLATFORM_SESSION_KEEPALIVE_INTERVAL_SECONDS', DEFAULT_KEEPALIVE_INTERVAL_SECONDS);
+    if (intervalSeconds <= 0) {
+      this.logger.log('session keepalive disabled (interval <= 0)');
+      return;
+    }
+    await this.db.ready();
+    this.keepaliveTimer = setInterval(() => {
+      void this.rotateStaleRefreshTokens().catch((error) => {
+        this.logger.warn(`keepalive cycle failed: ${errorMessage(error, 'unknown')}`);
+      });
+    }, intervalSeconds * 1000);
+    this.keepaliveTimer.unref?.();
+  }
+
+  onModuleDestroy(): void {
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = undefined;
+    }
+  }
 
   async loginReadiness(): Promise<LoginReadinessResponse> {
     const authBaseUrl = env('AUTH_API_BASE_URL', 'http://localhost:3032');
@@ -236,16 +279,7 @@ export class GamePlatformSessionService {
     if (!sessionId) {
       throw new UnauthorizedException('Game-platform session is required');
     }
-    const row = await this.db.one<{
-      id: string;
-      user_json: AuthAccount;
-      access_token: string;
-      refresh_token: string;
-      access_token_expires_at: Date;
-      created_at: Date;
-      last_seen_at: Date;
-      expires_at: Date;
-    }>(
+    const row = await this.db.one<AppSessionRow>(
       `SELECT id, user_json, access_token, refresh_token, access_token_expires_at, created_at, last_seen_at, expires_at
        FROM app_sessions
        WHERE id = $1`,
@@ -264,7 +298,7 @@ export class GamePlatformSessionService {
     if (session.accessTokenExpiresAt - Date.now() <= PREEMPTIVE_REFRESH_MS) {
       session = await this.refreshSessionLocked(session);
     }
-    await this.db.query(`UPDATE app_sessions SET last_seen_at = now() WHERE id = $1`, [session.id]);
+    session = await this.extendSlidingSession(session);
     return session;
   }
 
@@ -391,7 +425,6 @@ export class GamePlatformSessionService {
     }
     const account = await this.auth.verifyBearerToken(token.access_token);
     const now = Date.now();
-    const maxAgeMs = intEnv('GAME_PLATFORM_SESSION_MAX_AGE_SECONDS', 604800) * 1000;
     const session: GamePlatformSession = {
       id: randomToken(32),
       account,
@@ -400,12 +433,12 @@ export class GamePlatformSessionService {
       accessTokenExpiresAt: now + token.expires_in * 1000,
       createdAt: now,
       lastSeenAt: now,
-      expiresAt: now + maxAgeMs,
+      expiresAt: this.slidingExpiresAt(now, now),
     };
     await this.db.query(
       `INSERT INTO app_sessions
-       (id, account_id, user_json, access_token, refresh_token, access_token_expires_at, created_at, last_seen_at, expires_at)
-       VALUES ($1, $2, $3::jsonb, $4, $5, to_timestamp($6 / 1000.0), to_timestamp($7 / 1000.0), to_timestamp($8 / 1000.0), to_timestamp($9 / 1000.0))`,
+       (id, account_id, user_json, access_token, refresh_token, access_token_expires_at, created_at, last_seen_at, expires_at, refresh_token_issued_at)
+       VALUES ($1, $2, $3::jsonb, $4, $5, to_timestamp($6 / 1000.0), to_timestamp($7 / 1000.0), to_timestamp($8 / 1000.0), to_timestamp($9 / 1000.0), to_timestamp($7 / 1000.0))`,
       [
         session.id,
         session.account.accountId,
@@ -447,6 +480,7 @@ export class GamePlatformSessionService {
       refreshToken: token.refresh_token,
       accessTokenExpiresAt: now + token.expires_in * 1000,
       lastSeenAt: now,
+      expiresAt: this.slidingExpiresAt(session.createdAt, now),
     };
     await this.db.query(
       `UPDATE app_sessions
@@ -455,7 +489,8 @@ export class GamePlatformSessionService {
            refresh_token = $4,
            access_token_expires_at = to_timestamp($5 / 1000.0),
            last_seen_at = now(),
-           expires_at = to_timestamp($6 / 1000.0)
+           expires_at = to_timestamp($6 / 1000.0),
+           refresh_token_issued_at = now()
        WHERE id = $1`,
       [
         session.id,
@@ -523,6 +558,69 @@ export class GamePlatformSessionService {
     await this.db.query(`DELETE FROM app_sessions WHERE id = $1`, [session.id]);
     this.logSessionEvent('deleted', 'refresh_rejected', session.id);
     throw sessionUnauthorized('SESSION_EXPIRED', 'Game-platform session expired. Please login again');
+  }
+
+  private sessionIdleMs(): number {
+    return intEnv('GAME_PLATFORM_SESSION_IDLE_SECONDS', DEFAULT_SESSION_IDLE_SECONDS) * 1000;
+  }
+
+  /** absolute cap: 신규 키 우선, 없으면 legacy GAME_PLATFORM_SESSION_MAX_AGE_SECONDS 를 매핑. */
+  private sessionAbsoluteMaxAgeMs(): number {
+    if (hasEnv('GAME_PLATFORM_SESSION_ABSOLUTE_MAX_AGE_SECONDS')) {
+      return intEnv('GAME_PLATFORM_SESSION_ABSOLUTE_MAX_AGE_SECONDS', DEFAULT_SESSION_ABSOLUTE_MAX_AGE_SECONDS) * 1000;
+    }
+    if (hasEnv('GAME_PLATFORM_SESSION_MAX_AGE_SECONDS')) {
+      return intEnv('GAME_PLATFORM_SESSION_MAX_AGE_SECONDS', DEFAULT_SESSION_ABSOLUTE_MAX_AGE_SECONDS) * 1000;
+    }
+    return DEFAULT_SESSION_ABSOLUTE_MAX_AGE_SECONDS * 1000;
+  }
+
+  /** sliding + absolute cap: LEAST(created_at + ABSOLUTE, now + IDLE) (root §1.3-(3)). */
+  private slidingExpiresAt(createdAtMs: number, nowMs: number): number {
+    return Math.min(createdAtMs + this.sessionAbsoluteMaxAgeMs(), nowMs + this.sessionIdleMs());
+  }
+
+  /** 마지막 연장에서 5분 이상 지났을 때만 sliding 연장 UPDATE(write 증폭 방지). */
+  private async extendSlidingSession(session: GamePlatformSession): Promise<GamePlatformSession> {
+    const nowMs = Date.now();
+    if (nowMs - session.lastSeenAt < SLIDING_EXTEND_THROTTLE_MS) {
+      return session;
+    }
+    const expiresAt = this.slidingExpiresAt(session.createdAt, nowMs);
+    await this.db.query(
+      `UPDATE app_sessions SET last_seen_at = now(), expires_at = to_timestamp($2 / 1000.0) WHERE id = $1`,
+      [session.id, expiresAt],
+    );
+    return { ...session, lastSeenAt: nowMs, expiresAt };
+  }
+
+  /**
+   * keepalive job(root §1.3-(4)): last_seen 이 idle 창 내(=expires_at 미래)이면서 refresh token 이
+   * 만료 24h 전에 근접한 세션의 refresh 를 미리 rotation 해서, 앱을 며칠 안 열어도 체인이 끊기지 않게 한다.
+   */
+  private async rotateStaleRefreshTokens(): Promise<void> {
+    const refreshTtlSeconds = intEnv('GAME_PLATFORM_REFRESH_TOKEN_TTL_SECONDS', DEFAULT_REFRESH_TOKEN_TTL_SECONDS);
+    const cutoffMs = Date.now() - Math.max(refreshTtlSeconds * 1000 - KEEPALIVE_ROTATE_BEFORE_MS, 60_000);
+    const result = await this.db.query<AppSessionRow>(
+      `SELECT id, user_json, access_token, refresh_token, access_token_expires_at, created_at, last_seen_at, expires_at
+       FROM app_sessions
+       WHERE expires_at > now()
+         AND refresh_token_issued_at IS NOT NULL
+         AND refresh_token_issued_at < to_timestamp($1 / 1000.0)
+       ORDER BY refresh_token_issued_at ASC
+       LIMIT $2`,
+      [cutoffMs, KEEPALIVE_BATCH_SIZE],
+    );
+    for (const row of result.rows) {
+      const session = rowToSession(row);
+      try {
+        await this.refreshSessionLocked(session);
+        this.logger.log(`keepalive rotated session=${session.id}`);
+      } catch (error) {
+        // AuthRejected 는 이미 세션 삭제됨. AuthUnavailable/503 은 다음 주기에 재시도.
+        this.logger.warn(`keepalive skip session=${session.id} reason=${errorMessage(error, 'unknown')}`);
+      }
+    }
   }
 
   private async markTransactionFailed(id: string, errorCode: string, error: string): Promise<void> {
@@ -611,7 +709,7 @@ export function sessionResponse(session: GamePlatformSession) {
   };
 }
 
-function rowToSession(row: {
+interface AppSessionRow {
   id: string;
   user_json: AuthAccount;
   access_token: string;
@@ -620,7 +718,9 @@ function rowToSession(row: {
   created_at: Date;
   last_seen_at: Date;
   expires_at: Date;
-}): GamePlatformSession {
+}
+
+function rowToSession(row: AppSessionRow): GamePlatformSession {
   return {
     id: row.id,
     account: row.user_json,
