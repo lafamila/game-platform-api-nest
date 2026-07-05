@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
 import { DatabaseService } from '../database/database.service';
 import { env, intEnv, listEnv } from '../config/env';
@@ -43,6 +43,16 @@ export interface LoginReadinessResponse {
 @Injectable()
 export class GamePlatformSessionService {
   private readonly refreshLocks = new Map<string, Promise<GamePlatformSession>>();
+  private readonly logger = new Logger(GamePlatformSessionService.name);
+
+  /**
+   * 세션 끊김 원인 배분을 위한 계측(원칙: root §1.1). 세션 삭제/refresh 실패 사유를
+   * 원인 코드로 서버 로그에 남긴다. 클라이언트 측 SSE 재연결/refresh 실패는
+   * `POST /api/client-errors` 로 수집되어 `client_error_reports` 에 적재된다.
+   */
+  private logSessionEvent(event: 'deleted' | 'refresh_failed', reason: string, sessionId: string): void {
+    this.logger.warn(`session ${event} reason=${reason} session=${sessionId}`);
+  }
 
   constructor(
     private readonly db: DatabaseService,
@@ -232,6 +242,9 @@ export class GamePlatformSessionService {
     if (!row || row.expires_at.getTime() <= Date.now()) {
       if (row) {
         await this.db.query(`DELETE FROM app_sessions WHERE id = $1`, [sessionId]);
+        this.logSessionEvent('deleted', 'session_expired', sessionId);
+      } else {
+        this.logSessionEvent('deleted', 'session_missing', sessionId);
       }
       throw new UnauthorizedException('Game-platform session expired');
     }
@@ -434,8 +447,10 @@ export class GamePlatformSessionService {
     const refresh = this.refreshSession(session).catch(async (error: unknown) => {
       if (error instanceof UnauthorizedException) {
         await this.db.query(`DELETE FROM app_sessions WHERE id = $1`, [session.id]);
+        this.logSessionEvent('deleted', 'refresh_rejected', session.id);
         throw new UnauthorizedException('Game-platform session expired. Please login again');
       }
+      this.logSessionEvent('refresh_failed', 'refresh_error', session.id);
       throw error;
     }).finally(() => {
       this.refreshLocks.delete(session.id);
