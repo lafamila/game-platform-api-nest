@@ -46,6 +46,8 @@ import {
   AlkkagiPiece,
   AlkkagiShotResult,
   AlkkagiSession,
+  CrazyArcadeSession,
+  CrazyArcadeSide,
   CustomEmote,
   Difficulty,
   GameMode,
@@ -152,6 +154,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       { key: 'sokoban', title: 'Sokoban', modes: ['solo', 'friend_match'], status: 'playable' },
       { key: 'splendor', title: 'Splendor', modes: ['local_ai', 'friend_match'], status: 'playable' },
       { key: 'fortress', title: 'Fortress', modes: ['local_ai', 'friend_match'], status: 'playable' },
+      { key: 'crazy_arcade', title: 'Crazy Arcade', modes: ['local_ai', 'friend_match'], status: 'playable' },
     ];
   }
 
@@ -1008,6 +1011,160 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return fortressClientSession(saved, user.accountId);
   }
 
+  async createCrazyArcadeSession(
+    user: AuthAccount,
+    opponentAccountId?: string,
+    mode?: 'local_ai' | 'friend_match',
+    difficulty: Difficulty = 'medium',
+  ): Promise<CrazyArcadeSession> {
+    this.assertDifficulty(difficulty);
+    const resolvedMode = opponentAccountId ? 'friend_match' : mode ?? 'local_ai';
+    const now = new Date().toISOString();
+    const state: CrazyArcadeSession = {
+      id: '',
+      mode: resolvedMode,
+      ownerAccountId: user.accountId,
+      difficulty,
+      aiDifficulty: resolvedMode === 'local_ai' ? difficulty : undefined,
+      players: {
+        challenger: user.accountId,
+        opponent: opponentAccountId || LOCAL_AI_ACCOUNT_ID,
+      },
+      status: 'playing',
+      snapshot: {
+        seed: Math.floor(Math.random() * 0x7fffffff),
+        rows: 11,
+        cols: 13,
+        createdAt: now,
+      },
+      inputs: {
+        challenger: {},
+        opponent: {},
+      },
+      version: 0,
+      createdAt: '',
+      updatedAt: '',
+    };
+    if (resolvedMode === 'friend_match') {
+      state.pause = {
+        active: false,
+        counts: {
+          [user.accountId]: 0,
+          [opponentAccountId!]: 0,
+        },
+      };
+    }
+    const row = await this.insertGame(
+      'crazy_arcade',
+      resolvedMode,
+      user.accountId,
+      opponentAccountId ?? null,
+      'playing',
+      null,
+      null,
+      state,
+    );
+    const session = this.crazyArcadeFromRow(row);
+    this.emitSessionEvent(session, 'game.session.created', session);
+    return sessionForCrazyArcadeUser(session, user);
+  }
+
+  async getCrazyArcadeSession(id: string, user: AuthAccount): Promise<CrazyArcadeSession> {
+    const session = this.crazyArcadeFromRow(await this.requireGameRow(id, 'crazy_arcade'));
+    this.assertCrazyArcadeParticipant(user, session);
+    return sessionForCrazyArcadeUser(session, user);
+  }
+
+  async syncCrazyArcadeState(
+    id: string,
+    user: AuthAccount,
+    input: {
+      snapshot?: Record<string, unknown>;
+      status?: string;
+      winnerSide?: string | null;
+      finishReason?: string;
+      version?: number;
+    },
+  ): Promise<CrazyArcadeSession> {
+    const session = this.crazyArcadeFromRow(await this.requireGameRow(id, 'crazy_arcade'));
+    this.assertCrazyArcadeParticipant(user, session);
+    this.assertNotPaused(session);
+    const side = this.crazyArcadeSideForUser(session, user);
+    if (session.mode === 'friend_match' && side !== 'challenger' && session.status === 'playing') {
+      throw new ForbiddenException('only host can sync matched crazy arcade state');
+    }
+    if (isRecord(input.snapshot)) {
+      session.snapshot = input.snapshot;
+    }
+    const winnerSide = optionalCrazyArcadeSide(input.winnerSide);
+    if (input.status === 'finished' || winnerSide) {
+      session.status = 'finished';
+      session.winnerSide = winnerSide ?? session.winnerSide;
+      session.winnerAccountId = session.winnerSide ? session.players[session.winnerSide] : undefined;
+      session.finishReason = stringFromSnapshot(input.finishReason, session.finishReason ?? 'finished');
+    } else {
+      session.status = 'playing';
+      session.winnerSide = undefined;
+      session.winnerAccountId = undefined;
+      session.finishReason = undefined;
+    }
+    session.version = Math.max(session.version + 1, typeof input.version === 'number' ? Math.floor(input.version) : 0);
+    session.updatedAt = new Date().toISOString();
+    const saved = await this.saveCrazyArcadeSession(session);
+    this.emitSessionEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'crazy_arcade.state.synced', saved);
+    return sessionForCrazyArcadeUser(saved, user);
+  }
+
+  async updateCrazyArcadeInput(
+    id: string,
+    user: AuthAccount,
+    input: Record<string, unknown>,
+  ): Promise<CrazyArcadeSession> {
+    const session = this.crazyArcadeFromRow(await this.requireGameRow(id, 'crazy_arcade'));
+    this.assertCrazyArcadeParticipant(user, session);
+    this.assertNotPaused(session);
+    const side = this.crazyArcadeSideForUser(session, user);
+    session.inputs[side] = {
+      ...input,
+      accountId: user.accountId,
+      side,
+      updatedAt: new Date().toISOString(),
+    };
+    session.version += 1;
+    const saved = await this.saveCrazyArcadeSession(session);
+    this.emitSessionEvent(saved, 'crazy_arcade.input.updated', {
+      sessionId: saved.id,
+      side,
+      input: saved.inputs[side],
+      version: saved.version,
+    });
+    return sessionForCrazyArcadeUser(saved, user);
+  }
+
+  async sendCrazyArcadeEmote(id: string, user: AuthAccount, slot: number): Promise<unknown> {
+    const session = this.crazyArcadeFromRow(await this.requireGameRow(id, 'crazy_arcade'));
+    this.assertCrazyArcadeParticipant(user, session);
+    return this.sendSessionEmote('crazy_arcade', session, user, slot);
+  }
+
+  async forfeitCrazyArcade(id: string, user: AuthAccount): Promise<CrazyArcadeSession> {
+    const session = this.crazyArcadeFromRow(await this.requireGameRow(id, 'crazy_arcade'));
+    this.assertCrazyArcadeParticipant(user, session);
+    if (session.status !== 'playing') {
+      return sessionForCrazyArcadeUser(session, user);
+    }
+    const loser = this.crazyArcadeSideForUser(session, user);
+    session.status = 'finished';
+    session.winnerSide = loser === 'challenger' ? 'opponent' : 'challenger';
+    session.winnerAccountId = session.players[session.winnerSide];
+    session.finishReason = 'forfeit';
+    session.version += 1;
+    session.updatedAt = new Date().toISOString();
+    const saved = await this.saveCrazyArcadeSession(session);
+    this.emitSessionEvent(saved, 'game.session.finished', saved);
+    return sessionForCrazyArcadeUser(saved, user);
+  }
+
   async restoreLocalSaveSnapshot(
     gameKey: string,
     id: string,
@@ -1212,7 +1369,32 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       return fortressClientSession(saved, user.accountId);
     }
 
-    throw new BadRequestException('gameKey must be gomoku, alkkagi, othello, sokoban, splendor, or fortress');
+    if (gameKey === 'crazy_arcade') {
+      const row = await this.requireGameRow(id, 'crazy_arcade');
+      this.assertLocalSaveOwner(row, user);
+      const current = this.crazyArcadeFromRow(row);
+      this.assertCrazyArcadeParticipant(user, current);
+      this.assertLocalSaveMode(current.mode, 'local_ai');
+      const restored: CrazyArcadeSession = {
+        ...current,
+        difficulty: difficultyFromSnapshot(snapshot.difficulty, current.difficulty),
+        aiDifficulty: difficultyFromSnapshot(snapshot.aiDifficulty, current.aiDifficulty ?? 'medium'),
+        status: playingStatusFromSnapshot(snapshot.status),
+        winnerSide: optionalCrazyArcadeSide(snapshot.winnerSide),
+        winnerAccountId: optionalCrazyArcadeSide(snapshot.winnerSide)
+          ? current.players[optionalCrazyArcadeSide(snapshot.winnerSide)!]
+          : undefined,
+        snapshot: isRecord(snapshot.snapshot) ? snapshot.snapshot : { ...snapshot },
+        inputs: { challenger: {}, opponent: {} },
+        pause: undefined,
+        finishReason: undefined,
+        version: current.version + 1,
+      };
+      const saved = await this.saveCrazyArcadeSession(restored);
+      return sessionForCrazyArcadeUser(saved, user);
+    }
+
+    throw new BadRequestException('gameKey must be gomoku, alkkagi, othello, sokoban, splendor, fortress, or crazy_arcade');
   }
 
   async pauseMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
@@ -1275,7 +1457,15 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitSessionEvent(saved, 'game.session.paused', fortressClientSession(saved));
       return fortressClientSession(saved, user.accountId);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, or fortress');
+    if (gameKey === 'crazy_arcade') {
+      const session = this.crazyArcadeFromRow(await this.requireGameRow(id, 'crazy_arcade'));
+      this.assertCrazyArcadeParticipant(user, session);
+      this.applyPause(session, user);
+      const saved = await this.saveCrazyArcadeSession(session);
+      this.emitSessionEvent(saved, 'game.session.paused', saved);
+      return sessionForCrazyArcadeUser(saved, user);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, or crazy_arcade');
   }
 
   async resumeMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
@@ -1338,7 +1528,15 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitSessionEvent(saved, 'game.session.resumed', fortressClientSession(saved));
       return fortressClientSession(saved, user.accountId);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, or fortress');
+    if (gameKey === 'crazy_arcade') {
+      const session = this.crazyArcadeFromRow(await this.requireGameRow(id, 'crazy_arcade'));
+      this.assertCrazyArcadeParticipant(user, session);
+      this.applyResume(session);
+      const saved = await this.saveCrazyArcadeSession(session);
+      this.emitSessionEvent(saved, 'game.session.resumed', saved);
+      return sessionForCrazyArcadeUser(saved, user);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, or crazy_arcade');
   }
 
   async createSessionFromMatch(gameKey: string, requesterAccountId: string, opponentAccountId: string): Promise<string> {
@@ -1370,7 +1568,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'fortress') {
       return (await this.createFortressSession(fakeUser, opponentAccountId, 'friend_match')).id;
     }
-    throw new BadRequestException('match requests support sudoku, gomoku, alkkagi, othello, sokoban, splendor, or fortress');
+    if (gameKey === 'crazy_arcade') {
+      return (await this.createCrazyArcadeSession(fakeUser, opponentAccountId, 'friend_match')).id;
+    }
+    throw new BadRequestException('match requests support sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, or crazy_arcade');
   }
 
   private async insertGame(
@@ -1508,6 +1709,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return ensureFortressRuntimeState(session);
   }
 
+  private crazyArcadeFromRow(row: GameRow): CrazyArcadeSession {
+    return withRowDates(row.state_json as CrazyArcadeSession, row);
+  }
+
   private async saveSplendorSession(session: SplendorSession): Promise<SplendorSession> {
     return this.splendorFromRow(await this.updateGame(
       session.id,
@@ -1523,6 +1728,16 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       session.id,
       session.status,
       session.currentTurn,
+      session.winnerSide ?? null,
+      session,
+    ));
+  }
+
+  private async saveCrazyArcadeSession(session: CrazyArcadeSession): Promise<CrazyArcadeSession> {
+    return this.crazyArcadeFromRow(await this.updateGame(
+      session.id,
+      session.status,
+      null,
       session.winnerSide ?? null,
       session,
     ));
@@ -1579,13 +1794,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return undefined;
   }
 
-  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession): void {
+  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession): void {
     if (session.pause?.active) {
       throw new BadRequestException('game is paused');
     }
   }
 
-  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession, user: AuthAccount): void {
+  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession, user: AuthAccount): void {
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('pause is only available during matched games');
     }
@@ -1609,7 +1824,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     session.updatedAt = new Date(now).toISOString();
   }
 
-  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession): void {
+  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession): void {
     const pause = session.pause;
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('resume is only available during matched games');
@@ -1652,6 +1867,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.assertGameParticipant(user, session.players.challenger, session.players.opponent);
   }
 
+  private assertCrazyArcadeParticipant(user: AuthAccount, session: CrazyArcadeSession): void {
+    this.assertGameParticipant(user, session.players.challenger, session.players.opponent);
+  }
+
   private splendorSideForUser(session: SplendorSession, user: AuthAccount): SplendorSide {
     const side = splendorSideForAccount(session, user.accountId);
     if (side) {
@@ -1674,6 +1893,19 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     throw new ForbiddenException('not a participant');
   }
 
+  private crazyArcadeSideForUser(session: CrazyArcadeSession, user: AuthAccount): CrazyArcadeSide {
+    if (this.canActAs(user, session.players.challenger)) {
+      return 'challenger';
+    }
+    if (this.canActAs(user, session.players.opponent)) {
+      return 'opponent';
+    }
+    if (user.permission === 'superadmin') {
+      return 'challenger';
+    }
+    throw new ForbiddenException('not a participant');
+  }
+
   private sokobanSideForUser(session: SokobanSession, user: AuthAccount): SokobanSide | undefined {
     if (!session.players) {
       return undefined;
@@ -1688,8 +1920,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async sendSessionEmote(
-    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress',
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession,
+    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress' | 'crazy_arcade',
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession,
     user: AuthAccount,
     slot: number,
   ): Promise<unknown> {
@@ -2269,7 +2501,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private emitSessionEvent(
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession,
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession,
     event: string,
     payload: unknown,
   ): void {
@@ -2339,6 +2571,23 @@ function splendorSideFromSnapshot(value: unknown, fallback: SplendorSide): Splen
 
 function optionalSplendorSide(value: unknown): SplendorSide | undefined {
   return value === 'challenger' || value === 'opponent' ? value : undefined;
+}
+
+function optionalCrazyArcadeSide(value: unknown): CrazyArcadeSide | undefined {
+  return value === 'challenger' || value === 'opponent' ? value : undefined;
+}
+
+function sessionForCrazyArcadeUser(session: CrazyArcadeSession, user: AuthAccount): CrazyArcadeSession {
+  return {
+    ...session,
+    mySide: session.players.challenger === user.accountId
+      ? 'challenger'
+      : session.players.opponent === user.accountId
+        ? 'opponent'
+        : user.permission === 'superadmin'
+          ? 'challenger'
+          : undefined,
+  };
 }
 
 function gomokuBoardSnapshot(value: unknown): (PlayerColor | null)[][] {
@@ -3057,7 +3306,7 @@ function hashText(value: string): number {
   return hash;
 }
 
-function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession): string[] {
+function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession): string[] {
   if ('players' in session && session.players) {
     return [...new Set(Object.values(session.players).filter((accountId) => !isLocalAiAccount(accountId)))];
   }
@@ -3072,7 +3321,7 @@ function isLocalAiAccount(accountId: string): boolean {
 }
 
 function shiftDeadline(
-  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession,
+  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession,
   key: 'turnStartedAt' | 'turnDeadlineAt' | 'networkGraceStartedAt' | 'networkGraceDeadlineAt',
   deltaMs: number,
 ): void {

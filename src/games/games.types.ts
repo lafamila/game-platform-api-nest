@@ -4,6 +4,7 @@ export type OthelloColor = 'black' | 'white';
 export type PieceTeam = 'red' | 'blue';
 export type SudokuSide = 'challenger' | 'opponent';
 export type SokobanSide = 'challenger' | 'opponent';
+export type CrazyArcadeSide = 'challenger' | 'opponent';
 export type GameMode = 'solo' | 'local_ai' | 'friend_match';
 
 export interface MatchPauseState {
@@ -186,6 +187,26 @@ export interface SokobanSession {
   createdAt: string;
   updatedAt: string;
   solvedAt?: string;
+}
+
+export interface CrazyArcadeSession {
+  id: string;
+  mode?: GameMode;
+  ownerAccountId: string;
+  difficulty: Difficulty;
+  aiDifficulty?: Difficulty;
+  players: Record<CrazyArcadeSide, string>;
+  mySide?: CrazyArcadeSide;
+  status: 'playing' | 'finished';
+  winnerSide?: CrazyArcadeSide;
+  winnerAccountId?: string;
+  finishReason?: string;
+  pause?: MatchPauseState;
+  snapshot: Record<string, unknown>;
+  inputs: Record<CrazyArcadeSide, Record<string, unknown>>;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface CustomEmote {

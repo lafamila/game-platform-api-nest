@@ -294,4 +294,42 @@ export class GamesController {
   forfeitFortress(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
     return this.games.forfeitFortress(id, user);
   }
+
+  @Post('crazy-arcade/sessions')
+  createCrazyArcade(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
+    return this.games.createCrazyArcadeSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium');
+  }
+
+  @Get('crazy-arcade/sessions/:id')
+  getCrazyArcade(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.getCrazyArcadeSession(id, user);
+  }
+
+  @Post('crazy-arcade/sessions/:id/sync')
+  syncCrazyArcadeState(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthAccount,
+    @Body() body: { snapshot?: Record<string, unknown>; status?: string; winnerSide?: string | null; finishReason?: string; version?: number },
+  ) {
+    return this.games.syncCrazyArcadeState(id, user, body);
+  }
+
+  @Post('crazy-arcade/sessions/:id/input')
+  updateCrazyArcadeInput(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthAccount,
+    @Body() body: Record<string, unknown>,
+  ) {
+    return this.games.updateCrazyArcadeInput(id, user, body);
+  }
+
+  @Post('crazy-arcade/sessions/:id/emotes')
+  sendCrazyArcadeEmote(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { slot: number }) {
+    return this.games.sendCrazyArcadeEmote(id, user, Number(body.slot));
+  }
+
+  @Post('crazy-arcade/sessions/:id/forfeit')
+  forfeitCrazyArcade(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.forfeitCrazyArcade(id, user);
+  }
 }
