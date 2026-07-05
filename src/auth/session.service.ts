@@ -262,13 +262,13 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
       [loginTransactionId],
     );
     if (!row || row.expires_at.getTime() <= Date.now()) {
-      throw new UnauthorizedException('Login transaction expired');
+      throw sessionUnauthorized('AUTH_REQUIRED', 'Login transaction expired');
     }
     if (row.status === 'failed') {
-      throw new UnauthorizedException(row.error ?? 'Login failed');
+      throw sessionUnauthorized('AUTH_REQUIRED', row.error ?? 'Login failed');
     }
     if (row.status !== 'completed' || !row.session_id) {
-      throw new UnauthorizedException('Login transaction is not complete');
+      throw sessionUnauthorized('AUTH_REQUIRED', 'Login transaction is not complete');
     }
     const session = await this.requireSession(row.session_id);
     await this.db.query(`UPDATE login_transactions SET status = 'consumed', updated_at = now() WHERE id = $1`, [row.id]);
@@ -277,7 +277,7 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
 
   async requireSession(sessionId: string | undefined): Promise<GamePlatformSession> {
     if (!sessionId) {
-      throw new UnauthorizedException('Game-platform session is required');
+      throw sessionUnauthorized('AUTH_REQUIRED', 'Game-platform session is required');
     }
     const row = await this.db.one<AppSessionRow>(
       `SELECT id, user_json, access_token, refresh_token, access_token_expires_at, created_at, last_seen_at, expires_at
@@ -292,7 +292,7 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
       } else {
         this.logSessionEvent('deleted', 'session_missing', sessionId);
       }
-      throw new UnauthorizedException('Game-platform session expired');
+      throw sessionUnauthorized('SESSION_EXPIRED', 'Game-platform session expired');
     }
     let session = rowToSession(row);
     if (session.accessTokenExpiresAt - Date.now() <= PREEMPTIVE_REFRESH_MS) {
@@ -320,7 +320,7 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
         expiresAt: now + 15 * 60 * 1000,
       };
     }
-    throw new UnauthorizedException('Game-platform session is required');
+    throw sessionUnauthorized('AUTH_REQUIRED', 'Game-platform session is required');
   }
 
   async logout(sessionId: string | undefined): Promise<void> {
@@ -340,7 +340,7 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
 
   async refreshSessionNow(session: GamePlatformSession | undefined): Promise<GamePlatformSession> {
     if (!session?.refreshToken) {
-      throw new UnauthorizedException('Refreshable game-platform session is required');
+      throw sessionUnauthorized('SESSION_INVALID', 'Refreshable game-platform session is required');
     }
     return this.refreshSessionLocked(session);
   }
@@ -421,7 +421,7 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
 
   private async createSession(token: TokenResponse): Promise<GamePlatformSession> {
     if (!token.access_token || !token.refresh_token || !token.expires_in) {
-      throw new UnauthorizedException('Invalid token response');
+      throw sessionUnauthorized('SESSION_INVALID', 'Invalid token response');
     }
     const account = await this.auth.verifyBearerToken(token.access_token);
     const now = Date.now();

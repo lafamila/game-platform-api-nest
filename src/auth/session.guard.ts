@@ -1,8 +1,8 @@
-import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
+import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { env } from '../config/env';
 import { RequestWithAuth } from './auth.types';
-import { GamePlatformSessionService } from './session.service';
+import { GamePlatformSessionService, sessionUnauthorized } from './session.service';
 
 @Injectable()
 export class GamePlatformSessionGuard implements CanActivate {
@@ -43,7 +43,7 @@ export class GamePlatformSessionGuard implements CanActivate {
     }
     const [scheme, token] = header.split(' ', 2);
     if (scheme?.toLowerCase() !== 'bearer' || !token) {
-      throw new UnauthorizedException('Invalid authorization header');
+      throw sessionUnauthorized('SESSION_INVALID', 'Invalid authorization header');
     }
     return token.trim();
   }
