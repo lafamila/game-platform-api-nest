@@ -37,6 +37,50 @@ This repo follows `../CLAUDE.md`, especially central auth, env handling, local-f
 - Scopes: `openid profile email service.permission`
 - Optional backend credential scopes: `account.search` for friend search.
 
+## Session Policy (Phase 1 — session stabilization)
+
+The Flutter/native client holds only the opaque `x-game-platform-session` id. This BFF owns the OIDC access/refresh tokens in `app_sessions` and refreshes them for the client. Phase 1 hardens that so a transient auth outage never logs a player out mid-game.
+
+- **Lifetime — sliding idle + absolute cap.** On each authenticated request `requireSession` extends `expires_at = LEAST(created_at + ABSOLUTE, now + IDLE)`, throttled to at most once per 5 minutes to avoid write amplification. Env: `GAME_PLATFORM_SESSION_IDLE_SECONDS` (default 30d) and `GAME_PLATFORM_SESSION_ABSOLUTE_MAX_AGE_SECONDS` (default 180d). The legacy `GAME_PLATFORM_SESSION_MAX_AGE_SECONDS` still drives the browser cookie max-age and is the absolute-cap fallback when the ABSOLUTE key is unset.
+- **Preemptive refresh.** The access token is refreshed when it is within 5 minutes of expiry (was 30s), so a refresh that fails transiently can soft-fail on the still-valid token for the remaining window.
+- **Refresh failure 3-classification** (only the first case logs a player out):
+  - `AuthRejectedError` — auth returned 400/401/403 → refresh token is permanently invalid → session row is DELETEd → `401 SESSION_EXPIRED`.
+  - `AuthUnavailableError` — 5xx, network failure, or JWKS not loaded → transient → retry once after 0.5s; if it still fails, soft-fail on the still-valid access token, or if that has already expired return `503 AUTH_UPSTREAM_UNAVAILABLE` **without deleting the session**.
+- **Keepalive job.** A background job (`GAME_PLATFORM_SESSION_KEEPALIVE_INTERVAL_SECONDS`, default 3600s; 0 disables) rotates the refresh token of sessions still inside the idle window when it is within 24h of `GAME_PLATFORM_REFRESH_TOKEN_TTL_SECONDS` (default 7d, mirrors auth's current hardcoded TTL). This keeps the chain alive for apps left closed for days, and is the interim mechanism until auth ships a per-client 30d refresh TTL (see cross-repo dependency below). Tracked via the `app_sessions.refresh_token_issued_at` column.
+
+### Auth-failure `code` contract (client-facing)
+
+Every 401/503 from the session guard/service carries a stable `code` alongside the existing (unchanged) `message`. Clients branch on `code`: only `SESSION_*` should trigger a logout/relogin flow; `AUTH_UPSTREAM_UNAVAILABLE` and network/timeout errors should show a retry affordance and keep the session.
+
+| HTTP | `code` | When |
+|------|--------|------|
+| 401 | `AUTH_REQUIRED` | No session id / bearer presented; login transaction not usable |
+| 401 | `SESSION_INVALID` | Malformed Authorization header, invalid bearer/token response, non-refreshable session |
+| 401 | `SESSION_EXPIRED` | Session row expired, or auth permanently rejected the refresh (400/401/403) |
+| 503 | `AUTH_UPSTREAM_UNAVAILABLE` | Auth temporarily unreachable and local access token already expired |
+
+Response body shape (additive — `code` added, other fields preserved): `{ "statusCode": 401, "code": "SESSION_EXPIRED", "message": "…", "error": "Unauthorized" }`.
+
+Note: `auth.service.ts` (bearer verification for non-session consumers) and `social.service.ts` defensive post-guard checks still throw code-less 401s; the Flutter client uses the session-id path, which is fully covered.
+
+### Disconnect-cause instrumentation
+
+Session deletion / refresh-failure reasons are logged server-side as `session <event> reason=<code> session=<id>` (reasons: `session_expired`, `session_missing`, `refresh_rejected`, `auth_unavailable`, `auth_unavailable_softfail`, `auth_unavailable_expired`, `refresh_error`). Client-observed SSE reconnect / refresh failures are posted to `POST /api/client-errors` and stored in `client_error_reports`. Cause-attribution query over the client side:
+
+```sql
+SELECT status_code,
+       context_json->>'reason' AS reason,
+       count(*)
+FROM client_error_reports
+WHERE created_at > now() - interval '7 days'
+GROUP BY status_code, reason
+ORDER BY count DESC;
+```
+
+### Cross-repo dependency
+
+Sliding idle of 30d only truly holds once `auth-api-nest` applies a per-client refresh TTL (≥ idle window) for the `game-platform-api` OIDC client. Until then the keepalive job maintains the 7d chain. When auth ships per-client TTL, submit a service-onboarding **update request** (workspace principle 3) to raise `game-platform-api`'s refresh TTL to 30d.
+
 ## Local Dev
 
 ```bash
@@ -67,11 +111,14 @@ Normal local development uses `auth-api-nest` on `http://localhost:3032`, Postgr
 - `POST /api/alkkagi/sessions/:id/emotes`
 - `GET /api/emotes`
 - `PUT /api/emotes/:slot`
+- `GET /api/session/oidc/readiness`
 - `POST /api/session/oidc/start`
 - `GET /api/session/oidc/callback`
 - `POST /api/session/oidc/complete`
 - `GET /api/session/me`
+- `POST /api/session/refresh`
 - `POST /api/session/logout`
+- `POST /api/client-errors`
 - `GET /api/accounts/search`
 - `GET /api/friends/requests`
 - `POST /api/friends/requests`
