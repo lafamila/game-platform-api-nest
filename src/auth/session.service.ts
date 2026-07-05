@@ -44,6 +44,8 @@ export interface LoginReadinessResponse {
 const PERMANENT_AUTH_REJECT_STATUSES = new Set([400, 401, 403]);
 /** 일시 장애 시 refresh 재시도 대기(root §1.3-(1) — 0.5s 1회). */
 const REFRESH_RETRY_DELAY_MS = 500;
+/** 만료 5분 전 선제 refresh(root §1.3-(2)). 일시 실패해도 남은 수명 동안 soft-fail 가능. */
+const PREEMPTIVE_REFRESH_MS = 5 * 60 * 1000;
 
 /** auth 가 refresh 를 영구 거절(400/401/403)했을 때. */
 class AuthRejectedError extends Error {}
@@ -259,7 +261,7 @@ export class GamePlatformSessionService {
       throw new UnauthorizedException('Game-platform session expired');
     }
     let session = rowToSession(row);
-    if (session.accessTokenExpiresAt - Date.now() <= 30_000) {
+    if (session.accessTokenExpiresAt - Date.now() <= PREEMPTIVE_REFRESH_MS) {
       session = await this.refreshSessionLocked(session);
     }
     await this.db.query(`UPDATE app_sessions SET last_seen_at = now() WHERE id = $1`, [session.id]);
