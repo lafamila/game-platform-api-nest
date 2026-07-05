@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
 import { DatabaseService } from '../database/database.service';
 import { env, intEnv, listEnv } from '../config/env';
@@ -39,6 +39,16 @@ export interface LoginReadinessResponse {
     jwks: ReadinessProbe;
   };
 }
+
+/** 400/401/403 만 refresh token 영구 무효로 취급(D2 보류 전제). 그 외는 일시 장애. */
+const PERMANENT_AUTH_REJECT_STATUSES = new Set([400, 401, 403]);
+/** 일시 장애 시 refresh 재시도 대기(root §1.3-(1) — 0.5s 1회). */
+const REFRESH_RETRY_DELAY_MS = 500;
+
+/** auth 가 refresh 를 영구 거절(400/401/403)했을 때. */
+class AuthRejectedError extends Error {}
+/** auth 가 일시적으로 불가(5xx·네트워크·JWKS 미로딩)일 때. */
+class AuthUnavailableError extends Error {}
 
 @Injectable()
 export class GamePlatformSessionService {
@@ -351,13 +361,24 @@ export class GamePlatformSessionService {
 
   private async requestToken(body: Record<string, string | undefined>): Promise<TokenResponse> {
     const clean = Object.fromEntries(Object.entries(body).filter(([, value]) => typeof value !== 'undefined'));
-    const response = await fetch(`${env('AUTH_API_BASE_URL', 'http://localhost:3032')}/oauth/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(clean),
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${env('AUTH_API_BASE_URL', 'http://localhost:3032')}/oauth/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(clean),
+      });
+    } catch (error) {
+      // 네트워크 실패(connection refused / DNS / abort) = 일시 장애
+      throw new AuthUnavailableError(errorMessage(error, 'Token exchange failed'));
+    }
     if (!response.ok) {
-      throw new UnauthorizedException(await responseText(response, 'Token exchange failed'));
+      const message = await responseText(response, 'Token exchange failed');
+      // 400/401/403 = 영구 거절(refresh token 무효), 그 외(5xx·429 등) = 일시 장애
+      if (PERMANENT_AUTH_REJECT_STATUSES.has(response.status)) {
+        throw new AuthRejectedError(message);
+      }
+      throw new AuthUnavailableError(message);
     }
     return (await response.json()) as TokenResponse;
   }
@@ -406,9 +427,16 @@ export class GamePlatformSessionService {
       refresh_token: session.refreshToken,
     });
     if (!token.access_token || !token.refresh_token || !token.expires_in) {
-      throw new UnauthorizedException('Invalid refresh token response');
+      // 2xx 이지만 형식 이상: 명확한 거절이 아니므로 일시 장애로 취급(로그아웃 승격 방지)
+      throw new AuthUnavailableError('Invalid refresh token response');
     }
-    const account = await this.auth.verifyBearerToken(token.access_token);
+    let account: AuthAccount;
+    try {
+      account = await this.auth.verifyBearerToken(token.access_token);
+    } catch (error) {
+      // refresh 직후 JWKS 미로딩/검증 실패(auth 재기동 중) = 일시 장애 (root §1.1-7)
+      throw new AuthUnavailableError(errorMessage(error, 'Invalid refresh token response'));
+    }
     const now = Date.now();
     const refreshed: GamePlatformSession = {
       ...session,
@@ -444,19 +472,55 @@ export class GamePlatformSessionService {
     if (existing) {
       return existing;
     }
-    const refresh = this.refreshSession(session).catch(async (error: unknown) => {
-      if (error instanceof UnauthorizedException) {
-        await this.db.query(`DELETE FROM app_sessions WHERE id = $1`, [session.id]);
-        this.logSessionEvent('deleted', 'refresh_rejected', session.id);
-        throw new UnauthorizedException('Game-platform session expired. Please login again');
-      }
-      this.logSessionEvent('refresh_failed', 'refresh_error', session.id);
-      throw error;
-    }).finally(() => {
+    const refresh = this.refreshWithClassification(session).finally(() => {
       this.refreshLocks.delete(session.id);
     });
     this.refreshLocks.set(session.id, refresh);
     return refresh;
+  }
+
+  /**
+   * refresh 실패 3분류 (root §1.3-(1)):
+   *  - AuthRejectedError(400/401/403) → refresh token 영구 무효 → 세션 DELETE + 401
+   *  - AuthUnavailableError(5xx·네트워크·JWKS 미로딩) → 일시 장애 →
+   *      0.5s 후 1회 재시도, 그래도 실패면 기존 access token 이 유효하면 soft-fail(세션 유지),
+   *      만료 상태면 503 AUTH_UPSTREAM_UNAVAILABLE (세션은 삭제하지 않는다)
+   */
+  private async refreshWithClassification(session: GamePlatformSession): Promise<GamePlatformSession> {
+    try {
+      return await this.refreshSession(session);
+    } catch (error) {
+      if (error instanceof AuthRejectedError) {
+        return this.deleteRejectedSession(session);
+      }
+      if (!(error instanceof AuthUnavailableError)) {
+        // 예기치 못한 오류 — 세션은 유지하고 원본 오류를 전파
+        this.logSessionEvent('refresh_failed', 'refresh_error', session.id);
+        throw error;
+      }
+      this.logSessionEvent('refresh_failed', 'auth_unavailable', session.id);
+      await wait(REFRESH_RETRY_DELAY_MS);
+      try {
+        return await this.refreshSession(session);
+      } catch (retryError) {
+        if (retryError instanceof AuthRejectedError) {
+          return this.deleteRejectedSession(session);
+        }
+        if (session.accessTokenExpiresAt > Date.now()) {
+          // 기존 access token 이 아직 유효 → soft-fail 로 서비스 지속
+          this.logSessionEvent('refresh_failed', 'auth_unavailable_softfail', session.id);
+          return session;
+        }
+        this.logSessionEvent('refresh_failed', 'auth_unavailable_expired', session.id);
+        throw authUpstreamUnavailable('Authentication service is temporarily unavailable. Please retry.');
+      }
+    }
+  }
+
+  private async deleteRejectedSession(session: GamePlatformSession): Promise<never> {
+    await this.db.query(`DELETE FROM app_sessions WHERE id = $1`, [session.id]);
+    this.logSessionEvent('deleted', 'refresh_rejected', session.id);
+    throw sessionUnauthorized('SESSION_EXPIRED', 'Game-platform session expired. Please login again');
   }
 
   private async markTransactionFailed(id: string, errorCode: string, error: string): Promise<void> {
@@ -569,6 +633,39 @@ function rowToSession(row: {
 
 function randomToken(byteLength: number): string {
   return randomBytes(byteLength).toString('base64url');
+}
+
+/**
+ * 인증 실패 응답 code 계약(root §1.3-(5)). 메시지 문자열은 하위호환을 위해 유지하고
+ * `code` 필드만 추가한다. NestJS 는 HttpException 에 객체를 넘기면 그대로 응답 body 로 직렬화한다.
+ */
+export type SessionErrorCode =
+  | 'SESSION_EXPIRED'
+  | 'SESSION_INVALID'
+  | 'AUTH_REQUIRED'
+  | 'AUTH_UPSTREAM_UNAVAILABLE';
+
+export function sessionUnauthorized(
+  code: 'SESSION_EXPIRED' | 'SESSION_INVALID' | 'AUTH_REQUIRED',
+  message: string,
+): UnauthorizedException {
+  return new UnauthorizedException({ statusCode: 401, code, message, error: 'Unauthorized' });
+}
+
+export function authUpstreamUnavailable(message: string): ServiceUnavailableException {
+  return new ServiceUnavailableException({
+    statusCode: 503,
+    code: 'AUTH_UPSTREAM_UNAVAILABLE' satisfies SessionErrorCode,
+    message,
+    error: 'Service Unavailable',
+  });
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
 }
 
 function pkceChallenge(verifier: string): string {
