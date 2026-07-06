@@ -662,6 +662,33 @@ class FakeRealtime {
   }
 }
 
+test('duplicate clientMoveId re-responds without reapplying, and a new id applies', async () => {
+  const service = new GamesService(new FakeDb(), new FakeRealtime());
+  try {
+    const session = await service.createGomokuSession(user, opponent.accountId, undefined, 'medium');
+
+    const first = await service.playGomokuMove(session.id, user, 7, 7, 'move-1');
+    assert.equal(first.moves.length, 1);
+    assert.equal(first.board[7][7], 'black');
+    assert.equal(first.currentTurn, 'white');
+    const revAfterFirst = first.rev;
+
+    // 동일 clientMoveId 재제출: 재적용 없이 현재 상태를 그대로 재응답 (에러 아님)
+    const duplicate = await service.playGomokuMove(session.id, user, 7, 7, 'move-1');
+    assert.equal(duplicate.moves.length, 1);
+    assert.equal(duplicate.rev, revAfterFirst);
+    assert.equal(duplicate.currentTurn, 'white');
+    assert.equal(duplicate.board[7][7], 'black');
+
+    // 새 clientMoveId 는 정상 적용된다
+    const second = await service.playGomokuMove(session.id, opponent, 8, 8, 'move-2');
+    assert.equal(second.moves.length, 2);
+    assert.equal(second.board[8][8], 'white');
+  } finally {
+    service.onModuleDestroy();
+  }
+});
+
 test('stale game session writes fail with a state conflict', async () => {
   const service = new GamesService(new FakeDb(), new FakeRealtime());
   const session = await service.createGomokuSession(user, undefined, undefined, 'medium');

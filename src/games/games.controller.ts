@@ -100,8 +100,8 @@ export class GamesController {
   }
 
   @Post('gomoku/sessions/:id/moves')
-  playGomokuMove(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { row: number; col: number }) {
-    return this.games.playGomokuMove(id, user, Number(body.row), Number(body.col));
+  playGomokuMove(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { row: number; col: number; clientMoveId?: string }) {
+    return this.games.playGomokuMove(id, user, Number(body.row), Number(body.col), body.clientMoveId);
   }
 
   @Post('gomoku/sessions/:id/emotes')

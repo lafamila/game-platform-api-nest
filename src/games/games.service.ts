@@ -86,6 +86,7 @@ const EMOTE_COOLDOWN_MS = 3_000;
 const MATCH_PAUSE_LIMIT = 3;
 const MATCH_PAUSE_RESUME_LOCK_MS = 3_000;
 const SUDOKU_OBSCURE_MS = 5_000;
+const CLIENT_MOVE_HISTORY_LIMIT = 20;
 const EMOTE_COLORS = new Set(['red', 'orange', 'yellow', 'green', 'blue', 'indigo', 'purple', 'black', 'white']);
 const LOCAL_AI_ACCOUNT_ID = '__game_platform_local_ai__';
 const ALKKAGI_HINGES = [
@@ -512,7 +513,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return session;
   }
 
-  async playGomokuMove(id: string, user: AuthAccount, row: number, col: number): Promise<GomokuSession> {
+  async playGomokuMove(id: string, user: AuthAccount, row: number, col: number, clientMoveId?: string): Promise<GomokuSession> {
     validateGomokuIndex(row, 'row');
     validateGomokuIndex(col, 'col');
     const session = this.gomokuFromRow(await this.requireGameRow(id, 'gomoku'));
@@ -521,6 +522,9 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('game is already finished');
     }
     this.assertNotPaused(session);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return session;
+    }
     const color = session.currentTurn;
     if (isLocalAiAccount(session.players[color])) {
       throw new ForbiddenException('not your turn');
@@ -1734,6 +1738,29 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       [gameKey, mode, status, currentTurn, winner, ownerAccountId, opponentAccountId, JSON.stringify({ ...(state as Record<string, unknown>), rev: 1 })],
     );
     return result.rows[0];
+  }
+
+  /**
+   * 멱등 제출(root §4.2-5): seat/계정별 최근 clientMoveId 를 state_json 에 최대 20개 보관한다.
+   * 처음 보는 id 면 기록 후 true(진행), 이미 처리한 id 면 false(재적용 금지 — 호출부가 현재 상태 재응답).
+   * clientMoveId 가 없으면 항상 true. state_json 에 함께 직렬화되므로 별도 컬럼/타입 변경이 필요 없다.
+   */
+  private consumeClientMoveId(session: unknown, accountId: string, clientMoveId?: string): boolean {
+    if (!clientMoveId) {
+      return true;
+    }
+    const state = session as { recentClientMoves?: Record<string, string[]> };
+    const store = state.recentClientMoves ?? (state.recentClientMoves = {});
+    const seen = store[accountId] ?? [];
+    if (seen.includes(clientMoveId)) {
+      return false;
+    }
+    seen.push(clientMoveId);
+    if (seen.length > CLIENT_MOVE_HISTORY_LIMIT) {
+      seen.splice(0, seen.length - CLIENT_MOVE_HISTORY_LIMIT);
+    }
+    store[accountId] = seen;
+    return true;
   }
 
   private async updateGame(id: string, status: string, currentTurn: string | null, winner: string | null, state: unknown): Promise<GameRow> {
