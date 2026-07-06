@@ -90,6 +90,109 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     await this.query(`CREATE INDEX IF NOT EXISTS idx_game_sessions_opponent ON game_sessions(opponent_account_id)`);
 
     await this.query(`
+      CREATE TABLE IF NOT EXISTS game_session_players (
+        session_id uuid NOT NULL REFERENCES game_sessions(id) ON DELETE CASCADE,
+        seat integer NOT NULL CHECK (seat >= 0),
+        account_id text NULL,
+        kind text NOT NULL DEFAULT 'account',
+        ai_difficulty text NULL,
+        status text NOT NULL DEFAULT 'active',
+        result text NULL,
+        joined_at timestamptz NOT NULL DEFAULT now(),
+        left_at timestamptz NULL,
+        PRIMARY KEY(session_id, seat)
+      )
+    `);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_game_session_players_account ON game_session_players(account_id) WHERE account_id IS NOT NULL`);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_game_session_players_session ON game_session_players(session_id, status)`);
+    await this.query(`
+      INSERT INTO game_session_players (session_id, seat, account_id, kind, status, joined_at)
+      SELECT id, 0, owner_account_id, 'account', 'active', created_at
+      FROM game_sessions
+      ON CONFLICT (session_id, seat) DO NOTHING
+    `);
+    await this.query(`
+      INSERT INTO game_session_players (session_id, seat, account_id, kind, status, joined_at)
+      SELECT id, 1, opponent_account_id, 'account', 'active', created_at
+      FROM game_sessions
+      WHERE opponent_account_id IS NOT NULL
+      ON CONFLICT (session_id, seat) DO NOTHING
+    `);
+
+    await this.query(`
+      CREATE TABLE IF NOT EXISTS game_rooms (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        room_code text NOT NULL UNIQUE,
+        game_key text NOT NULL,
+        host_account_id text NOT NULL,
+        max_players integer NOT NULL CHECK (max_players >= 2 AND max_players <= 6),
+        visibility text NOT NULL DEFAULT 'private',
+        config_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+        status text NOT NULL DEFAULT 'waiting',
+        session_id uuid NULL REFERENCES game_sessions(id) ON DELETE SET NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_game_rooms_host ON game_rooms(host_account_id, status)`);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_game_rooms_status ON game_rooms(status, updated_at DESC)`);
+
+    await this.query(`
+      CREATE TABLE IF NOT EXISTS game_room_members (
+        room_id uuid NOT NULL REFERENCES game_rooms(id) ON DELETE CASCADE,
+        account_id text NOT NULL,
+        seat integer NOT NULL CHECK (seat >= 0),
+        status text NOT NULL DEFAULT 'joined',
+        ready boolean NOT NULL DEFAULT false,
+        joined_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY(room_id, account_id),
+        UNIQUE(room_id, seat)
+      )
+    `);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_game_room_members_account ON game_room_members(account_id, status)`);
+
+    await this.query(`
+      CREATE TABLE IF NOT EXISTS game_saves (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        account_id text NOT NULL,
+        game_key text NOT NULL,
+        slot integer NOT NULL CHECK (slot >= 1 AND slot <= 3),
+        label text NOT NULL DEFAULT '',
+        source_session_id uuid NULL,
+        source_mode text NOT NULL,
+        my_seat integer NOT NULL,
+        players_json jsonb NOT NULL,
+        state_json jsonb NOT NULL,
+        state_version integer NOT NULL DEFAULT 1,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        UNIQUE(account_id, game_key, slot)
+      )
+    `);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_game_saves_account_game ON game_saves(account_id, game_key, slot)`);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_game_saves_source_session ON game_saves(source_session_id) WHERE source_session_id IS NOT NULL`);
+
+    await this.query(`
+      CREATE TABLE IF NOT EXISTS local_ai_results (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        account_id text NOT NULL,
+        game_key text NOT NULL,
+        session_id text NOT NULL,
+        result text NOT NULL,
+        difficulty text NOT NULL,
+        reason text NOT NULL DEFAULT '',
+        recorded_at timestamptz NOT NULL,
+        payload_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        UNIQUE(account_id, game_key, session_id)
+      )
+    `);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_local_ai_results_account ON local_ai_results(account_id, created_at DESC)`);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_local_ai_results_game ON local_ai_results(game_key, created_at DESC)`);
+
+    await this.query(`
       CREATE TABLE IF NOT EXISTS friend_requests (
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
         requester_account_id text NOT NULL,

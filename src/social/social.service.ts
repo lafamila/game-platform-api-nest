@@ -196,15 +196,21 @@ export class SocialService implements OnModuleInit, OnModuleDestroy {
       throw new ForbiddenException('friend stats are only available between friends');
     }
     const result = await this.db.query<FriendGameStatsRow>(
-      `SELECT game_key, state_json
-       FROM game_sessions
-       WHERE mode = 'friend_match'
-         AND status IN ('finished', 'cleared')
-         AND (
-           (owner_account_id = $1 AND opponent_account_id = $2)
-           OR (owner_account_id = $2 AND opponent_account_id = $1)
-         )
-       ORDER BY updated_at DESC`,
+      `SELECT DISTINCT gs.id, gs.game_key, gs.state_json, gs.updated_at
+       FROM game_sessions gs
+       JOIN game_session_players me
+         ON me.session_id = gs.id
+        AND me.account_id = $1
+        AND me.kind = 'account'
+       JOIN game_session_players friend
+         ON friend.session_id = gs.id
+        AND friend.account_id = $2
+        AND friend.kind = 'account'
+       WHERE gs.mode = 'friend_match'
+         AND gs.status IN ('finished', 'cleared')
+         AND me.status <> 'left'
+         AND friend.status <> 'left'
+       ORDER BY gs.updated_at DESC`,
       [user.accountId, friendAccountId],
     );
     const stats = {
@@ -656,17 +662,15 @@ function hasPlayerPermissionKey(permission: string | null | undefined): boolean 
   return ['player', 'premium', 'superadmin'].includes(String(permission ?? '').toLowerCase());
 }
 
-function winnerAccountForRow(gameKey: string, state: Record<string, unknown>): string | undefined {
-  if (gameKey === 'sudoku') {
-    return typeof state.winnerAccountId === 'string' ? state.winnerAccountId : undefined;
+function winnerAccountForRow(_gameKey: string, state: Record<string, unknown>): string | undefined {
+  if (typeof state.winnerAccountId === 'string') {
+    return state.winnerAccountId;
   }
-  if (gameKey === 'sokoban') {
-    return typeof state.winnerAccountId === 'string' ? state.winnerAccountId : undefined;
-  }
-  if (gameKey === 'splendor' || gameKey === 'fortress' || gameKey === 'crazy_arcade') {
-    return typeof state.winnerAccountId === 'string' ? state.winnerAccountId : undefined;
-  }
-  const winner = typeof state.winner === 'string' ? state.winner : undefined;
+  const winner = typeof state.winnerSide === 'string'
+    ? state.winnerSide
+    : typeof state.winner === 'string'
+      ? state.winner
+      : undefined;
   const players = state.players && typeof state.players === 'object'
     ? state.players as Record<string, unknown>
     : {};

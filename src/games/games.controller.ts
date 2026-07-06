@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Post, Put, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Put, Query, UseGuards } from '@nestjs/common';
 import { AuthAccount } from '../auth/auth.types';
 import { GamePlatformSessionGuard } from '../auth/session.guard';
 import { CurrentUser } from '../auth/current-user';
@@ -13,6 +13,24 @@ export class GamesController {
   @Get('games')
   listGames() {
     return { games: this.games.listGames() };
+  }
+
+  @Post('games/:gameKey/sessions')
+  createGameSession(
+    @Param('gameKey') gameKey: string,
+    @CurrentUser() user: AuthAccount,
+    @Body() body: { opponentAccountId?: string; difficulty?: Difficulty },
+  ) {
+    return this.games.createGameSession(gameKey, user, body);
+  }
+
+  @Get('games/:gameKey/sessions/:id')
+  getGameSession(
+    @Param('gameKey') gameKey: string,
+    @Param('id') id: string,
+    @CurrentUser() user: AuthAccount,
+  ) {
+    return this.games.getGameSession(gameKey, id, user);
   }
 
   @Get('sessions/active')
@@ -79,6 +97,16 @@ export class GamesController {
     return this.games.restoreLocalSaveSnapshot(gameKey, id, user, body);
   }
 
+  @Post('games/:gameKey/sessions/:id/actions')
+  applyGameAction(
+    @Param('gameKey') gameKey: string,
+    @Param('id') id: string,
+    @CurrentUser() user: AuthAccount,
+    @Body() body: { type?: string; payload?: Record<string, unknown>; clientMoveId?: string },
+  ) {
+    return this.games.applyGameAction(gameKey, id, user, body);
+  }
+
   @Post('games/:gameKey/sessions/:id/claim-win')
   claimDisconnectedWin(@Param('gameKey') gameKey: string, @Param('id') id: string, @CurrentUser() user: AuthAccount) {
     return this.games.claimDisconnectedWin(gameKey, id, user);
@@ -87,6 +115,72 @@ export class GamesController {
   @Post('games/:gameKey/sessions/:id/wait')
   waitForOpponent(@Param('gameKey') gameKey: string, @Param('id') id: string, @CurrentUser() user: AuthAccount) {
     return this.games.waitForOpponent(gameKey, id, user);
+  }
+
+  @Post('games/:gameKey/sessions/:id/save')
+  saveGameSession(
+    @Param('gameKey') gameKey: string,
+    @Param('id') id: string,
+    @CurrentUser() user: AuthAccount,
+    @Body() body: { slot?: number; label?: string },
+  ) {
+    return this.games.saveGameSessionToSlot(gameKey, id, user, body);
+  }
+
+  @Get('saves')
+  listSaves(@CurrentUser() user: AuthAccount, @Query('gameKey') gameKey?: string) {
+    return this.games.listGameSaves(user, gameKey);
+  }
+
+  @Post('saves/:id/continue')
+  continueSave(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { difficulty?: Difficulty }) {
+    return this.games.continueGameSave(id, user, body);
+  }
+
+  @Delete('saves/:id')
+  deleteSave(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.deleteGameSave(id, user);
+  }
+
+  @Post('local-ai-results/batch')
+  uploadLocalAiResults(
+    @CurrentUser() user: AuthAccount,
+    @Body() body: { results?: unknown[] },
+  ) {
+    return this.games.uploadLocalAiResults(user, body);
+  }
+
+  @Post('rooms')
+  createRoom(
+    @CurrentUser() user: AuthAccount,
+    @Body() body: { gameKey?: string; maxPlayers?: number; visibility?: string; config?: Record<string, unknown> },
+  ) {
+    return this.games.createRoom(user, body);
+  }
+
+  @Get('rooms/:id')
+  getRoom(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.getRoom(id, user);
+  }
+
+  @Post('rooms/:id/invite')
+  inviteToRoom(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { accountId?: string }) {
+    return this.games.inviteToRoom(id, user, body);
+  }
+
+  @Post('rooms/join')
+  joinRoom(@CurrentUser() user: AuthAccount, @Body() body: { roomCode?: string }) {
+    return this.games.joinRoom(user, body);
+  }
+
+  @Post('rooms/:id/ready')
+  setRoomReady(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { ready?: boolean }) {
+    return this.games.setRoomReady(id, user, body);
+  }
+
+  @Post('rooms/:id/start')
+  startRoom(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.startRoom(id, user);
   }
 
   @Post('gomoku/sessions')
@@ -337,7 +431,13 @@ export class GamesController {
     @CurrentUser() user: AuthAccount,
     @Body() body: Record<string, unknown>,
   ) {
-    return this.games.updateCrazyArcadeInput(id, user, body);
+    const { clientMoveId, ...input } = body;
+    return this.games.updateCrazyArcadeInput(
+      id,
+      user,
+      input,
+      typeof clientMoveId === 'string' ? clientMoveId : undefined,
+    );
   }
 
   @Post('crazy-arcade/sessions/:id/emotes')

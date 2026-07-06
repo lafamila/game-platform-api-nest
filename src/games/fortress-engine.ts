@@ -1,4 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
+import { GameAction, GameEngine, SeatInfo } from './engine/game-engine';
 import { Difficulty, GameMode, MatchPauseState } from './games.types';
 
 export type FortressSide = 'challenger' | 'opponent';
@@ -91,6 +92,10 @@ export interface FortressSession {
   shots: FortressShot[];
   turnStartedAt?: string;
   turnDeadlineAt?: string;
+  networkGraceStartedAt?: string;
+  networkGraceDeadlineAt?: string;
+  networkGraceAccountId?: string;
+  opponentLeftAt?: string;
   pause?: MatchPauseState;
   finishReason?: string;
   createdAt: string;
@@ -136,6 +141,7 @@ const FORTRESS_UI_POWER_MAX = 100;
 const FORTRESS_ANGLE_MIN = -20;
 const FORTRESS_ANGLE_MAX = 85;
 const FORTRESS_DEFAULT_ANGLE = 45;
+export const FORTRESS_STATE_VERSION = 1;
 
 export const FORTRESS_TANKS: Record<FortressTankKey, FortressTankDefinition> = {
   balance: {
@@ -195,6 +201,114 @@ export const FORTRESS_TANKS: Record<FortressTankKey, FortressTankDefinition> = {
     hitCenterYOffset: 18,
   },
 };
+
+export const FORTRESS_ENGINE: GameEngine<FortressSession> = {
+  descriptor: {
+    key: 'fortress',
+    title: 'Fortress',
+    minPlayers: 2,
+    maxPlayers: 2,
+    modes: ['local_ai', 'friend_match'],
+    turnType: 'turnBased',
+    hiddenInfo: false,
+    supportsAi: true,
+    supportsMatchSave: true,
+    turnTimerSeconds: 20,
+    graceSeconds: 60,
+    status: 'playable',
+  },
+  stateVersion: FORTRESS_STATE_VERSION,
+  createState(players: SeatInfo[], config: Record<string, unknown>): FortressSession {
+    const state = createFortressState(
+      players[0]?.accountId ?? '',
+      players[1]?.accountId ?? '__game_platform_local_ai__#1',
+      fortressModeFromConfig(config.mode),
+      fortressDifficultyFromConfig(config.aiDifficulty),
+    );
+    state.id = typeof config.id === 'string' ? config.id : '';
+    return state;
+  },
+  applyAction(state: FortressSession, seat: number, action: GameAction) {
+    const side = fortressSideForSeat(seat);
+    const accountId = state.players[side];
+    if (!accountId) {
+      throw new BadRequestException('fortress account is missing');
+    }
+    const payload = action.payload ?? {};
+    if (action.type === 'select_tank') {
+      selectFortressTank(state, side, typeof payload.tankKey === 'string' ? payload.tankKey : '');
+      return { state };
+    }
+    if (action.type === 'move') {
+      applyFortressMove(state, side, Number(payload.distance));
+      return { state };
+    }
+    if (action.type === 'aim') {
+      updateFortressAim(
+        state,
+        side,
+        Number(payload.angle),
+        Number(payload.power),
+        Boolean(payload.charging),
+      );
+      return { state };
+    }
+    if (action.type === 'shoot') {
+      const result = applyFortressShot(
+        state,
+        side,
+        accountId,
+        Number(payload.angle),
+        Number(payload.power),
+        'manual',
+        typeof payload.item === 'string' ? normalizeFortressItemKey(payload.item as FortressItemKey) : undefined,
+      );
+      return { state: result.session, events: [{ type: 'fortress.shot.played', payload: result }] };
+    }
+    if (action.type === 'forfeit') {
+      applyFortressForfeit(state, side);
+      return { state };
+    }
+    throw new BadRequestException('unsupported fortress action');
+  },
+  viewFor(state: FortressSession, seat: number | 'spectator') {
+    const side = typeof seat === 'number' ? fortressSideForSeat(seat) : undefined;
+    return fortressClientSession(state, side ? state.players[side] : undefined);
+  },
+  finishInfo(state: FortressSession) {
+    if (state.status !== 'finished') {
+      return null;
+    }
+    const winnerSeat = state.winnerSide === 'challenger' ? 0 : state.winnerSide === 'opponent' ? 1 : undefined;
+    return { status: 'finished', winnerSeat, reason: state.finishReason };
+  },
+  aiAction(state: FortressSession, seat: number, difficulty: Difficulty) {
+    const side = fortressSideForSeat(seat);
+    if (state.status === 'selecting' && !state.tanks[side].tankKey) {
+      return { type: 'select_tank', payload: { tankKey: aiTankForDifficulty(difficulty) } };
+    }
+    const shot = chooseFortressAiShot(state, difficulty);
+    return {
+      type: 'shoot',
+      payload: {
+        angle: shot.angle,
+        power: fortressProjectilePowerToUiPower(shot.power),
+      },
+    };
+  },
+};
+
+function fortressModeFromConfig(value: unknown): GameMode {
+  return value === 'friend_match' ? 'friend_match' : 'local_ai';
+}
+
+function fortressDifficultyFromConfig(value: unknown): Difficulty {
+  return value === 'easy' || value === 'medium' || value === 'hard' ? value : 'medium';
+}
+
+function fortressSideForSeat(seat: number): FortressSide {
+  return seat === 1 ? 'opponent' : 'challenger';
+}
 
 export function createFortressState(
   challengerAccountId: string,

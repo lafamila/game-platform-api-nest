@@ -1,9 +1,10 @@
 import { BadRequestException } from '@nestjs/common';
-import { GameMode } from './games.types';
+import { GameAction, GameEngine, SeatInfo } from './engine/game-engine';
+import { Difficulty, GameMode } from './games.types';
 
 export type SplendorGem = 'white' | 'blue' | 'green' | 'red' | 'black';
 export type SplendorToken = SplendorGem | 'gold';
-export type SplendorSide = 'challenger' | 'opponent';
+export type SplendorSide = string;
 export type SplendorTier = '1' | '2' | '3';
 
 export type SplendorTokenMap = Record<SplendorToken, number>;
@@ -41,6 +42,7 @@ export interface SplendorSession {
   aiDifficulty?: string;
   players: Record<SplendorSide, string>;
   currentTurn: SplendorSide;
+  turnOrder?: SplendorSide[];
   winnerSide?: SplendorSide;
   winnerAccountId?: string;
   status: 'playing' | 'finished';
@@ -79,11 +81,166 @@ type SplendorAiAction =
 export const SPLENDOR_GEMS: SplendorGem[] = ['white', 'blue', 'green', 'red', 'black'];
 export const SPLENDOR_TOKENS: SplendorToken[] = ['white', 'blue', 'green', 'red', 'black', 'gold'];
 export const SPLENDOR_TIERS: SplendorTier[] = ['1', '2', '3'];
+export const SPLENDOR_STATE_VERSION = 1;
 
 const ZERO_GEMS: SplendorGemCost = { white: 0, blue: 0, green: 0, red: 0, black: 0 };
 const ZERO_TOKENS: SplendorTokenMap = { white: 0, blue: 0, green: 0, red: 0, black: 0, gold: 0 };
 
+export const SPLENDOR_ENGINE: GameEngine<SplendorSession> = {
+  descriptor: {
+    key: 'splendor',
+    title: 'Splendor',
+    minPlayers: 2,
+    maxPlayers: 4,
+    modes: ['local_ai', 'friend_match'],
+    turnType: 'turnBased',
+    hiddenInfo: true,
+    supportsAi: true,
+    supportsMatchSave: true,
+    status: 'playable',
+  },
+  stateVersion: SPLENDOR_STATE_VERSION,
+  createState(players: SeatInfo[], config: Record<string, unknown>): SplendorSession {
+    const mode = splendorModeFromConfig(config.mode);
+    const seats = players.map((player, index) => ({
+      side: splendorSideForSeat(index, players.length),
+      accountId: player.accountId ?? `__game_platform_local_ai__#${index}`,
+    }));
+    const state = createSplendorStateForPlayers(seats, mode, splendorDifficultyFromConfig(config.aiDifficulty));
+    state.id = typeof config.id === 'string' ? config.id : '';
+    return state;
+  },
+  applyAction(state: SplendorSession, seat: number, action: GameAction) {
+    const side = splendorTurnOrder(state)[seat];
+    if (!side) {
+      throw new BadRequestException('splendor player is missing');
+    }
+    const accountId = state.players[side];
+    if (!accountId) {
+      throw new BadRequestException('splendor account is missing');
+    }
+    const payload = action.payload ?? {};
+    if (action.type === 'take_tokens') {
+      applySplendorTakeTokens(
+        state,
+        side,
+        accountId,
+        splendorTokenPayload(payload.tokens),
+        splendorTokenPayload(payload.discardTokens),
+      );
+      return { state };
+    }
+    if (action.type === 'reserve_card' || action.type === 'reserve') {
+      applySplendorReserve(state, side, accountId, {
+        cardId: typeof payload.cardId === 'string' ? payload.cardId : undefined,
+        tier: typeof payload.tier === 'string' ? payload.tier : undefined,
+        discardTokens: splendorTokenPayload(payload.discardTokens),
+      });
+      return { state };
+    }
+    if (action.type === 'buy_card' || action.type === 'buy') {
+      applySplendorBuy(state, side, accountId, typeof payload.cardId === 'string' ? payload.cardId : '');
+      return { state };
+    }
+    if (action.type === 'forfeit') {
+      applySplendorForfeit(state, side, accountId);
+      return { state };
+    }
+    if (action.type === 'pass') {
+      advanceSplendorTurn(state, side);
+      return { state };
+    }
+    throw new BadRequestException('unsupported splendor action');
+  },
+  viewFor(state: SplendorSession, seat: number | 'spectator') {
+    const side = typeof seat === 'number' ? splendorTurnOrder(state)[seat] : undefined;
+    return splendorClientSession(state, side ? state.players[side] : undefined);
+  },
+  finishInfo(state: SplendorSession) {
+    if (state.status !== 'finished') {
+      return null;
+    }
+    const winnerSeat = state.winnerSide ? splendorTurnOrder(state).indexOf(state.winnerSide) : -1;
+    return {
+      status: 'finished',
+      winnerSeat: winnerSeat >= 0 ? winnerSeat : undefined,
+      reason: state.finishReason,
+    };
+  },
+  aiAction(state: SplendorSession, seat: number, difficulty: Difficulty) {
+    const side = splendorTurnOrder(state)[seat];
+    if (!side) {
+      return { type: 'pass' };
+    }
+    state.aiDifficulty = difficulty;
+    const action = chooseSplendorAiAction(state, side);
+    if (action.kind === 'buy') {
+      return { type: 'buy_card', payload: { cardId: action.card.id } };
+    }
+    if (action.kind === 'reserve') {
+      return {
+        type: 'reserve_card',
+        payload: { cardId: action.card.id, discardTokens: action.discardTokens },
+      };
+    }
+    if (action.kind === 'take') {
+      return {
+        type: 'take_tokens',
+        payload: { tokens: action.tokens, discardTokens: action.discardTokens },
+      };
+    }
+    return { type: 'pass' };
+  },
+};
+
+function splendorModeFromConfig(value: unknown): GameMode {
+  return value === 'friend_match' ? 'friend_match' : 'local_ai';
+}
+
+function splendorDifficultyFromConfig(value: unknown): Difficulty {
+  return value === 'easy' || value === 'medium' || value === 'hard' ? value : 'medium';
+}
+
+function splendorSideForSeat(seat: number, playerCount: number): SplendorSide {
+  if (playerCount <= 2) {
+    return seat === 0 ? 'challenger' : 'opponent';
+  }
+  return `seat${seat}`;
+}
+
+function splendorTokenPayload(value: unknown): Partial<Record<SplendorToken, number>> {
+  if (!value || typeof value !== 'object') {
+    return {};
+  }
+  const source = value as Record<string, unknown>;
+  const tokens: Partial<Record<SplendorToken, number>> = {};
+  for (const token of SPLENDOR_TOKENS) {
+    if (source[token] !== undefined) {
+      tokens[token] = Number(source[token]);
+    }
+  }
+  return tokens;
+}
+
 export function createSplendorState(ownerAccountId: string, opponentAccountId: string, mode: GameMode, aiDifficulty?: string): SplendorSession {
+  return createSplendorStateForPlayers(
+    [
+      { side: 'challenger', accountId: ownerAccountId },
+      { side: 'opponent', accountId: opponentAccountId },
+    ],
+    mode,
+    aiDifficulty,
+  );
+}
+
+export function createSplendorStateForPlayers(
+  seats: Array<{ side: SplendorSide; accountId: string }>,
+  mode: GameMode,
+  aiDifficulty?: string,
+): SplendorSession {
+  if (seats.length < 2 || seats.length > 4) {
+    throw new BadRequestException('splendor supports 2 to 4 players');
+  }
   const decks = createSplendorDecks();
   for (const tier of SPLENDOR_TIERS) {
     shuffleArray(decks[tier]);
@@ -93,25 +250,24 @@ export function createSplendorState(ownerAccountId: string, opponentAccountId: s
     '2': drawCards(decks['2'], 4),
     '3': drawCards(decks['3'], 4),
   };
-  const nobles = shuffleArray(createSplendorNobles()).slice(0, 3);
+  const players = Object.fromEntries(seats.map((seat) => [seat.side, seat.accountId]));
+  const turnOrder = seats.map((seat) => seat.side);
+  const playerStates = Object.fromEntries(seats.map((seat) => [seat.side, createPlayerState()]));
+  const bankCount = seats.length <= 2 ? 4 : seats.length === 3 ? 5 : 7;
+  const nobles = shuffleArray(createSplendorNobles()).slice(0, seats.length + 1);
   return {
     id: '',
     mode,
     aiDifficulty,
-    players: {
-      challenger: ownerAccountId,
-      opponent: opponentAccountId,
-    },
-    currentTurn: 'challenger',
+    players,
+    currentTurn: turnOrder[0],
+    turnOrder,
     status: 'playing',
-    bank: { white: 4, blue: 4, green: 4, red: 4, black: 4, gold: 5 },
+    bank: { white: bankCount, blue: bankCount, green: bankCount, red: bankCount, black: bankCount, gold: 5 },
     market,
     decks,
     nobles,
-    playerStates: {
-      challenger: createPlayerState(),
-      opponent: createPlayerState(),
-    },
+    playerStates,
     moves: [],
     createdAt: '',
     updatedAt: '',
@@ -133,11 +289,10 @@ export function splendorClientSession(session: SplendorSession, accountId?: stri
 }
 
 export function splendorSideForAccount(session: SplendorSession, accountId: string): SplendorSide | undefined {
-  if (session.players.challenger === accountId) {
-    return 'challenger';
-  }
-  if (session.players.opponent === accountId) {
-    return 'opponent';
+  for (const [side, playerAccountId] of Object.entries(session.players)) {
+    if (playerAccountId === accountId) {
+      return side;
+    }
   }
   return undefined;
 }
@@ -258,10 +413,11 @@ export function applySplendorForfeit(session: SplendorSession, side: SplendorSid
   if (session.status !== 'playing') {
     return;
   }
-  const winnerSide = side === 'challenger' ? 'opponent' : 'challenger';
+  const activeSides = splendorTurnOrder(session).filter((item) => item !== side);
+  const winnerSide = activeSides.length === 1 ? activeSides[0] : undefined;
   session.status = 'finished';
   session.winnerSide = winnerSide;
-  session.winnerAccountId = session.players[winnerSide];
+  session.winnerAccountId = winnerSide ? session.players[winnerSide] : undefined;
   session.finishReason = 'forfeit';
   pushSplendorMove(session, { action: 'forfeit', side, accountId });
   session.updatedAt = new Date().toISOString();
@@ -391,7 +547,7 @@ function scoreSplendorBuyAction(
   const paymentTotal = tokenTotal(payment);
   const targetProgress = splendorTargetProgressScore(session, side, player, { purchasedCard: cardItem }) -
     splendorTargetProgressScore(session, side, player);
-  const opponentBlock = cardOpponentDenyValue(session, oppositeSplendorSide(side), cardItem, difficulty);
+  const opponentBlock = cardOpponentDenyValue(session, primarySplendorOpponentSide(session, side), cardItem, difficulty);
   const bonusDemand = splendorColorDemand(session, side, cardItem.color, difficulty);
   const reservedBonus = player.reserved.some((reserved) => reserved.id === cardItem.id) ? 55 : 0;
   const efficiency = cardItem.points > 0 ? (cardItem.points * 180) / Math.max(1, paymentTotal) : 0;
@@ -421,7 +577,7 @@ function scoreSplendorReserveAction(
   const player = session.playerStates[side];
   const turns = estimatedSplendorTurnsToBuy(player, cardItem);
   const goldValue = session.bank.gold > 0 ? 180 : 0;
-  const opponentDeny = cardOpponentDenyValue(session, oppositeSplendorSide(side), cardItem, difficulty);
+  const opponentDeny = cardOpponentDenyValue(session, primarySplendorOpponentSide(session, side), cardItem, difficulty);
   const targetValue = splendorCardStrategicValue(session, side, cardItem, difficulty);
   const slotPressure = player.reserved.length * (difficulty === 'hard' ? 180 : 120);
   let score = targetValue * (difficulty === 'hard' ? 0.72 : 0.42);
@@ -551,6 +707,9 @@ function cardOpponentDenyValue(
     return 0;
   }
   const opponent = session.playerStates[opponentSide];
+  if (!opponent) {
+    return 0;
+  }
   const opponentPayment = splendorPaymentFor(opponent, cardItem);
   const opponentProjection = projectedSplendorScoreAfterBuy(session, opponentSide, cardItem);
   if (opponentPayment && opponentProjection.score >= 15) {
@@ -741,6 +900,15 @@ function oppositeSplendorSide(side: SplendorSide): SplendorSide {
   return side === 'challenger' ? 'opponent' : 'challenger';
 }
 
+function primarySplendorOpponentSide(session: SplendorSession, side: SplendorSide): SplendorSide {
+  const directOpponent = oppositeSplendorSide(side);
+  if (session.playerStates[directOpponent]) {
+    return directOpponent;
+  }
+  const opponents = splendorTurnOrder(session).filter((candidate) => candidate !== side && Boolean(session.playerStates[candidate]));
+  return opponents.sort((left, right) => session.playerStates[right].score - session.playerStates[left].score)[0] ?? side;
+}
+
 function normalizeSplendorAiDifficulty(value: unknown): SplendorAiDifficulty {
   return value === 'easy' || value === 'medium' || value === 'hard' ? value : 'medium';
 }
@@ -797,31 +965,68 @@ function advanceSplendorTurn(session: SplendorSession, side: SplendorSide): void
   if (score >= 15 && !session.finalRoundStartedBy) {
     session.finalRoundStartedBy = side;
   }
-  if (session.finalRoundStartedBy && side === 'opponent') {
+  const nextSide = nextSplendorSide(session, side);
+  const firstSide = splendorTurnOrder(session)[0];
+  if (session.finalRoundStartedBy && nextSide === firstSide) {
     finishSplendor(session);
     return;
   }
-  if (score >= 15 && side === 'opponent') {
-    finishSplendor(session);
-    return;
-  }
-  session.currentTurn = side === 'challenger' ? 'opponent' : 'challenger';
+  session.currentTurn = nextSide;
 }
 
 function finishSplendor(session: SplendorSession): void {
   session.status = 'finished';
-  const challenger = session.playerStates.challenger;
-  const opponent = session.playerStates.opponent;
   let winner: SplendorSide | undefined;
-  if (challenger.score !== opponent.score) {
-    winner = challenger.score > opponent.score ? 'challenger' : 'opponent';
-  } else if (challenger.purchased.length !== opponent.purchased.length) {
-    winner = challenger.purchased.length < opponent.purchased.length ? 'challenger' : 'opponent';
+  let tied = false;
+  for (const side of splendorTurnOrder(session)) {
+    const candidate = session.playerStates[side];
+    if (!candidate) {
+      continue;
+    }
+    if (!winner) {
+      winner = side;
+      tied = false;
+      continue;
+    }
+    const current = session.playerStates[winner];
+    if (
+      candidate.score > current.score ||
+      (candidate.score === current.score &&
+        candidate.purchased.length < current.purchased.length)
+    ) {
+      winner = side;
+      tied = false;
+    } else if (
+      candidate.score === current.score &&
+      candidate.purchased.length === current.purchased.length
+    ) {
+      tied = true;
+    }
+  }
+  if (tied) {
+    winner = undefined;
   }
   session.winnerSide = winner;
   session.winnerAccountId = winner ? session.players[winner] : undefined;
   session.finishReason = winner ? 'score' : 'draw';
   session.updatedAt = new Date().toISOString();
+}
+
+function splendorTurnOrder(session: SplendorSession): SplendorSide[] {
+  const explicit = session.turnOrder?.filter((side) => Boolean(session.players[side]));
+  if (explicit && explicit.length > 0) {
+    return explicit;
+  }
+  return Object.keys(session.players);
+}
+
+function nextSplendorSide(session: SplendorSession, side: SplendorSide): SplendorSide {
+  const turnOrder = splendorTurnOrder(session);
+  const index = turnOrder.indexOf(side);
+  if (index < 0) {
+    return turnOrder[0] ?? side;
+  }
+  return turnOrder[(index + 1) % turnOrder.length];
 }
 
 function splendorPaymentFor(player: SplendorPlayerState, card: SplendorCard): SplendorTokenMap | null {
