@@ -1,5 +1,6 @@
 import { BadRequestException } from '@nestjs/common';
 import { GameAction, GameEngine, SeatInfo } from './engine/game-engine';
+import { createSeededRng } from './engine/rng';
 import { Difficulty, GameMode } from './games.types';
 
 export type SplendorGem = 'white' | 'blue' | 'green' | 'red' | 'black';
@@ -40,9 +41,13 @@ export interface SplendorSession {
   rev?: number;
   mode?: GameMode;
   aiDifficulty?: string;
+  /** 딜/셔플 재현용 시드 (감사 전용). viewFor/클라 응답에는 절대 노출하지 않는다. */
+  rngSeed?: string;
   players: Record<SplendorSide, string>;
   currentTurn: SplendorSide;
   turnOrder?: SplendorSide[];
+  /** 좌석별 참가 상태 (없으면 active 로 간주). left/forfeited 좌석은 턴 로테이션에서 제외된다. */
+  seatStatus?: Record<SplendorSide, SplendorSeatStatus>;
   winnerSide?: SplendorSide;
   winnerAccountId?: string;
   status: 'playing' | 'finished';
@@ -66,10 +71,12 @@ export interface SplendorSession {
   updatedAt: string;
 }
 
-export interface SplendorClientSession extends Omit<SplendorSession, 'decks'> {
+export interface SplendorClientSession extends Omit<SplendorSession, 'decks' | 'rngSeed'> {
   deckCounts: Record<SplendorTier, number>;
   mySide?: SplendorSide;
 }
+
+export type SplendorSeatStatus = 'active' | 'left' | 'forfeited';
 
 type SplendorAiDifficulty = 'easy' | 'medium' | 'hard';
 type SplendorAiAction =
@@ -106,7 +113,12 @@ export const SPLENDOR_ENGINE: GameEngine<SplendorSession> = {
       side: splendorSideForSeat(index, players.length),
       accountId: player.accountId ?? `__game_platform_local_ai__#${index}`,
     }));
-    const state = createSplendorStateForPlayers(seats, mode, splendorDifficultyFromConfig(config.aiDifficulty));
+    const state = createSplendorStateForPlayers(
+      seats,
+      mode,
+      splendorDifficultyFromConfig(config.aiDifficulty),
+      typeof config.seed === 'string' ? config.seed : undefined,
+    );
     state.id = typeof config.id === 'string' ? config.id : '';
     return state;
   },
@@ -237,13 +249,15 @@ export function createSplendorStateForPlayers(
   seats: Array<{ side: SplendorSide; accountId: string }>,
   mode: GameMode,
   aiDifficulty?: string,
+  seed?: string,
 ): SplendorSession {
   if (seats.length < 2 || seats.length > 4) {
     throw new BadRequestException('splendor supports 2 to 4 players');
   }
+  const rng = createSeededRng(seed);
   const decks = createSplendorDecks();
   for (const tier of SPLENDOR_TIERS) {
-    shuffleArray(decks[tier]);
+    rng.shuffle(decks[tier]);
   }
   const market = {
     '1': drawCards(decks['1'], 4),
@@ -253,15 +267,18 @@ export function createSplendorStateForPlayers(
   const players = Object.fromEntries(seats.map((seat) => [seat.side, seat.accountId]));
   const turnOrder = seats.map((seat) => seat.side);
   const playerStates = Object.fromEntries(seats.map((seat) => [seat.side, createPlayerState()]));
+  const seatStatus = Object.fromEntries(seats.map((seat) => [seat.side, 'active' as SplendorSeatStatus]));
   const bankCount = seats.length <= 2 ? 4 : seats.length === 3 ? 5 : 7;
-  const nobles = shuffleArray(createSplendorNobles()).slice(0, seats.length + 1);
+  const nobles = rng.shuffle(createSplendorNobles()).slice(0, seats.length + 1);
   return {
     id: '',
     mode,
     aiDifficulty,
+    rngSeed: rng.seed,
     players,
     currentTurn: turnOrder[0],
     turnOrder,
+    seatStatus,
     status: 'playing',
     bank: { white: bankCount, blue: bankCount, green: bankCount, red: bankCount, black: bankCount, gold: 5 },
     market,
@@ -276,7 +293,7 @@ export function createSplendorStateForPlayers(
 
 export function splendorClientSession(session: SplendorSession, accountId?: string): SplendorClientSession {
   const mySide = accountId ? splendorSideForAccount(session, accountId) : undefined;
-  const { decks: _decks, ...rest } = session;
+  const { decks: _decks, rngSeed: _rngSeed, ...rest } = session;
   return {
     ...rest,
     deckCounts: {
@@ -1100,14 +1117,6 @@ function drawCards(deck: SplendorCard[], count: number): SplendorCard[] {
     }
   }
   return cards;
-}
-
-function shuffleArray<T>(items: T[]): T[] {
-  for (let index = items.length - 1; index > 0; index -= 1) {
-    const swapIndex = Math.floor(Math.random() * (index + 1));
-    [items[index], items[swapIndex]] = [items[swapIndex], items[index]];
-  }
-  return items;
 }
 
 function sanitizeTokenInput(input: Partial<Record<SplendorToken, number>>, allowGold: boolean): SplendorTokenMap {

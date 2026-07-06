@@ -1,4 +1,5 @@
 import { GameAction, GameEngine, SeatInfo } from './engine/game-engine';
+import { cryptoSeedInt } from './engine/rng';
 import { CrazyArcadeSession, CrazyArcadeSide, Difficulty, GameMode } from './games.types';
 
 const ROWS = 11;
@@ -201,7 +202,7 @@ function crazyDifficultyFromConfig(value: unknown): Difficulty {
 
 function crazySeedFromConfig(value: unknown): number {
   const seed = Math.trunc(Number(value));
-  return Number.isFinite(seed) ? seed : Math.floor(Math.random() * 0x7fffffff);
+  return Number.isFinite(seed) ? seed : cryptoSeedInt();
 }
 
 function crazyArcadeSideForSeat(seat: number, playerCount: number): CrazyArcadeSide {
@@ -770,7 +771,7 @@ function itemTouching(snapshot: CrazySnapshot, subject: PlayerState): ItemState 
 function snapshotFromUnknown(value: unknown, difficulty: Difficulty): CrazySnapshot {
   const source = isRecord(value) ? value : {};
   if (!Array.isArray(source.tiles)) {
-    return createSnapshotFromSeed(Number(source.seed) || Math.floor(Math.random() * 0x7fffffff), difficulty);
+    return createSnapshotFromSeed(Number(source.seed) || cryptoSeedInt(), difficulty);
   }
   const playerSide = typeof source.playerSide === 'string' ? source.playerSide : 'challenger';
   const opponentSide = typeof source.opponentSide === 'string' ? source.opponentSide : 'opponent';
@@ -890,7 +891,7 @@ function startFacingForIndex(index: number): Direction {
 }
 
 function parseTiles(value: unknown): Tile[][] {
-  if (!Array.isArray(value)) return generateMap(Math.floor(Math.random() * 0x7fffffff));
+  if (!Array.isArray(value)) return generateMap(cryptoSeedInt());
   return Array.from({ length: ROWS }, (_, row) => {
     const sourceRow = Array.isArray(value[row]) ? value[row] : [];
     return Array.from({ length: COLS }, (_, col): Tile => {

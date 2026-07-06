@@ -63,6 +63,7 @@ import {
   ActiveGameSessionSummary,
 } from './games.types';
 import { GAME_REGISTRY, gameDescriptorFor } from './engine/game-registry';
+import { cryptoSeedInt } from './engine/rng';
 import {
   applyGomokuMove as applyGomokuEngineMove,
   availableGomokuCells,
@@ -1815,7 +1816,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         opponent: opponentAccountId || LOCAL_AI_ACCOUNT_ID,
       },
       status: 'playing',
-      snapshot: createCrazyArcadeSnapshot(Math.floor(Math.random() * 0x7fffffff), difficulty),
+      snapshot: createCrazyArcadeSnapshot(cryptoSeedInt(), difficulty),
       inputs: {
         challenger: {},
         opponent: {},
@@ -2764,7 +2765,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         status: 'playing',
         snapshot: createCrazyArcadeSnapshotForSides(
           sides,
-          Math.floor(Math.random() * 0x7fffffff),
+          cryptoSeedInt(),
           difficulty,
         ),
         inputs: Object.fromEntries(sides.map((side) => [side, {}])),
