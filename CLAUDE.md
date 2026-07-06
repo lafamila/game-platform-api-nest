@@ -81,6 +81,36 @@ ORDER BY count DESC;
 
 Sliding idle of 30d only truly holds once `auth-api-nest` applies a per-client refresh TTL (≥ idle window) for the `game-platform-api` OIDC client. Until then the keepalive job maintains the 7d chain. When auth ships per-client TTL, submit a service-onboarding **update request** (workspace principle 3) to raise `game-platform-api`'s refresh TTL to 30d.
 
+## Realtime & Reconnection (Phase 2)
+
+Phase 2 hardens live play against reconnects. New env: `GAME_PLATFORM_DISCONNECT_GRACE_SECONDS` (default 60) and `GAME_PLATFORM_SESSION_ABANDON_DAYS` (default 7).
+
+### Event channels
+
+- **socket.io** at path `/api/socket.io` is the push channel. The handshake is authenticated with the game-platform session id via the `x-game-platform-session` header or handshake `auth.sessionId` (same session the guard validates); the socket joins a per-account room. `emitToAccounts` publishes to the SSE `Subject` and socket.io simultaneously.
+- **SSE** `GET /api/realtime/events` is kept during the transition and will be removed only after the Flutter client has moved to socket.io (separate instruction).
+
+### `rev` and optimistic locking
+
+Every game session's `state_json` carries a monotonically increasing `rev`. Writes are conditional (`WHERE (state_json->>'rev')::int = expected`); a lost race throws `409 { code: 'STATE_CONFLICT' }`. Every session/action event payload includes the session (which carries `rev`; shot events carry it under `session.rev`). Client sequence: track the last `rev` per session; on a socket reconnect, or when an incoming `rev` is not `lastRev + 1` (gap), re-fetch `GET /{game}/sessions/:id` to resync. No event replay is needed for consistency.
+
+### Disconnect grace and the D7 choice
+
+When a player disconnects on their turn in a turn-based match, the server starts a grace window (`GAME_PLATFORM_DISCONNECT_GRACE_SECONDS`) and emits `game.opponent_left` to the remaining player. Instead of auto-forfeiting, the remaining player chooses:
+
+- `POST /api/games/:gameKey/sessions/:id/claim-win` — if the opponent is still offline, awards the win; if the opponent has reconnected, the match resumes, `game.opponent_returned` is emitted, and the call returns `409 { code: 'OPPONENT_RECONNECTED' }`.
+- `POST /api/games/:gameKey/sessions/:id/wait` — keeps the session open to wait; a win can still be claimed later.
+
+Abandoned sessions (no update for `GAME_PLATFORM_SESSION_ABANDON_DAYS`) are finished by a periodic GC job with `finishReason: 'abandoned'`.
+
+### Resume entry point
+
+`GET /api/sessions/active` returns the caller's unfinished (`status = playing`) sessions with `{ sessionId, gameKey, mode, status, rev, opponentAccountIds, currentTurnAccountId, myTurn, createdAt, updatedAt }` — the entry point for reconnect/resume after app restart.
+
+### Idempotent submission (`clientMoveId`)
+
+Every action POST accepts an optional `clientMoveId` (uuid). The server keeps the last 20 accepted ids per account in `state_json` and, on a repeat, re-responds with the current session in that route's normal shape instead of re-applying — so a timeout retry cannot double-move. The check runs after the participant/status/pause guards and before turn/input validation, so a retry stays idempotent even after the turn has advanced (it returns current state rather than a "not your turn"/"cell occupied" error). Wired routes: `gomoku/othello/sokoban moves`, `alkkagi/fortress shots`, `fortress moves`, `splendor tokens/reserve/buy`. Shot routes return an empty animation on a duplicate (`alkkagi: { frameMs: 16, frames: [] }`; `fortress`: no-op animation with the current terrain/tanks). Excluded by design: Crazy Arcade `sync`/`input` (host-authoritative last-write) and sudoku cell writes (value assignment is naturally idempotent).
+
 ## Local Dev
 
 ```bash
@@ -97,6 +127,9 @@ Normal local development uses `auth-api-nest` on `http://localhost:3032`, Postgr
 
 - `GET /api/health`
 - `GET /api/games`
+- `GET /api/sessions/active`
+- `POST /api/games/:gameKey/sessions/:id/claim-win`
+- `POST /api/games/:gameKey/sessions/:id/wait`
 - `POST /api/sudoku/sessions`
 - `GET /api/sudoku/sessions/:id`
 - `PATCH /api/sudoku/sessions/:id/cells`
@@ -128,7 +161,8 @@ Normal local development uses `auth-api-nest` on `http://localhost:3032`, Postgr
 - `POST /api/matches/:id/accept`
 - `POST /api/matches/:id/reject`
 - `POST /api/permission-upgrade-requests`
-- `GET /api/realtime/events`
+- `GET /api/realtime/events` (SSE, kept during the socket.io transition)
+- socket.io `/api/socket.io` (event push channel; auth via `x-game-platform-session` header or handshake `auth.sessionId`)
 
 ## Review Criteria
 
