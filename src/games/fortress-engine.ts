@@ -72,6 +72,7 @@ export interface FortressShot {
 
 export interface FortressSession {
   id: string;
+  rev?: number;
   mode?: GameMode;
   aiDifficulty?: Difficulty;
   currentTurn: FortressSide;

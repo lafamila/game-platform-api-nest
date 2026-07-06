@@ -605,6 +605,9 @@ class FakeDb {
     }
     if (sql.includes('UPDATE game_sessions')) {
       const row = this.rows.get(args[0]);
+      if (args.length > 5 && (row.state_json.rev ?? 0) !== args[5]) {
+        return { rows: [] };
+      }
       row.status = args[1];
       row.current_turn = args[2];
       row.winner = args[3];
@@ -630,3 +633,21 @@ class FakeRealtime {
     return true;
   }
 }
+
+test('stale game session writes fail with a state conflict', async () => {
+  const service = new GamesService(new FakeDb(), new FakeRealtime());
+  const session = await service.createGomokuSession(user, undefined, undefined, 'medium');
+  assert.equal(session.rev, 1);
+
+  const stale = JSON.parse(JSON.stringify(session));
+  const moved = await service.playGomokuMove(session.id, user, 7, 7);
+  assert.equal(moved.rev, 2);
+
+  await assert.rejects(
+    () => service.updateGame(session.id, stale.status, stale.currentTurn, null, stale),
+    (error) => error.getStatus?.() === 409 && error.getResponse?.().code === 'STATE_CONFLICT',
+  );
+
+  const latest = await service.getGomokuSession(session.id, user);
+  assert.equal(latest.moves.length, 1);
+});

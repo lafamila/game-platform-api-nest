@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException, Injectable, NotFoundException, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, ConflictException, NotFoundException, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
 import { AuthAccount } from '../auth/auth.types';
 import { emoteGridSizeFor, hasPlayerAccess } from '../auth/roles';
@@ -1589,23 +1589,30 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
        (game_key, mode, status, current_turn, winner, owner_account_id, opponent_account_id, state_json)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
        RETURNING *`,
-      [gameKey, mode, status, currentTurn, winner, ownerAccountId, opponentAccountId, JSON.stringify(state)],
+      [gameKey, mode, status, currentTurn, winner, ownerAccountId, opponentAccountId, JSON.stringify({ ...(state as Record<string, unknown>), rev: 1 })],
     );
     return result.rows[0];
   }
 
   private async updateGame(id: string, status: string, currentTurn: string | null, winner: string | null, state: unknown): Promise<GameRow> {
+    const stateRecord = state as Record<string, unknown> & { rev?: number };
+    const expectedRev = typeof stateRecord.rev === 'number' ? stateRecord.rev : 0;
+    const nextRev = expectedRev + 1;
     const result = await this.db.query<GameRow>(
       `UPDATE game_sessions
        SET status = $2, current_turn = $3, winner = $4, state_json = $5::jsonb, updated_at = now()
        WHERE id = $1
+         AND COALESCE((state_json->>'rev')::int, 0) = $6
        RETURNING *`,
-      [id, status, currentTurn, winner, JSON.stringify(state)],
+      [id, status, currentTurn, winner, JSON.stringify({ ...stateRecord, rev: nextRev }), expectedRev],
     );
-    if (!result.rows[0]) {
-      throw new NotFoundException('Game session not found');
+    const row = result.rows[0];
+    if (!row) {
+      // Every caller loads the row just before saving, so a missed update means a rev conflict.
+      throw new GameStateConflictError();
     }
-    return result.rows[0];
+    stateRecord.rev = nextRev;
+    return row;
   }
 
   private async requireGameRow(id: string, gameKey: string): Promise<GameRow> {
@@ -2518,6 +2525,12 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     for (const accountId of sessionAccountIds(session)) {
       this.realtime.emitToAccounts([accountId], event, sessionForSokobanAccount(session, accountId));
     }
+  }
+}
+
+export class GameStateConflictError extends ConflictException {
+  constructor() {
+    super({ statusCode: 409, code: 'STATE_CONFLICT', message: 'Game state changed. Refresh and retry.', error: 'Conflict' });
   }
 }
 

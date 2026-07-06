@@ -36,6 +36,7 @@ export interface SplendorPlayerState {
 
 export interface SplendorSession {
   id: string;
+  rev?: number;
   mode?: GameMode;
   aiDifficulty?: string;
   players: Record<SplendorSide, string>;
@@ -243,8 +244,7 @@ export function applySplendorBuy(
   if (reservedIndex >= 0) {
     player.reserved.splice(reservedIndex, 1);
   } else if (marketLocation) {
-    session.market[marketLocation.tier].splice(marketLocation.index, 1);
-    refillMarket(session, marketLocation.tier);
+    refillMarketSlot(session, marketLocation.tier, marketLocation.index);
   }
   player.purchased.push(card);
   player.bonuses[card.color] += 1;
@@ -875,6 +875,15 @@ function refillMarket(session: SplendorSession, tier: SplendorTier): void {
   if (next) {
     session.market[tier].push(next);
   }
+}
+
+function refillMarketSlot(session: SplendorSession, tier: SplendorTier, index: number): void {
+  const next = session.decks[tier].shift();
+  if (next) {
+    session.market[tier].splice(index, 1, next);
+    return;
+  }
+  session.market[tier].splice(index, 1);
 }
 
 function drawCards(deck: SplendorCard[], count: number): SplendorCard[] {

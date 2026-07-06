@@ -28,6 +28,7 @@ export interface TimedTurnState {
 
 export interface SudokuSession {
   id: string;
+  rev?: number;
   mode?: GameMode;
   ownerAccountId: string;
   difficulty: Difficulty;
@@ -67,6 +68,7 @@ export interface SudokuBattleState {
 
 export interface GomokuSession {
   id: string;
+  rev?: number;
   mode?: GameMode;
   aiDifficulty?: Difficulty;
   board: (PlayerColor | null)[][];
@@ -101,6 +103,7 @@ export interface AlkkagiPiece {
 
 export interface AlkkagiSession {
   id: string;
+  rev?: number;
   mode?: GameMode;
   aiDifficulty?: Difficulty;
   currentTurn: PieceTeam;
@@ -139,6 +142,7 @@ export interface AlkkagiShotResult {
 
 export interface OthelloSession {
   id: string;
+  rev?: number;
   mode?: GameMode;
   aiDifficulty?: Difficulty;
   board: (OthelloColor | null)[][];
@@ -167,6 +171,7 @@ export interface SokobanPlayerState {
 
 export interface SokobanSession {
   id: string;
+  rev?: number;
   mode?: GameMode;
   ownerAccountId: string;
   difficulty: Difficulty;
@@ -191,6 +196,7 @@ export interface SokobanSession {
 
 export interface CrazyArcadeSession {
   id: string;
+  rev?: number;
   mode?: GameMode;
   ownerAccountId: string;
   difficulty: Difficulty;
