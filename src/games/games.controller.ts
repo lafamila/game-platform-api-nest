@@ -128,9 +128,9 @@ export class GamesController {
   shootAlkkagi(
     @Param('id') id: string,
     @CurrentUser() user: AuthAccount,
-    @Body() body: { pieceId: string; vx: number; vy: number },
+    @Body() body: { pieceId: string; vx: number; vy: number; clientMoveId?: string },
   ) {
-    return this.games.shootAlkkagi(id, user, body.pieceId, Number(body.vx), Number(body.vy));
+    return this.games.shootAlkkagi(id, user, body.pieceId, Number(body.vx), Number(body.vy), body.clientMoveId);
   }
 
   @Post('alkkagi/sessions/:id/emotes')
@@ -170,8 +170,8 @@ export class GamesController {
   }
 
   @Post('othello/sessions/:id/moves')
-  playOthelloMove(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { row: number; col: number }) {
-    return this.games.playOthelloMove(id, user, Number(body.row), Number(body.col));
+  playOthelloMove(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { row: number; col: number; clientMoveId?: string }) {
+    return this.games.playOthelloMove(id, user, Number(body.row), Number(body.col), body.clientMoveId);
   }
 
   @Post('othello/sessions/:id/emotes')
@@ -195,8 +195,8 @@ export class GamesController {
   }
 
   @Post('sokoban/sessions/:id/moves')
-  moveSokoban(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { direction: string }) {
-    return this.games.moveSokoban(id, user, body.direction);
+  moveSokoban(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { direction: string; clientMoveId?: string }) {
+    return this.games.moveSokoban(id, user, body.direction, body.clientMoveId);
   }
 
   @Post('sokoban/sessions/:id/emotes')
@@ -227,9 +227,10 @@ export class GamesController {
     body: {
       tokens?: Record<string, number>;
       discardTokens?: Record<string, number>;
+      clientMoveId?: string;
     },
   ) {
-    return this.games.takeSplendorTokens(id, user, body.tokens ?? {}, body.discardTokens ?? {});
+    return this.games.takeSplendorTokens(id, user, body.tokens ?? {}, body.discardTokens ?? {}, body.clientMoveId);
   }
 
   @Post('splendor/sessions/:id/reserve')
@@ -241,14 +242,15 @@ export class GamesController {
       cardId?: string;
       tier?: string;
       discardTokens?: Record<string, number>;
+      clientMoveId?: string;
     },
   ) {
-    return this.games.reserveSplendorCard(id, user, body);
+    return this.games.reserveSplendorCard(id, user, body, body.clientMoveId);
   }
 
   @Post('splendor/sessions/:id/buy')
-  buySplendorCard(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { cardId: string }) {
-    return this.games.buySplendorCard(id, user, body.cardId);
+  buySplendorCard(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { cardId: string; clientMoveId?: string }) {
+    return this.games.buySplendorCard(id, user, body.cardId, body.clientMoveId);
   }
 
   @Post('splendor/sessions/:id/preview')
@@ -286,8 +288,8 @@ export class GamesController {
   }
 
   @Post('fortress/sessions/:id/moves')
-  moveFortress(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { distance: number }) {
-    return this.games.moveFortress(id, user, Number(body.distance));
+  moveFortress(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { distance: number; clientMoveId?: string }) {
+    return this.games.moveFortress(id, user, Number(body.distance), body.clientMoveId);
   }
 
   @Post('fortress/sessions/:id/aim')
@@ -296,8 +298,8 @@ export class GamesController {
   }
 
   @Post('fortress/sessions/:id/shots')
-  shootFortress(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { angle: number; power: number; item?: 'doubleShot' | 'airStrike' }) {
-    return this.games.shootFortress(id, user, Number(body.angle), Number(body.power), body.item);
+  shootFortress(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { angle: number; power: number; item?: 'doubleShot' | 'airStrike'; clientMoveId?: string }) {
+    return this.games.shootFortress(id, user, Number(body.angle), Number(body.power), body.item, body.clientMoveId);
   }
 
   @Post('fortress/sessions/:id/emotes')

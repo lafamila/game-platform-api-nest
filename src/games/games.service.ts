@@ -614,6 +614,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     pieceId: string,
     vx: number,
     vy: number,
+    clientMoveId?: string,
   ): Promise<AlkkagiShotResult> {
     if (!Number.isFinite(vx) || !Number.isFinite(vy)) {
       throw new BadRequestException('vx and vy must be numbers');
@@ -624,6 +625,9 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('game is already finished');
     }
     this.assertNotPaused(session);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return { session, animation: { frameMs: 16, frames: [] } };
+    }
     const team = session.currentTurn;
     if (isLocalAiAccount(session.players[team])) {
       throw new ForbiddenException('not your turn');
@@ -766,7 +770,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return session;
   }
 
-  async playOthelloMove(id: string, user: AuthAccount, row: number, col: number): Promise<OthelloSession> {
+  async playOthelloMove(id: string, user: AuthAccount, row: number, col: number, clientMoveId?: string): Promise<OthelloSession> {
     validateOthelloIndex(row, 'row');
     validateOthelloIndex(col, 'col');
     const session = this.othelloFromRow(await this.requireGameRow(id, 'othello'));
@@ -775,6 +779,9 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('game is already finished');
     }
     this.assertNotPaused(session);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return session;
+    }
     const color = session.currentTurn;
     if (isLocalAiAccount(session.players[color])) {
       throw new ForbiddenException('not your turn');
@@ -857,13 +864,16 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return sessionForSokobanUser(session, user);
   }
 
-  async moveSokoban(id: string, user: AuthAccount, direction: string): Promise<SokobanSession> {
+  async moveSokoban(id: string, user: AuthAccount, direction: string, clientMoveId?: string): Promise<SokobanSession> {
     const session = this.sokobanFromRow(await this.requireGameRow(id, 'sokoban'));
     this.assertSokobanParticipant(user, session);
     if (session.status !== 'playing') {
       throw new BadRequestException('game is already finished');
     }
     this.assertNotPaused(session);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return sessionForSokobanUser(session, user);
+    }
     const side = this.sokobanSideForUser(session, user);
     const playerState = side ? ensureSokobanPlayerState(session, side) : session.state;
     const moveResult = applySokobanMove(session, playerState, direction);
@@ -946,10 +956,14 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     user: AuthAccount,
     tokens: Partial<Record<SplendorToken, number>>,
     discardTokens: Partial<Record<SplendorToken, number>> = {},
+    clientMoveId?: string,
   ): Promise<SplendorClientSession> {
     const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
     this.assertSplendorParticipant(user, session);
     const side = this.splendorSideForUser(session, user);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return splendorClientSession(session, user.accountId);
+    }
     applySplendorTakeTokens(session, side, user.accountId, tokens, discardTokens);
     const saved = await this.saveSplendorSession(session);
     this.emitSessionEvent(saved, 'splendor.action.played', splendorClientSession(saved));
@@ -961,10 +975,14 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     id: string,
     user: AuthAccount,
     input: { cardId?: string; tier?: string; discardTokens?: Partial<Record<SplendorToken, number>> },
+    clientMoveId?: string,
   ): Promise<SplendorClientSession> {
     const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
     this.assertSplendorParticipant(user, session);
     const side = this.splendorSideForUser(session, user);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return splendorClientSession(session, user.accountId);
+    }
     applySplendorReserve(session, side, user.accountId, input);
     const saved = await this.saveSplendorSession(session);
     this.emitSessionEvent(saved, 'splendor.action.played', splendorClientSession(saved));
@@ -972,10 +990,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return splendorClientSession(saved, user.accountId);
   }
 
-  async buySplendorCard(id: string, user: AuthAccount, cardId: string): Promise<SplendorClientSession> {
+  async buySplendorCard(id: string, user: AuthAccount, cardId: string, clientMoveId?: string): Promise<SplendorClientSession> {
     const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
     this.assertSplendorParticipant(user, session);
     const side = this.splendorSideForUser(session, user);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return splendorClientSession(session, user.accountId);
+    }
     applySplendorBuy(session, side, user.accountId, cardId);
     const saved = await this.saveSplendorSession(session);
     this.emitSessionEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'splendor.action.played', splendorClientSession(saved));
@@ -1084,10 +1105,14 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     id: string,
     user: AuthAccount,
     distance: number,
+    clientMoveId?: string,
   ): Promise<ReturnType<typeof fortressClientSession>> {
     const session = this.fortressFromRow(await this.requireGameRow(id, 'fortress'));
     this.assertFortressParticipant(user, session);
     this.assertNotPaused(session);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return fortressClientSession(session, user.accountId);
+    }
     const side = this.fortressSideForUser(session, user);
     applyFortressMove(session, side, distance);
     const saved = await this.saveFortressSession(session);
@@ -1120,10 +1145,24 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     angle: number,
     power: number,
     item?: FortressItemKey,
+    clientMoveId?: string,
   ): Promise<FortressShotResult & { session: ReturnType<typeof fortressClientSession> }> {
     const session = this.fortressFromRow(await this.requireGameRow(id, 'fortress'));
     this.assertFortressParticipant(user, session);
     this.assertNotPaused(session);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return {
+        session: fortressClientSession(session, user.accountId),
+        animation: {
+          frameMs: 16,
+          projectile: [],
+          terrainBefore: session.terrain,
+          terrainAfter: session.terrain,
+          tanksBefore: session.tanks,
+          tanksAfter: session.tanks,
+        },
+      };
+    }
     const side = this.fortressSideForUser(session, user);
     const result = applyFortressShot(session, side, user.accountId, angle, power, 'manual', item);
     if (result.session.status === 'playing') {
