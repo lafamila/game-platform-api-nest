@@ -430,13 +430,28 @@ export function applySplendorForfeit(session: SplendorSession, side: SplendorSid
   if (session.status !== 'playing') {
     return;
   }
-  const activeSides = splendorTurnOrder(session).filter((item) => item !== side);
-  const winnerSide = activeSides.length === 1 ? activeSides[0] : undefined;
-  session.status = 'finished';
-  session.winnerSide = winnerSide;
-  session.winnerAccountId = winnerSide ? session.players[winnerSide] : undefined;
-  session.finishReason = 'forfeit';
+  if (!splendorSeatIsActive(session, side)) {
+    // 이미 이탈한 좌석의 중복 forfeit 은 무시한다.
+    return;
+  }
+  const seatStatus = ensureSplendorSeatStatus(session);
+  seatStatus[side] = 'forfeited';
   pushSplendorMove(session, { action: 'forfeit', side, accountId });
+  const remaining = activeSplendorSides(session);
+  if (remaining.length <= 1) {
+    // 활성 좌석이 1명 이하가 되면 게임 종료: 남은 1명이 승리(0명이면 무승부).
+    const winnerSide = remaining.length === 1 ? remaining[0] : undefined;
+    session.status = 'finished';
+    session.winnerSide = winnerSide;
+    session.winnerAccountId = winnerSide ? session.players[winnerSide] : undefined;
+    session.finishReason = 'forfeit';
+    session.updatedAt = new Date().toISOString();
+    return;
+  }
+  // 활성 좌석이 2명 이상 남으면 게임을 계속한다. 이탈한 좌석이 현재 턴이었다면 다음 활성 좌석으로 넘긴다.
+  if (session.currentTurn === side) {
+    advanceSplendorTurn(session, side);
+  }
   session.updatedAt = new Date().toISOString();
 }
 
@@ -983,7 +998,8 @@ function advanceSplendorTurn(session: SplendorSession, side: SplendorSide): void
     session.finalRoundStartedBy = side;
   }
   const nextSide = nextSplendorSide(session, side);
-  const firstSide = splendorTurnOrder(session)[0];
+  // 마지막 라운드는 활성 좌석 기준 첫 좌석으로 순번이 돌아오면 종료된다(이탈 좌석은 스킵되므로).
+  const firstSide = activeSplendorSides(session)[0];
   if (session.finalRoundStartedBy && nextSide === firstSide) {
     finishSplendor(session);
     return;
@@ -995,7 +1011,8 @@ function finishSplendor(session: SplendorSession): void {
   session.status = 'finished';
   let winner: SplendorSide | undefined;
   let tied = false;
-  for (const side of splendorTurnOrder(session)) {
+  // 자연 종료 시 승자는 활성 좌석 중에서만 가린다(이탈/포기 좌석은 승자 후보에서 제외).
+  for (const side of activeSplendorSides(session)) {
     const candidate = session.playerStates[side];
     if (!candidate) {
       continue;
@@ -1038,12 +1055,38 @@ function splendorTurnOrder(session: SplendorSession): SplendorSide[] {
 }
 
 function nextSplendorSide(session: SplendorSession, side: SplendorSide): SplendorSide {
+  // 좌석 인덱스는 전체 turnOrder 기준으로 유지하되, 다음 턴은 활성 좌석만 받는다(M4 — left/forfeited 스킵).
   const turnOrder = splendorTurnOrder(session);
-  const index = turnOrder.indexOf(side);
-  if (index < 0) {
-    return turnOrder[0] ?? side;
+  const start = turnOrder.indexOf(side);
+  if (start < 0) {
+    return activeSplendorSides(session)[0] ?? turnOrder[0] ?? side;
   }
-  return turnOrder[(index + 1) % turnOrder.length];
+  for (let step = 1; step <= turnOrder.length; step += 1) {
+    const candidate = turnOrder[(start + step) % turnOrder.length];
+    if (splendorSeatIsActive(session, candidate)) {
+      return candidate;
+    }
+  }
+  return side;
+}
+
+function ensureSplendorSeatStatus(session: SplendorSession): Record<SplendorSide, SplendorSeatStatus> {
+  if (!session.seatStatus) {
+    session.seatStatus = Object.fromEntries(
+      splendorTurnOrder(session).map((side) => [side, 'active' as SplendorSeatStatus]),
+    );
+  }
+  return session.seatStatus;
+}
+
+function splendorSeatIsActive(session: SplendorSession, side: SplendorSide): boolean {
+  // seatStatus 가 없는 기존 세션은 전부 active 로 간주한다(하위호환).
+  const status = session.seatStatus?.[side];
+  return status === undefined || status === 'active';
+}
+
+function activeSplendorSides(session: SplendorSession): SplendorSide[] {
+  return splendorTurnOrder(session).filter((side) => splendorSeatIsActive(session, side));
 }
 
 function splendorPaymentFor(player: SplendorPlayerState, card: SplendorCard): SplendorTokenMap | null {
