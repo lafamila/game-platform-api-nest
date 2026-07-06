@@ -611,6 +611,19 @@ class FakeDb {
       }
       return { rows: [] };
     }
+    if (sql.includes('UPDATE game_sessions') && sql.includes('abandoned')) {
+      const cutoff = Date.now() - args[0] * 86_400_000;
+      const updated = [];
+      for (const row of this.rows.values()) {
+        if (!['finished', 'cleared', 'failed'].includes(row.status) && row.updated_at.getTime() < cutoff) {
+          row.status = 'finished';
+          row.state_json = { ...row.state_json, status: 'finished', finishReason: 'abandoned' };
+          row.updated_at = new Date();
+          updated.push(row);
+        }
+      }
+      return { rows: updated };
+    }
     if (sql.includes('UPDATE game_sessions')) {
       const row = this.rows.get(args[0]);
       if (args.length > 5 && (row.state_json.rev ?? 0) !== args[5]) {
@@ -677,4 +690,20 @@ test('active session list returns my unfinished sessions', async () => {
   await service.forfeitGomoku(session.id, user);
   const after = await service.listActiveSessions(user);
   assert.equal(after.sessions.length, 0);
+});
+
+test('abandoned sessions are finished by the gc job', async () => {
+  const db = new FakeDb();
+  const service = new GamesService(db, new FakeRealtime());
+  const session = await service.createGomokuSession(user, undefined, undefined, 'medium');
+  db.rows.get(session.id).updated_at = new Date(Date.now() - 8 * 86_400_000);
+
+  const cleaned = await service.gcAbandonedSessions();
+  assert.equal(cleaned, 1);
+
+  const after = await service.listActiveSessions(user);
+  assert.equal(after.sessions.length, 0);
+  const finished = await service.getGomokuSession(session.id, user);
+  assert.equal(finished.status, 'finished');
+  assert.equal(finished.finishReason, 'abandoned');
 });

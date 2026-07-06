@@ -1,5 +1,6 @@
 import { BadRequestException, ForbiddenException, Injectable, ConflictException, NotFoundException, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
+import { intEnv } from '../config/env';
 import { AuthAccount } from '../auth/auth.types';
 import { emoteGridSizeFor, hasPlayerAccess } from '../auth/roles';
 import { RealtimeService } from '../realtime/realtime.service';
@@ -127,6 +128,7 @@ interface SokobanMapRow {
 export class GamesService implements OnModuleInit, OnModuleDestroy {
   private readonly turnTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly emoteCooldowns = new Map<string, number>();
+  private gcTimer?: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly db: DatabaseService,
@@ -137,6 +139,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     await this.db.ready();
     await this.prepareSokobanMapPool();
     await this.restoreActiveTurnTimers();
+    this.scheduleAbandonedSessionGc();
   }
 
   onModuleDestroy(): void {
@@ -144,6 +147,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       clearTimeout(timer);
     }
     this.turnTimers.clear();
+    if (this.gcTimer) {
+      clearInterval(this.gcTimer);
+      this.gcTimer = undefined;
+    }
   }
 
   listGames() {
@@ -188,6 +195,36 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       };
     });
     return { sessions };
+  }
+
+  private scheduleAbandonedSessionGc(): void {
+    const abandonDays = intEnv('GAME_PLATFORM_SESSION_ABANDON_DAYS', 7);
+    if (abandonDays <= 0) {
+      return;
+    }
+    void this.gcAbandonedSessions().catch((error) => console.error('[session-gc]', error));
+    this.gcTimer = setInterval(() => {
+      void this.gcAbandonedSessions().catch((error) => console.error('[session-gc]', error));
+    }, 60 * 60 * 1000);
+    this.gcTimer.unref?.();
+  }
+
+  async gcAbandonedSessions(): Promise<number> {
+    const abandonDays = intEnv('GAME_PLATFORM_SESSION_ABANDON_DAYS', 7);
+    const result = await this.db.query<{ id: string }>(
+      `UPDATE game_sessions
+       SET status = 'finished',
+           state_json = state_json || jsonb_build_object('status', 'finished', 'finishReason', 'abandoned'),
+           updated_at = now()
+       WHERE status NOT IN ('finished', 'cleared', 'failed')
+         AND updated_at < now() - make_interval(days => $1)
+       RETURNING id`,
+      [abandonDays],
+    );
+    for (const row of result.rows) {
+      this.clearTurnTimer(row.id);
+    }
+    return result.rows.length;
   }
 
   async listEmotes(user: AuthAccount): Promise<{ gridSize: 8 | 16; emotes: CustomEmote[] }> {
