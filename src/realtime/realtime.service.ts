@@ -103,6 +103,14 @@ export class RealtimeService {
     return (this.connectionCounts.get(accountId) ?? 0) > 0;
   }
 
+  async isAccountOnline(accountId: string | undefined): Promise<boolean> {
+    if (this.isAccountConnected(accountId)) {
+      return true;
+    }
+    // 다른 인스턴스에 붙어 있는 연결까지 Redis presence 로 확인한다.
+    return this.presence.isOnline(accountId);
+  }
+
   presenceChanges(): Observable<PresenceChange> {
     return this.presenceSubject.asObservable();
   }

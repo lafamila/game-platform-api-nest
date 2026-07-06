@@ -649,9 +649,16 @@ class FakeDb {
 }
 
 class FakeRealtime {
+  online = true;
+
   emitToAccounts() {}
+
   isAccountConnected() {
-    return true;
+    return this.online;
+  }
+
+  async isAccountOnline() {
+    return this.online;
   }
 }
 
@@ -706,4 +713,59 @@ test('abandoned sessions are finished by the gc job', async () => {
   const finished = await service.getGomokuSession(session.id, user);
   assert.equal(finished.status, 'finished');
   assert.equal(finished.finishReason, 'abandoned');
+});
+
+test('remaining player can claim a win after the opponent leaves', async () => {
+  const db = new FakeDb();
+  const realtime = new FakeRealtime();
+  const service = new GamesService(db, realtime);
+  const session = await service.createGomokuSession(user, opponent.accountId);
+  const row = db.rows.get(session.id);
+  row.state_json.opponentLeftAt = new Date().toISOString();
+  row.state_json.networkGraceAccountId = opponent.accountId;
+
+  realtime.online = false;
+  const finished = await service.claimDisconnectedWin('gomoku', session.id, user);
+  assert.equal(finished.status, 'finished');
+  assert.equal(finished.finishReason, 'disconnect');
+  assert.equal(finished.players[finished.winner], user.accountId);
+  service.onModuleDestroy();
+});
+
+test('claim is rejected when the opponent reconnected', async () => {
+  const db = new FakeDb();
+  const realtime = new FakeRealtime();
+  const service = new GamesService(db, realtime);
+  const session = await service.createGomokuSession(user, opponent.accountId);
+  const row = db.rows.get(session.id);
+  row.state_json.opponentLeftAt = new Date().toISOString();
+  row.state_json.networkGraceAccountId = opponent.accountId;
+
+  realtime.online = true;
+  await assert.rejects(
+    () => service.claimDisconnectedWin('gomoku', session.id, user),
+    (error) => error.getStatus?.() === 409 && error.getResponse?.().code === 'OPPONENT_RECONNECTED',
+  );
+  const resumed = await service.getGomokuSession(session.id, user);
+  assert.equal(resumed.status, 'playing');
+  assert.equal(resumed.opponentLeftAt, undefined);
+  service.onModuleDestroy();
+});
+
+test('waiting keeps the abandoned match open for a later claim', async () => {
+  const db = new FakeDb();
+  const realtime = new FakeRealtime();
+  const service = new GamesService(db, realtime);
+  const session = await service.createGomokuSession(user, opponent.accountId);
+  const row = db.rows.get(session.id);
+  row.state_json.opponentLeftAt = new Date().toISOString();
+  row.state_json.networkGraceAccountId = opponent.accountId;
+
+  realtime.online = false;
+  const waiting = await service.waitForOpponent('gomoku', session.id, user);
+  assert.equal(waiting.status, 'playing');
+
+  const finished = await service.claimDisconnectedWin('gomoku', session.id, user);
+  assert.equal(finished.status, 'finished');
+  service.onModuleDestroy();
 });

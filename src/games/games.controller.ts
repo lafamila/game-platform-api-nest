@@ -79,6 +79,16 @@ export class GamesController {
     return this.games.restoreLocalSaveSnapshot(gameKey, id, user, body);
   }
 
+  @Post('games/:gameKey/sessions/:id/claim-win')
+  claimDisconnectedWin(@Param('gameKey') gameKey: string, @Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.claimDisconnectedWin(gameKey, id, user);
+  }
+
+  @Post('games/:gameKey/sessions/:id/wait')
+  waitForOpponent(@Param('gameKey') gameKey: string, @Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.waitForOpponent(gameKey, id, user);
+  }
+
   @Post('gomoku/sessions')
   createGomoku(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
     return this.games.createGomokuSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium');

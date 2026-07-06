@@ -81,7 +81,7 @@ const ALKKAGI_AI_BUDGET_MS = 1_400;
 const LOCAL_AI_RESPONSE_DELAY_MS = 180;
 const FORTRESS_AI_RESPONSE_DELAY_MS = 1_000;
 const FORTRESS_SHOT_ANIMATION_MS = 2_800;
-const DISCONNECT_GRACE_MS = 10_000;
+const DISCONNECT_GRACE_MS = intEnv('GAME_PLATFORM_DISCONNECT_GRACE_SECONDS', 60) * 1000;
 const EMOTE_COOLDOWN_MS = 3_000;
 const MATCH_PAUSE_LIMIT = 3;
 const MATCH_PAUSE_RESUME_LOCK_MS = 3_000;
@@ -225,6 +225,79 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.clearTurnTimer(row.id);
     }
     return result.rows.length;
+  }
+
+  async claimDisconnectedWin(gameKey: string, id: string, user: AuthAccount): Promise<GomokuSession | AlkkagiSession> {
+    const { key, session } = await this.requireDisconnectClaimable(gameKey, id, user);
+    const absentAccountId = session.networkGraceAccountId as string;
+    if (await this.realtime.isAccountOnline(absentAccountId)) {
+      // 상대가 돌아와 있으면 몰수 대신 턴을 재개한다.
+      this.startTimedTurn(session, key);
+      const resumed = key === 'gomoku'
+        ? this.gomokuFromRow(await this.updateGame(session.id, session.status, (session as GomokuSession).currentTurn, session.winner ?? null, session))
+        : this.alkkagiFromRow(await this.updateGame(session.id, session.status, (session as AlkkagiSession).currentTurn, session.winner ?? null, session));
+      this.scheduleTurnTimer(resumed, key);
+      this.emitSessionEvent(resumed, 'game.opponent_returned', resumed);
+      throw new ConflictException({
+        statusCode: 409,
+        code: 'OPPONENT_RECONNECTED',
+        message: 'Opponent reconnected. The match continues.',
+        error: 'Conflict',
+      });
+    }
+    if (key === 'gomoku') {
+      const gomoku = session as GomokuSession;
+      const mySide = this.participantSide(gomoku.players, user.accountId, gomoku.currentTurn);
+      gomoku.status = 'finished';
+      gomoku.winner = mySide;
+      gomoku.finishReason = 'disconnect';
+      gomoku.updatedAt = new Date().toISOString();
+      this.clearTurnTimer(gomoku.id);
+      const saved = this.gomokuFromRow(await this.updateGame(gomoku.id, gomoku.status, gomoku.currentTurn, gomoku.winner, gomoku));
+      this.emitSessionEvent(saved, 'gomoku.move.played', saved);
+      this.emitSessionEvent(saved, 'game.session.finished', saved);
+      return saved;
+    }
+    const alkkagi = session as AlkkagiSession;
+    const mySide = this.participantSide(alkkagi.players, user.accountId, alkkagi.currentTurn);
+    alkkagi.status = 'finished';
+    alkkagi.winner = mySide;
+    alkkagi.finishReason = 'disconnect';
+    alkkagi.updatedAt = new Date().toISOString();
+    this.clearTurnTimer(alkkagi.id);
+    const saved = this.alkkagiFromRow(await this.updateGame(alkkagi.id, alkkagi.status, alkkagi.currentTurn, alkkagi.winner, alkkagi));
+    this.emitSessionEvent(saved, 'alkkagi.shot.played', { session: saved, animation: { frameMs: 16, frames: [] } });
+    this.emitSessionEvent(saved, 'game.session.finished', saved);
+    return saved;
+  }
+
+  async waitForOpponent(gameKey: string, id: string, user: AuthAccount): Promise<GomokuSession | AlkkagiSession> {
+    // D7: "계속 대기" — 세션은 열린 채 유지되고 언제든 claim-win 할 수 있다. (최후 안전망은 세션 GC)
+    const { session } = await this.requireDisconnectClaimable(gameKey, id, user);
+    return session;
+  }
+
+  private async requireDisconnectClaimable(
+    gameKey: string,
+    id: string,
+    user: AuthAccount,
+  ): Promise<{ key: 'gomoku' | 'alkkagi'; session: GomokuSession | AlkkagiSession }> {
+    if (gameKey !== 'gomoku' && gameKey !== 'alkkagi') {
+      throw new BadRequestException('claim is not supported for this game yet');
+    }
+    const row = await this.requireGameRow(id, gameKey);
+    const session = gameKey === 'gomoku' ? this.gomokuFromRow(row) : this.alkkagiFromRow(row);
+    if (session.mode !== 'friend_match' || session.status !== 'playing') {
+      throw new BadRequestException('Session is not an active match');
+    }
+    if (!session.opponentLeftAt || !session.networkGraceAccountId) {
+      throw new BadRequestException('Opponent has not left the match');
+    }
+    const participants = Object.values(session.players);
+    if (!participants.includes(user.accountId) || user.accountId === session.networkGraceAccountId) {
+      throw new ForbiddenException('Only the remaining player can decide');
+    }
+    return { key: gameKey, session };
   }
 
   async listEmotes(user: AuthAccount): Promise<{ gridSize: 8 | 16; emotes: CustomEmote[] }> {
@@ -2346,6 +2419,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     delete session.networkGraceStartedAt;
     delete session.networkGraceDeadlineAt;
     delete session.networkGraceAccountId;
+    delete session.opponentLeftAt;
   }
 
   private scheduleTurnTimer(session: GomokuSession | AlkkagiSession, gameKey: 'gomoku' | 'alkkagi'): void {
@@ -2420,7 +2494,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     const currentAccountId = session.players[session.currentTurn];
-    if (!this.realtime.isAccountConnected(currentAccountId)) {
+    if (!(await this.realtime.isAccountOnline(currentAccountId))) {
       await this.startDisconnectGrace(session, 'gomoku', currentAccountId);
       return;
     }
@@ -2451,7 +2525,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     const currentAccountId = session.players[session.currentTurn];
-    if (!this.realtime.isAccountConnected(currentAccountId)) {
+    if (!(await this.realtime.isAccountOnline(currentAccountId))) {
       await this.startDisconnectGrace(session, 'alkkagi', currentAccountId);
       return;
     }
@@ -2520,33 +2594,23 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.scheduleTurnTimer(session, gameKey);
       return true;
     }
-    if (this.realtime.isAccountConnected(session.networkGraceAccountId)) {
+    if (await this.realtime.isAccountOnline(session.networkGraceAccountId)) {
       this.clearNetworkGrace(session);
       return false;
     }
-    if (gameKey === 'gomoku') {
-      const gomoku = session as GomokuSession;
-      const loser = this.participantSide(gomoku.players, session.networkGraceAccountId, gomoku.currentTurn);
-      gomoku.status = 'finished';
-      gomoku.winner = loser === 'black' ? 'white' : 'black';
-      gomoku.finishReason = 'disconnect';
-      gomoku.updatedAt = new Date().toISOString();
-      this.clearTurnTimer(gomoku.id);
-      const saved = this.gomokuFromRow(await this.updateGame(gomoku.id, gomoku.status, gomoku.currentTurn, gomoku.winner, gomoku));
-      this.emitSessionEvent(saved, 'gomoku.move.played', saved);
-      this.emitSessionEvent(saved, 'game.session.finished', saved);
+    if (session.opponentLeftAt) {
+      // 이미 상대 결정 대기 상태 — 타이머는 더 돌리지 않는다.
+      this.clearTurnTimer(session.id);
       return true;
     }
-    const alkkagi = session as AlkkagiSession;
-    const loser = this.participantSide(alkkagi.players, session.networkGraceAccountId, alkkagi.currentTurn);
-    alkkagi.status = 'finished';
-    alkkagi.winner = loser === 'red' ? 'blue' : 'red';
-    alkkagi.finishReason = 'disconnect';
-    alkkagi.updatedAt = new Date().toISOString();
-    this.clearTurnTimer(alkkagi.id);
-    const saved = this.alkkagiFromRow(await this.updateGame(alkkagi.id, alkkagi.status, alkkagi.currentTurn, alkkagi.winner, alkkagi));
-    this.emitSessionEvent(saved, 'alkkagi.shot.played', { session: saved, animation: { frameMs: 16, frames: [] } });
-    this.emitSessionEvent(saved, 'game.session.finished', saved);
+    // D7: grace 만료 시 즉시 몰수하지 않고 남은 유저에게 선택권을 준다 (claim-win / 계속 대기).
+    session.opponentLeftAt = new Date().toISOString();
+    session.updatedAt = session.opponentLeftAt;
+    this.clearTurnTimer(session.id);
+    const saved = gameKey === 'gomoku'
+      ? this.gomokuFromRow(await this.updateGame(session.id, session.status, (session as GomokuSession).currentTurn, session.winner ?? null, session))
+      : this.alkkagiFromRow(await this.updateGame(session.id, session.status, (session as AlkkagiSession).currentTurn, session.winner ?? null, session));
+    this.emitSessionEvent(saved, 'game.opponent_left', saved);
     return true;
   }
 

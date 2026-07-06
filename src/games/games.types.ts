@@ -22,6 +22,7 @@ export interface TimedTurnState {
   networkGraceStartedAt?: string;
   networkGraceDeadlineAt?: string;
   networkGraceAccountId?: string;
+  opponentLeftAt?: string;
   pause?: MatchPauseState;
   finishReason?: string;
 }
@@ -82,6 +83,7 @@ export interface GomokuSession {
   networkGraceStartedAt?: string;
   networkGraceDeadlineAt?: string;
   networkGraceAccountId?: string;
+  opponentLeftAt?: string;
   pause?: MatchPauseState;
   finishReason?: string;
   createdAt: string;
@@ -117,6 +119,7 @@ export interface AlkkagiSession {
   networkGraceStartedAt?: string;
   networkGraceDeadlineAt?: string;
   networkGraceAccountId?: string;
+  opponentLeftAt?: string;
   pause?: MatchPauseState;
   lastAim?: {
     accountId: string;
