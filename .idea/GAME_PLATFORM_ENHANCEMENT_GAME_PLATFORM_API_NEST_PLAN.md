@@ -1,6 +1,6 @@
 ---
-status: PREPARED
-summary: "게임 플랫폼 서버 Phase 1–6 — 세션 sliding/refresh 3분류/에러 code 계약, rev·멱등·socket.io·grace 공통화, GameEngine 레지스트리, participants/rooms N인, 세이브→AI fork, 신규 게임 엔진(뱀사다리→고스톱→마이티→리듬→격투)과 기존 게임 보강"
+status: IN_PROGRESS
+summary: "게임 플랫폼 서버 Phase 1–6 — 세션 sliding/refresh 3분류/에러 code 계약, rev·멱등·socket.io·grace 공통화, GameEngine 레지스트리, participants/rooms N인, 세이브 이어하기(대전→AI/솔로 복원), 신규 게임 엔진(뱀사다리→고스톱→마이티→리듬→격투)과 기존 게임 보강"
 ---
 
 # GAME_PLATFORM_ENHANCEMENT — game-platform-api-nest execution plan
@@ -9,7 +9,7 @@ Canonical orchestration plan: **workspace root** `.idea/GAME_PLATFORM_ENHANCEMEN
 
 ## Repo Responsibility
 
-게임 플랫폼 서버의 전 Phase 구현. 세션이 일시 장애로 죽지 않게 하고(P1), 재연결 프로토콜과 socket.io 채널을 만들고(P2), 게임 추가가 "엔진 파일 1개 + 등록 1줄"이 되도록 플랫폼화하고(P3), N인 룸(P4)·세이브→AI fork(P5)·신규 게임 5종과 기존 게임 보강(P6)을 제공한다.
+게임 플랫폼 서버의 전 Phase 구현. 세션이 일시 장애로 죽지 않게 하고(P1), 재연결 프로토콜과 socket.io 채널을 만들고(P2), 게임 추가가 "엔진 파일 1개 + 등록 1줄"이 되도록 플랫폼화하고(P3), N인 룸(P4)·세이브 이어하기(P5)·신규 게임 5종과 기존 게임 보강(P6)을 제공한다.
 
 ## Inputs / Dependencies
 
@@ -55,17 +55,20 @@ Canonical orchestration plan: **workspace root** `.idea/GAME_PLATFORM_ENHANCEMEN
 1. DDL 추가(root §2.3): `game_session_players`(seat/kind/ai_difficulty/status/result), `game_rooms`, `game_room_members`. 기동 backfill: 기존 행 → seat0=owner, seat1=opponent. 기존 컬럼은 읽기 호환 유지.
 2. rooms API: `POST /api/rooms`, `GET /api/rooms/:id`, `invite`(친구·온라인 검증 재사용)/`join {roomCode}`/`ready`/`start`(host, min 충족 시). 이벤트 `room.member_joined/ready/left`, `room.started {sessionId}`. **기존 1:1 매치 초대 = 2인 룸 자동 시작 shortcut 으로 재정의**(match_requests 유지).
 3. 턴 일반화: `currentSeat` + `turnOrder[]`, left/forfeited 스킵. 2인 게임은 seat0/1 ↔ 기존 색 매핑으로 무변경.
-4. **splendor 2–4인(D4)**: 은행 토큰 2인 4·3인 5·4인 7(splendor-engine.ts:106 파라미터화), 귀족 타일 = 인원+1, 이진 턴 토글(:795-809) → 로테이션. **2인은 기존과 완전 동일 동작 보장**. sudoku 배틀/sokoban 레이스 2–4인(side Record → seat 배열).
+4. **splendor 2–4인(D4)**: 은행 토큰 2인 4·3인 5·4인 7(splendor-engine.ts:106 파라미터화), 귀족 타일 = 인원+1, 이진 턴 토글(:795-809) → 로테이션. **2인은 기존과 완전 동일 동작 보장**. sudoku 배틀/sokoban 레이스 2–6인(side Record → seat 배열).
 5. friendStats(social.service.ts:198-249)를 participants 조인 기준으로 재작성.
 
-### Phase 5 — 세이브 슬롯 → AI fork (root §3, D5·D6·D9)
+### Phase 5 — 세이브 슬롯 → 매칭 종료 후 이어하기 (root §3, D5·D6·D9)
 
 1. `game_saves` DDL(root §3.2 — 계정×게임×슬롯 1..3, full state + my_seat + players_json + state_version, created_at 은 Asia/Seoul 표기 원칙 준수).
-2. API: `POST /api/games/:gameKey/sessions/:id/save {slot, label?}`(참가자 전원, **friend_match 포함**, 언제든 — D5), `GET /api/saves?gameKey=`, `POST /api/saves/:id/continue {difficulty}`(**fork**: 새 local_ai 세션 — 저장자 seat 유지, 나머지 seat AI, 턴/데드라인 재설정, 원본 세이브·원본 세션 불변), `DELETE /api/saves/:id`.
+2. API: `POST /api/games/:gameKey/sessions/:id/save {slot, label?}`(참가자 전원, **friend_match 포함**, 언제든 — D5), `GET /api/saves?gameKey=`, `POST /api/saves/:id/continue {difficulty}`, `DELETE /api/saves/:id`.
+   - `source_mode='friend_match'` 이고 원본 세션이 아직 종료되지 않았으면 `continueAvailable=false` + continue 400.
+   - 원본 match 종료 후 대전 전용 게임(gomoku/othello/alkkagi/splendor/fortress/crazy_arcade)은 새 `local_ai` 세션으로 fork 한다. 저장자 seat 유지, 나머지 seat AI, 턴/데드라인 재설정, 원본 세이브·원본 세션 불변.
+   - sudoku/sokoban 은 AI 와 이어서 하는 것이 아니라 저장자가 혼자 같은 퍼즐/맵을 계속 푸는 `solo` 세션으로 복원한다.
 3. 조회/목록은 항상 `viewFor(seat)` 필터 경유 — 세이브로 상대 정보(sudoku solution 등) 훔쳐보기 구조적 차단.
-4. **레이스형 AI 신규**: sudoku(난이도별 셀 채움 속도/오답률), sokoban(기존 BFS 해 경로를 난이도별 속도로 재생). crazy_arcade 는 서버 권위 확립 전 보류(§12.2 아님 — Phase 6.7 과 연동).
-5. **로컬 AI 전적 서버 반영(D9)**: 결과 업로드 엔드포인트 + 저장(클라의 `local-ai-results.json` 이관 수신).
-6. 기존 `local-save-restore`(:1168-1398)는 존치하되 서버 세이브로의 수렴을 문서화(D6 이관은 클라 주도).
+4. sudoku/sokoban 세이브 복원은 `solo` 전용이다. 이 두 게임은 세이브 이어하기를 위한 별도 AI 구현 대상이 아니다. crazy_arcade 는 server-authoritative snapshot 을 저장하고, 이어하기는 다른 대전 게임과 동일하게 `local_ai` 세션으로 fork 한다.
+5. **로컬 AI 전적 서버 반영(D9)**: `POST /api/local-ai-results/batch` 로 클라의 `local-ai-results.json` 배치를 수신하고 `local_ai_results` 에 계정×게임×세션 기준 idempotent 저장.
+6. 기존 `local-save-restore`(:1168-1398)는 존치하되, 로컬 save slot 을 서버 슬롯으로 이관해 제거하지 않는다. 로컬 슬롯은 게임별 최근 플레이 임시 복구 지점이고, 서버 슬롯과 충돌하면 클라가 최신 로컬 기록/서버 저장 기준 중 선택하게 한다.
 
 ### Phase 6 — 신규 게임 + 기존 게임 보강 (root §6, §7, D12·§12.1)
 
@@ -85,13 +88,46 @@ Canonical orchestration plan: **workspace root** `.idea/GAME_PLATFORM_ENHANCEMEN
 - 신규/변경 env 키가 `.env.example` 에 먼저 반영되고 완료 보고에 나열됨: `GAME_PLATFORM_SESSION_IDLE_SECONDS`, `GAME_PLATFORM_SESSION_ABSOLUTE_MAX_AGE_SECONDS`, `GAME_PLATFORM_DISCONNECT_GRACE_SECONDS`, `GAME_PLATFORM_SESSION_ABANDON_DAYS` (+구현 중 추가분).
 - 기능 단위 커밋(Conventional Commits), Phase 내 항목별 계획→구현→검토.
 
+## Progress Log
+
+- 2026-07-06: Phase 4 room/session 1차 구현 — `game_session_players`, `game_rooms`, `game_room_members` DDL/backfill, rooms create/get/join/invite/ready/start API, 2인 room → 기존 match shortcut, 3인 이상 room → participant seat 기반 session skeleton, active sessions participant 기반 조회를 추가. 검증: `npm run test` 43/43 통과.
+- 2026-07-06: Phase 4 Splendor N인 진척 — `createSplendorStateForPlayers` 추가, room 3–4인 Splendor 시작 시 실제 Splendor state(`seat0..seatN`, turnOrder, 인원별 bank token 4/5/7, noble 인원+1)를 생성하도록 변경. Splendor participant 검증/turn advance/final-round/winner 판정을 N인 turnOrder 기반으로 일반화하고, `friendStats` 를 `game_session_players` self-join 기준으로 전환. 검증: `npm run test` 44/44 통과. 잔여: Splendor 3–4인 클라 상세 UI, Crazy Arcade server-authoritative 전환.
+- 2026-07-06: Phase 5 save/continue 1차 구현 — `game_saves`, save/list/continue/delete API, source friend_match 종료 전 continue 차단, 대전 게임 local_ai fork, sudoku/sokoban solo 복원, save view 필터, local AI result batch 업로드를 추가. 검증: `npm run test` 43/43 통과. 잔여: 공통 GameEngine `viewFor/migrate` 로 저장/복원 경로 일원화, crazy_arcade server-authoritative 전환 이후 save 정책 확정.
+- 2026-07-06: Phase 5 save origin 보강 — `POST /saves/:id/continue` 응답에 `{sourceSave:{id,slot,label,updatedAt}}` 를 추가해 클라가 서버 save 에서 재개한 세션의 원본 슬롯을 기본 저장 슬롯으로 제안할 수 있게 함. 검증: `npm run test` 44/44 통과.
+- 2026-07-06: Phase 4 Sudoku/Sokoban 6인 race state/action 보강 — 3인 이상 room start 시 skeleton 대신 실제 Sudoku puzzle/solution/side별 board·battle·progress, Sokoban map/side별 state 를 생성하도록 변경. `SudokuSide`/`SokobanSide` 를 `seatN` 가능한 side 로 일반화하고 participant 검증·유저별 view·cell update·sokoban state 조회를 players map 기반으로 확장. Sudoku N인 damage 대상은 진행률 기준 가장 가까운 앞선 상대 1명. 검증: `npm run test` 44/44 통과. 잔여: Flutter race 진행률/결과 UI, Crazy Arcade server-authoritative 전환, 공통 GameEngine 오케스트레이터 이식.
+- 2026-07-06: Phase 4 N인 emote sender 보강 — `game.emote.sent` payload 에 `senderSide` 를 추가해 3인 이상 room 에서 감정표현 발신자를 클라가 side 기준으로 표시할 수 있게 함. `custom_emotes` FakeDb/realtime capture 테스트를 추가. 검증: `npm run test` 45/45 통과.
+- 2026-07-06: Phase 3 disconnect grace 1차 확장 — Fortress `friend_match` 타이머가 오프라인 턴 플레이어를 감지하면 `networkGrace*` + `game.turn.network_waiting` 으로 전환하고, grace 만료 후 `claim-win`/`wait` 선택 플로우를 Gomoku/Alkkagi 와 동일하게 지원하도록 확장. `GameDescriptor.graceSeconds` 를 Gomoku/Alkkagi/Fortress 에 명시. 검증: `npm run test` 46/46 통과. 잔여: Crazy Arcade server-authoritative 전환을 GameEngine 공통 orchestrator 로 흡수.
+- 2026-07-06: Phase 3 Crazy Arcade server-authoritative 1차 전환 — `crazy-arcade-engine.ts` 를 추가해 서버가 map/player/bomb/flame/item snapshot 을 생성·전진하고, `friend_match` 의 `/input` 이 서버 tick 을 수행해 `crazy_arcade.state.synced` 를 브로드캐스트하도록 변경. `/sync` 는 더 이상 host snapshot 으로 matched state 를 덮어쓰지 않고 서버 snapshot 전진만 수행. opponent 응답은 `player`/`opponent` snapshot 을 viewer 기준으로 swap. 검증: `npm run test` 47/47 통과. 잔여: socket.io input queue + 주기 server tick + GameEngine `realtimeServer` 훅으로 이식.
+- 2026-07-06: Phase 3 GameRegistry 런타임 메타 1차 — `GameRegistry` 클래스를 추가해 `listGames`, room 생성/start bounds, save validation 의 게임 메타를 단일 `GAME_DESCRIPTORS` 기준으로 조회하도록 전환. descriptor 반환은 defensive clone 으로 보호하고 Sudoku/Sokoban 6인, Splendor/Crazy Arcade 4인 계약을 테스트로 고정. 검증: `npm run test` 48/48 통과. 잔여: `GameEngine.applyAction/viewFor/migrate` 공통 오케스트레이터로 각 게임 handler 이식.
+- 2026-07-06: Phase 3 공통 action route 1차 — `POST /api/games/:gameKey/sessions/:id/actions {type,payload,clientMoveId}` 를 추가하고 기존 게임별 gameplay 메서드로 위임하는 thin wrapper 를 구현. sudoku `set_cell/submit`, gomoku/othello/sokoban `move`, alkkagi `shoot`, splendor `take_tokens/reserve_card/buy_card`, fortress `select_tank/move/aim/shoot`, crazy_arcade `input` 을 지원하며, 권한/턴/멱등 검사는 기존 메서드 경로를 그대로 사용한다. Gomoku/Othello/Splendor/Alkkagi/Crazy Arcade dispatch 회귀 테스트를 추가. 검증: `npm run test` 49/49 통과. 잔여: 레거시 게임별 라우트는 클라 호환과 emote/preview/drag/forfeit 보조 route 정리 전까지 유지.
+- 2026-07-06: Phase 3 Crazy Arcade 주기 server tick 1차 — 2인 `friend_match` Crazy Arcade 세션에 서버 주도 `setInterval` tick 을 추가해 `/input`/`GET` 요청이 없어도 snapshot 이 전진하고 `crazy_arcade.state.synced` 가 브로드캐스트되도록 변경. 생성/조회/입력/부팅 복구 시 tick 을 보장하고 pause/finish/forfeit/destroy 시 timer 를 정리한다. N인 room skeleton 은 snapshot 구조가 확정되기 전까지 tick 대상에서 제외. 검증: `npm run test` 50/50 통과. 잔여: socket.io input queue 정밀화와 N인 Crazy Arcade state 모델 확정.
+- 2026-07-06: Phase 3 Crazy Arcade disconnect grace 보강 — 서버 tick 이 `friend_match` 참가자 presence 를 검사해 오프라인 감지 시 `networkGrace*` 상태와 `game.turn.network_waiting` 이벤트를 만들고, grace 만료 후 `game.opponent_left` + 기존 `claim-win`/`wait` 선택 흐름으로 연결되도록 확장. `crazy_arcade` 도 `GameDescriptor.graceSeconds=60` 을 노출하며 실제 기본 `GAME_PLATFORM_DISCONNECT_GRACE_SECONDS=60` 과 맞춘다. 검증: `npm run test` 51/51 통과. 잔여: Crazy Arcade N인 state 모델과 socket.io input queue 정밀화.
+- 2026-07-06: Phase 3 Othello turn timer 보강 — `OthelloSession` 에 `turnStartedAt/turnDeadlineAt/networkGrace*` 를 추가하고 20초 `friend_match` 턴 제한을 적용. 타임아웃 시 온라인이면 랜덤 합법수, 둘 수 없으면 패스/종료 규칙을 수행하고, 오프라인이면 60초 disconnect grace 후 `claim-win`/`wait` 흐름으로 연결한다. `GameDescriptor.turnTimerSeconds=20`, `graceSeconds=60` 을 노출하고 회귀 테스트를 추가. 검증: `npm run test` 52/52 통과. Splendor 는 시간 초과 자동 행동 정책(구매/예약/토큰/버릴 토큰) 확정 전까지 제한시간 없이 유지.
+- 2026-07-06: Phase 3 Crazy Arcade N인 room state 보강 — 3~4인 `crazy_arcade` room start 가 generic skeleton 대신 `seat0..seat3` 기반 server-authoritative snapshot/input map 을 생성하도록 수정. `CrazyArcadeSession.players/inputs` 를 동적 side record 로 일반화하고, viewer 별 `player/opponent/others` snapshot 을 제공한다. 4인 room start, participant seat 보존, `seat2` viewer swap, input update 회귀를 기존 rooms 테스트에 추가. 추가로 snapshot 파서가 `seatN` winner 를 보존하도록 수정해 N인 승자 판정 유실을 막았다. 검증: `npm run test` 53/53 통과.
+- 2026-07-06: Phase 4 friend stats winner 일반화 — 전적 계산이 `winnerAccountId` 우선, 없으면 `winnerSide` 또는 legacy `winner` 를 `players` map 으로 역참조하도록 수정. 동적 `seatN` 승자만 남은 Crazy Arcade/N인 state 도 승패에 반영된다. 검증: `npm run test` 53/53 통과.
+- 2026-07-06: Phase 3 Crazy Arcade input 멱등 보강 — `updateCrazyArcadeInput` 에 `clientMoveId` 소비를 추가해 공통 action route 재시도가 중복 입력으로 재적용되지 않도록 수정. 레거시 `/crazy-arcade/sessions/:id/input` 는 body 의 `clientMoveId` 를 payload 와 분리해 같은 서비스 경로로 전달한다. 검증: `npm run test` 53/53 통과.
+- 2026-07-06: Phase 3 Othello GameEngine 이식 1차 — Othello 규칙/AI/점수 계산을 `src/games/othello-engine.ts` 로 분리하고 `OTHELLO_ENGINE` 이 `GameEngine` 계약(`descriptor/createState/applyAction/viewFor/finishInfo/aiAction`)을 구현하도록 추가. `GameRegistry` 의 Othello 메타는 엔진 descriptor 를 직접 사용하고, `engine('othello')` lookup 도 테스트로 고정했다. 기존 service route 는 새 엔진 함수들을 import 해 사용하므로 API 호환은 유지된다. 검증: `npm run test` 54/54 통과, `git diff --check` 통과.
+- 2026-07-06: Phase 3 Gomoku GameEngine 이식 1차 — Gomoku 보드 생성/수 적용/승패 판정/AI 후보 탐색을 `src/games/gomoku-engine.ts` 로 분리하고 `GOMOKU_ENGINE` 이 `GameEngine` 계약을 구현하도록 추가. `GameRegistry` 의 Gomoku 메타는 엔진 descriptor 를 직접 사용하고, `engine('gomoku')` lookup 과 엔진 applyAction 계약을 테스트로 고정했다. 기존 service wrapper 는 타이머·disconnect grace·이벤트 흐름을 유지한다. 검증: `npm run test` 55/55 통과, `git diff --check` 통과.
+- 2026-07-06: Phase 3 Sokoban GameEngine 이식 1차 — Sokoban player state 생성, side/view helper, move 적용, solved/deadlock 판정, solvability search 를 `src/games/sokoban-engine.ts` 로 분리하고 `SOKOBAN_ENGINE` 을 registry 에 등록했다. 기존 service 는 DB 저장·participant auth·emit 흐름을 유지하며 엔진 helper 를 재사용한다. `engine('sokoban')` lookup 과 solo move 완료 계약을 테스트로 고정했다. 검증: `npm run test` 56/56 통과, `git diff --check` 통과.
+- 2026-07-06: Phase 3 Sudoku GameEngine 이식 1차 — Sudoku state/view helper, solution hiding, side별 board/progress, battle damage, cell update/submit 판정을 `src/games/sudoku-engine.ts` 로 분리하고 `SUDOKU_ENGINE` 을 registry 에 등록했다. 기존 service 는 생성·저장·participant auth·emit 흐름을 유지하며 엔진 helper 를 재사용한다. `engine('sudoku')` lookup, solution 은닉, solo set/submit 계약을 테스트로 고정했다. 검증: `npm run test` 57/57 통과, `git diff --check` 통과.
+- 2026-07-06: Phase 3 Alkkagi GameEngine 이식 1차 — 알까기 초기 장기말 배치, 샷 적용, 물리 시뮬레이션, AI 후보 탐색/평가를 `src/games/alkkagi-engine.ts` 로 분리하고 `ALKKAGI_ENGINE` 을 registry 에 등록했다. 기존 service wrapper 는 타이머·disconnect grace·저장·이벤트 흐름을 유지하며 엔진의 `applyAlkkagiShotToSession` 을 사용한다. `engine('alkkagi')` lookup 과 엔진 shot 계약을 테스트로 고정했다. 검증: `npm run test` 58/58 통과, `git diff --check` 통과.
+- 2026-07-06: Phase 3 Splendor GameEngine 이식 1차 — 기존 순수 Splendor rule/AI 함수를 `SPLENDOR_ENGINE` 계약(`descriptor/createState/applyAction/viewFor/finishInfo/aiAction`)으로 감싸고 registry 에 등록했다. `descriptor.turnTimerSeconds` 는 의도적으로 비워 제한시간 없이 유지하며, `viewFor` 는 deck 순서를 숨기고 deckCounts/mySide 만 노출한다. 2인/4인 side 평가가 깨지지 않도록 AI opponent scoring 도 N인 turnOrder 기반으로 보강했다. 검증: `npm run test` 59/59 통과, `git diff --check` 통과.
+- 2026-07-06: Phase 3 Fortress GameEngine 이식 1차 — Fortress state 생성, 탱크 선택, 이동, 조준, 발사, 포기, client view, finishInfo 를 `FORTRESS_ENGINE` 계약으로 감싸고 registry 에 등록했다. 기존 service 의 타이머·AI 스케줄·shot animation 이벤트 경로는 유지하며, 엔진 descriptor 는 20초 턴 제한과 60초 grace 를 노출한다. 검증: `npm run test` 60/60 통과, `git diff --check` 통과.
+- 2026-07-06: Phase 3 Crazy Arcade GameEngine 이식 1차 — Crazy Arcade server snapshot/input/tick 함수를 `CRAZY_ARCADE_ENGINE` 계약(`turnType='realtimeServer'`)으로 감싸고 registry 에 등록했다. 2~4인 dynamic seat snapshot 생성, input action, tick action, viewer별 snapshot 변환, finishInfo 를 테스트로 고정했다. 검증: `npm run test` 61/61 통과, `git diff --check` 통과.
+- 2026-07-06: Phase 3 Crazy Arcade socket.io input queue 보강 — `RealtimeGateway` 가 `crazy_arcade.input` socket event 를 받아 handshake 로 인증된 `AuthAccount` 를 재사용하고, `GamesService.enqueueCrazyArcadeSocketInput` 이 session 별 Promise queue 로 입력을 직렬화한 뒤 기존 `updateCrazyArcadeInput` server-authoritative 경로를 호출하도록 추가했다. socket gateway routing 테스트와 실제 service queue idempotency 테스트를 추가했다. 검증: `npm run test` 63/63 통과, `git diff --check` 통과.
+- 2026-07-06: Phase 5 save preview 엔진 view 보강 — `saveRowView` 가 `GAME_REGISTRY.engine(gameKey).viewFor(...)` 를 우선 사용해 save/list preview 를 생성하도록 변경했다. Splendor save preview 가 deck 원본을 숨기고 `deckCounts/mySide` 만 노출하는 회귀 테스트를 추가했으며, 엔진 view 실패 시 기존 게임별 필터 fallback 은 유지한다. 검증: `npm run test` 64/64 통과, `git diff --check` 통과.
+- 2026-07-06: Phase 5 continue 응답 엔진 view 보강 — `visibleSessionForRow` 가 continue 로 생성된 세션 payload 에도 `GAME_REGISTRY.engine(gameKey).viewFor(...)` 를 우선 적용하도록 변경했다. Splendor continue 응답이 deck 원본을 숨기고 `deckCounts/mySide` 만 노출하는 회귀 테스트를 추가했으며, 엔진 view 실패 시 기존 legacy fallback 을 유지한다. 검증: `npm run test` 65/65 통과, `git diff --check` 통과.
+- 2026-07-06: Phase 3 8게임 공통 오케스트레이터 이관 1차 — 공통 action route 의 `sudoku/set_cell`, `sudoku/submit`, `gomoku/move`, `alkkagi/shoot`, `othello/move`, `sokoban/move`, `splendor/take_tokens|reserve_card|buy_card`, `fortress/select_tank|move|aim|shoot`, `crazy_arcade/input` 처리가 레거시 gameplay wrapper 를 다시 호출하지 않고 `GAME_REGISTRY.engine(gameKey).applyAction(...)` 를 직접 호출하도록 변경했다. 레거시 route 는 같은 공통 엔진 경로를 호출하므로 기존 타이머/AI/이벤트/멱등/solution 은닉/deck 은닉 동작을 한곳에서 공유한다. Alkkagi/Fortress 엔진은 animation 을 이벤트 payload 로 반환해 기존 클라 연출을 유지한다. Sokoban 은 기존처럼 실제 이동이 없는 입력은 저장/emit 하지 않고, Sudoku submit 의 solo board payload 적용도 유지한다. Crazy Arcade 는 friend_match/online 입력을 `CRAZY_ARCADE_ENGINE.applyAction` 으로 처리하되, 로컬/AI 입력 저장 경로는 앱 로컬 루프 보존을 위해 기존 의미를 유지한다. generic action/매칭 입력 테스트가 엔진 호출을 직접 검증하도록 보강했다. 검증: `npm run test` 65/65 통과, `git diff --check` 통과.
+- 2026-07-06: Phase 3 공통 create/get route 보강 — `POST /api/games/:gameKey/sessions`, `GET /api/games/:gameKey/sessions/:id` 를 추가해 8게임 세션 생성/조회가 공통 URL 로도 가능하게 했다. 기존 게임별 route 는 클라 호환을 위해 유지하며, 공통 route 는 기존 생성/조회 메서드로 dispatch 한다. 회귀 테스트가 8게임 모두 공통 create/get 으로 세션을 만들고 조회하는지 검증한다. 검증: `npm run test` 66/66 통과, `git diff --check` 통과.
+- 2026-07-06: Phase 5 Crazy Arcade 서버 save 지원 — `CRAZY_ARCADE_ENGINE.descriptor.supportsMatchSave=true` 로 전환하고, 저장된 server-authoritative snapshot 을 원본 match 종료 후 `local_ai` 세션으로 fork 하도록 확정했다. fork 시 저장자를 제외한 플레이어는 `__game_platform_local_ai__` 로 치환하고 `inputs` 는 동적 side 기준으로 초기화한다. 회귀 테스트가 진행 중 continue 400, 종료 후 continue local_ai, preview side 은닉/표시, 슬롯 metadata 를 검증한다. 검증: `npm run test` 66/66 통과, `git diff --check` 통과.
+
 ## Report Back To Orchestrator
 
 - guard `code` 계약/이벤트 rev/socket.io 채널의 확정 스펙(flutter 착수 신호).
 - auth 로 제출할 TTL update request 내용과 승인 결과.
 - rooms/participants 도입 시 기존 클라 호환성 확인 결과(2인 shortcut).
 - 신규 게임별 착수 시 확정이 필요한 룰 옵션 목록(뱀사다리 보드 규칙, 고스톱 지방룰, 마이티 공약 표기).
-- 남은 위험: crazy_arcade 서버 권위 수준, 다중 인스턴스 확장(타이머/락 메모리 상주) — 단일 인스턴스 전제 유지 여부.
+- 남은 위험: 다중 인스턴스 확장(타이머/락/입력 queue 메모리 상주) — 단일 인스턴스 전제 유지 여부.
 
 ## Decision Escalation
 
