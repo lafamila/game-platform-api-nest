@@ -586,6 +586,14 @@ class FakeDb {
       this.rows.set(row.id, row);
       return { rows: [row] };
     }
+    if (sql.includes('FROM game_sessions') && sql.includes('ORDER BY updated_at')) {
+      const active = [...this.rows.values()].filter(
+        (row) =>
+          !['finished', 'cleared', 'failed'].includes(row.status) &&
+          (row.owner_account_id === args[0] || row.opponent_account_id === args[0]),
+      );
+      return { rows: active };
+    }
     if (sql.includes('FROM sokoban_maps')) {
       return { rows: this.sokobanMaps.filter((row) => row.difficulty === args[0]).slice(0, 1) };
     }
@@ -650,4 +658,23 @@ test('stale game session writes fail with a state conflict', async () => {
 
   const latest = await service.getGomokuSession(session.id, user);
   assert.equal(latest.moves.length, 1);
+});
+
+test('active session list returns my unfinished sessions', async () => {
+  const service = new GamesService(new FakeDb(), new FakeRealtime());
+  const session = await service.createGomokuSession(user, undefined, undefined, 'medium');
+
+  const mine = await service.listActiveSessions(user);
+  assert.equal(mine.sessions.length, 1);
+  assert.equal(mine.sessions[0].sessionId, session.id);
+  assert.equal(mine.sessions[0].gameKey, 'gomoku');
+  assert.equal(mine.sessions[0].rev, 1);
+  assert.equal(mine.sessions[0].myTurn, true);
+
+  const theirs = await service.listActiveSessions(opponent);
+  assert.equal(theirs.sessions.length, 0);
+
+  await service.forfeitGomoku(session.id, user);
+  const after = await service.listActiveSessions(user);
+  assert.equal(after.sessions.length, 0);
 });

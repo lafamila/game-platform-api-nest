@@ -215,6 +215,19 @@ export interface CrazyArcadeSession {
   updatedAt: string;
 }
 
+export interface ActiveGameSessionSummary {
+  sessionId: string;
+  gameKey: string;
+  mode: string;
+  status: string;
+  rev: number;
+  opponentAccountIds: string[];
+  currentTurnAccountId?: string;
+  myTurn?: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface CustomEmote {
   slot: number;
   gridSize: 8 | 16;

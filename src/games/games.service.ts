@@ -65,6 +65,7 @@ import {
   SokobanPosition,
   SokobanSession,
   SokobanSide,
+  ActiveGameSessionSummary,
 } from './games.types';
 
 const GOMOKU_SIZE = 15;
@@ -156,6 +157,37 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       { key: 'fortress', title: 'Fortress', modes: ['local_ai', 'friend_match'], status: 'playable' },
       { key: 'crazy_arcade', title: 'Crazy Arcade', modes: ['local_ai', 'friend_match'], status: 'playable' },
     ];
+  }
+
+  async listActiveSessions(user: AuthAccount): Promise<{ sessions: ActiveGameSessionSummary[] }> {
+    const result = await this.db.query<GameRow>(
+      `SELECT * FROM game_sessions
+       WHERE status NOT IN ('finished', 'cleared', 'failed')
+         AND (owner_account_id = $1 OR opponent_account_id = $1)
+       ORDER BY updated_at DESC
+       LIMIT 50`,
+      [user.accountId],
+    );
+    const sessions = result.rows.map((row) => {
+      const state = row.state_json as { rev?: number; players?: Record<string, string> };
+      const players = state.players ?? {};
+      const currentTurnAccountId = row.current_turn ? players[row.current_turn] : undefined;
+      return {
+        sessionId: row.id,
+        gameKey: row.game_key,
+        mode: row.mode,
+        status: row.status,
+        rev: state.rev ?? 0,
+        opponentAccountIds: Object.values(players).filter(
+          (accountId) => Boolean(accountId) && accountId !== user.accountId,
+        ),
+        currentTurnAccountId,
+        myTurn: currentTurnAccountId ? currentTurnAccountId === user.accountId : undefined,
+        createdAt: new Date(row.created_at).toISOString(),
+        updatedAt: new Date(row.updated_at).toISOString(),
+      };
+    });
+    return { sessions };
   }
 
   async listEmotes(user: AuthAccount): Promise<{ gridSize: 8 | 16; emotes: CustomEmote[] }> {

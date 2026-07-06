@@ -15,6 +15,11 @@ export class GamesController {
     return { games: this.games.listGames() };
   }
 
+  @Get('sessions/active')
+  listActiveSessions(@CurrentUser() user: AuthAccount) {
+    return this.games.listActiveSessions(user);
+  }
+
   @Get('emotes')
   listEmotes(@CurrentUser() user: AuthAccount) {
     return this.games.listEmotes(user);
