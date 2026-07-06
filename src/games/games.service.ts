@@ -4969,7 +4969,11 @@ function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSessi
 }
 
 function isLocalAiAccount(accountId: string): boolean {
-  return accountId === LOCAL_AI_ACCOUNT_ID;
+  // 기존 sentinel 과, N인 세이브 fork/멀티 좌석용 `<sentinel>#<seat>` 형식(M5)을 모두 인식한다.
+  return (
+    typeof accountId === 'string' &&
+    (accountId === LOCAL_AI_ACCOUNT_ID || accountId.startsWith(`${LOCAL_AI_ACCOUNT_ID}#`))
+  );
 }
 
 function inferSessionSeats(
@@ -5144,11 +5148,20 @@ function forkSavedStateForLocalAi(gameKey: string, stateValue: unknown, accountI
   state.turnStartedAt = undefined;
   state.turnDeadlineAt = undefined;
   state.finishReason = undefined;
+  // 이어하기 세션은 더 이상 룸 게임이 아니므로 룸 메타데이터를 제거한다. 특히 roomPlayers 를 남겨두면
+  // inferSessionSeats 가 players 레코드 대신 (전부 human 인) 옛 roomPlayers 를 좌석 진실원본으로 써서
+  // AI 좌석이 account 로 잘못 기록된다(M5 — 승자 귀속 모호 방지).
+  state.roomPlayers = undefined;
+  state.roomId = undefined;
+  state.roomCode = undefined;
+  state.roomMode = undefined;
   const players = isRecord(state.players) ? state.players : undefined;
   if (players) {
-    for (const key of Object.keys(players)) {
-      players[key] = players[key] === accountId ? accountId : LOCAL_AI_ACCOUNT_ID;
-    }
+    // 저장자 좌석은 그대로 두고, 나머지 좌석마다 고유한 `<sentinel>#<seat>` AI id 를 부여한다(M5).
+    // 좌석 인덱스는 players 삽입 순서(= turnOrder/seat 순서)를 따른다.
+    Object.keys(players).forEach((key, index) => {
+      players[key] = players[key] === accountId ? accountId : `${LOCAL_AI_ACCOUNT_ID}#${index}`;
+    });
   }
   if (typeof state.ownerAccountId === 'string') {
     state.ownerAccountId = accountId;
