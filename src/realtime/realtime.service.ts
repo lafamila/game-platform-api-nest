@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { MessageEvent } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { Observable, Subject, interval, map, merge } from 'rxjs';
+import type { Server } from 'socket.io';
 import { PresenceService } from './presence.service';
 
 export interface PresenceChange {
@@ -14,6 +15,8 @@ export class RealtimeService {
   private readonly accountStreams = new Map<string, Subject<MessageEvent>>();
   private readonly connectionCounts = new Map<string, number>();
   private readonly presenceSubject = new Subject<PresenceChange>();
+  private readonly socketRefreshTimers = new Map<string, ReturnType<typeof setInterval>>();
+  private socketServer?: Server;
 
   constructor(private readonly presence: PresenceService) {}
 
@@ -52,11 +55,45 @@ export class RealtimeService {
 
   emitToAccounts(accountIds: string[], event: string, data: unknown): void {
     for (const accountId of accountIds.filter(Boolean)) {
+      const payload = normalizeMessageData(data);
       this.subjectFor(accountId).next({
         type: event,
-        data: normalizeMessageData(data),
+        data: payload,
       });
+      this.socketServer?.to(`account:${accountId}`).emit(event, payload);
     }
+  }
+
+  attachSocketServer(server: Server): void {
+    this.socketServer = server;
+  }
+
+  registerSocketConnection(accountId: string, connectionId: string): void {
+    this.setConnectionCount(accountId, 1);
+    void this.presence.connect(accountId, connectionId).then((changed) => {
+      if (changed) {
+        this.presenceSubject.next({ accountId, online: true });
+      }
+    });
+    const refreshTimer = setInterval(() => {
+      void this.presence.refresh(accountId, connectionId);
+    }, 25_000);
+    refreshTimer.unref?.();
+    this.socketRefreshTimers.set(connectionId, refreshTimer);
+  }
+
+  unregisterSocketConnection(accountId: string, connectionId: string): void {
+    const timer = this.socketRefreshTimers.get(connectionId);
+    if (timer) {
+      clearInterval(timer);
+      this.socketRefreshTimers.delete(connectionId);
+    }
+    this.setConnectionCount(accountId, -1);
+    void this.presence.disconnect(accountId, connectionId).then((changed) => {
+      if (changed) {
+        this.presenceSubject.next({ accountId, online: false });
+      }
+    });
   }
 
   isAccountConnected(accountId: string | undefined): boolean {

@@ -8,6 +8,7 @@ import { GamePlatformSessionService } from './auth/session.service';
 import { GamePlatformSessionGuard } from './auth/session.guard';
 import { SessionController } from './auth/session.controller';
 import { RealtimeController } from './realtime/realtime.controller';
+import { RealtimeGateway } from './realtime/realtime.gateway';
 import { RealtimeService } from './realtime/realtime.service';
 import { PresenceService } from './realtime/presence.service';
 import { SocialController } from './social/social.controller';
@@ -26,6 +27,7 @@ import { DiagnosticsService } from './diagnostics/diagnostics.service';
     SocialService,
     DiagnosticsService,
     RealtimeService,
+    RealtimeGateway,
     PresenceService,
   ],
 })
