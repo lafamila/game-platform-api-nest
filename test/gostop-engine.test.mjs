@@ -686,3 +686,109 @@ test('reaching threshold moves to go_stop instead of passing the turn', () => {
   assert.equal(s.goStopSeat, 0);
   assert.equal(s.currentSeat, 0); // 턴 유지
 });
+
+// ---------------------------------------------------------------------------
+// C4: end-to-end round → settlement → continuous integration
+// ---------------------------------------------------------------------------
+
+// 규칙 준수 최소 드라이버: go_stop 은 무조건 stop, 선택은 첫 옵션, 그 외엔 손패 첫 장.
+function autoDrive(state, { maxSteps = 200000 } = {}) {
+  let steps = 0;
+  while (state.status === 'playing' && steps < maxSteps) {
+    steps += 1;
+    if (state.phase === 'go_stop') {
+      GOSTOP_ENGINE.applyAction(state, state.goStopSeat, { type: 'stop' });
+    } else if (state.phase === 'settled') {
+      GOSTOP_ENGINE.applyAction(state, state.currentSeat, { type: 'next_round' });
+    } else if (state.phase === 'flip_choice') {
+      const seat = state.pending.seat;
+      GOSTOP_ENGINE.applyAction(state, seat, {
+        type: 'flip_choice',
+        payload: { cardId: state.pendingChoice.options[0] },
+      });
+    } else {
+      const seat = state.currentSeat;
+      const cardId = state.hands[seat][0].id;
+      GOSTOP_ENGINE.applyAction(state, seat, { type: 'play_card', payload: { cardId } });
+    }
+    // 전역 재화는 항상 zero-sum(참가자 간 이동만).
+    const total = state.balances.reduce((sum, b) => sum + b, 0);
+    assert.equal(total, state.seatCount * state.config.startingBalance, 'balance must be zero-sum');
+  }
+  return steps;
+}
+
+test('a full 2인 session plays to a finish without exceptions and stays zero-sum', () => {
+  let finished = 0;
+  for (let i = 0; i < 12; i += 1) {
+    const s = createGostopState(seats(2), 'local_ai', { seed: `e2e2-${i}` });
+    autoDrive(s);
+    assert.ok(['playing', 'finished'].includes(s.status));
+    if (s.status === 'finished') {
+      finished += 1;
+      assert.ok(['bankrupt', 'opponent_left'].includes(s.finishReason));
+      assert.ok(s.gameWinner);
+    }
+  }
+  assert.ok(finished > 0, 'at least some 2인 sessions must finish via bankruptcy');
+});
+
+test('a full 3인 session plays to a finish without exceptions and stays zero-sum', () => {
+  let finished = 0;
+  for (let i = 0; i < 12; i += 1) {
+    const s = createGostopState(seats(3), 'local_ai', { seed: `e2e3-${i}` });
+    autoDrive(s);
+    assert.ok(['playing', 'finished'].includes(s.status));
+    if (s.status === 'finished') {
+      finished += 1;
+      assert.ok(['bankrupt', 'opponent_left'].includes(s.finishReason));
+    }
+  }
+  assert.ok(finished > 0, 'at least some 3인 sessions must finish');
+});
+
+test('rounds are continuous: roundNumber increments and dealer follows the last winner', () => {
+  // 여러 판이 진행되는 세션을 찾아 연속성 확인.
+  let observed = false;
+  for (let i = 0; i < 30 && !observed; i += 1) {
+    const s = createGostopState(seats(2), 'local_ai', { seed: `cont-${i}` });
+    let lastRound = s.roundNumber;
+    let sawSecondRound = false;
+    let steps = 0;
+    while (s.status === 'playing' && steps < 200000) {
+      steps += 1;
+      if (s.phase === 'go_stop') {
+        const winner = s.goStopSeat;
+        GOSTOP_ENGINE.applyAction(s, winner, { type: 'stop' });
+        if (s.phase === 'settled' && !s.lastRoundResult.nagari) {
+          // 다음 판 선 = 직전 승자.
+          assert.equal(s.dealer, s.lastRoundResult.winnerSeat);
+        }
+      } else if (s.phase === 'settled') {
+        GOSTOP_ENGINE.applyAction(s, s.currentSeat, { type: 'next_round' });
+        if (s.roundNumber > lastRound + 0 && s.roundNumber >= 2) sawSecondRound = true;
+        lastRound = s.roundNumber;
+      } else if (s.phase === 'flip_choice') {
+        GOSTOP_ENGINE.applyAction(s, s.pending.seat, { type: 'flip_choice', payload: { cardId: s.pendingChoice.options[0] } });
+      } else {
+        GOSTOP_ENGINE.applyAction(s, s.currentSeat, { type: 'play_card', payload: { cardId: s.hands[s.currentSeat][0].id } });
+      }
+    }
+    if (sawSecondRound) observed = true;
+  }
+  assert.ok(observed, 'expected at least one session to reach a second round');
+});
+
+test('viewFor exposes pendingChoice while awaiting a flip choice', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_1_1', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_9_2', 'hwatu_9_3']],
+    deck: ['hwatu_7_4', 'hwatu_9_1'],
+  });
+  s.firstTurnPlayed = true;
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_1_1' });
+  const view = gostopViewFor(s, 0);
+  assert.equal(view.phase, 'flip_choice');
+  assert.ok(view.pendingChoice);
+  assert.equal(view.pendingChoice.type, 'flip_pick');
+});
