@@ -934,6 +934,12 @@ export const GOSTOP_ENGINE: GameEngine<GostopSession> = {
     }
     const payload = action.payload ?? {};
     switch (action.type) {
+      case 'play_card':
+        applyGostopPlayCard(state, seat, payload);
+        break;
+      case 'flip_choice':
+        applyGostopFlipChoice(state, seat, payload);
+        break;
       case 'go':
         applyGostopGo(state, seat);
         break;
@@ -946,14 +952,9 @@ export const GOSTOP_ENGINE: GameEngine<GostopSession> = {
       case 'forfeit':
         applyGostopForfeit(state, seat);
         break;
-      case 'play_card':
-      case 'flip_choice':
-        // 턴 상태머신은 C3 에서 구현한다.
-        throw new BadRequestException(`gostop action not implemented yet: ${action.type}`);
       default:
         throw new BadRequestException(`unsupported gostop action: ${action.type}`);
     }
-    void payload;
     return { state };
   },
   viewFor(state: GostopSession, seat: number | 'spectator') {
@@ -973,3 +974,378 @@ export const GOSTOP_ENGINE: GameEngine<GostopSession> = {
     return oldState as GostopSession;
   },
 };
+
+// ---------------------------------------------------------------------------
+// 턴 상태머신 (play_card / flip_choice) 및 특수(뻑/첫뻑/쪽/따닥/싹쓸이/흔들기/폭탄)
+// ---------------------------------------------------------------------------
+
+function floorIndexForMonth(state: GostopSession, month: number): number {
+  return state.floor.findIndex((stack) => stack.cards.length > 0 && stack.cards[0].month === month);
+}
+
+function placeOnFloor(state: GostopSession, card: GostopCard): void {
+  const idx = floorIndexForMonth(state, card.month);
+  if (idx >= 0) {
+    state.floor[idx].cards.push(card);
+  } else {
+    state.floor.push({ cards: [card] });
+  }
+}
+
+function removeFloorStack(state: GostopSession, idx: number): GostopCard[] {
+  const [stack] = state.floor.splice(idx, 1);
+  return stack.cards;
+}
+
+/** 상대(다음 좌석부터)에게서 피를 count 장 뺏어 actor 획득으로 옮긴다. 일반 피 우선. */
+function stealPi(state: GostopSession, actorSeat: number, count: number): void {
+  for (let taken = 0; taken < count; taken += 1) {
+    let moved = false;
+    for (let step = 1; step < state.seatCount && !moved; step += 1) {
+      const candidate = (actorSeat + step) % state.seatCount;
+      if (state.seatStatus[sideForSeat(candidate)] !== 'active') {
+        continue;
+      }
+      const captures = state.captures[candidate];
+      // 일반 피 우선, 없으면 쌍피.
+      let pick = captures.findIndex((card) => card.kind === 'pi');
+      if (pick < 0) {
+        pick = captures.findIndex((card) => card.kind === 'ssangpi');
+      }
+      if (pick >= 0) {
+        const [card] = captures.splice(pick, 1);
+        state.captures[actorSeat].push(card);
+        moved = true;
+      }
+    }
+    if (!moved) {
+      break; // 뺏을 피가 없음
+    }
+  }
+}
+
+interface GostopPlayInfo {
+  kind: 'place' | 'match1' | 'match2' | 'match3';
+}
+
+export function applyGostopPlayCard(state: GostopSession, seat: number, payload: Record<string, unknown>): void {
+  if (state.phase !== 'playing') {
+    throw new BadRequestException('not in the playing phase');
+  }
+  if (seat !== state.currentSeat) {
+    throw new BadRequestException('not your turn');
+  }
+  const cardId = typeof payload.cardId === 'string' ? payload.cardId : undefined;
+  if (!cardId) {
+    throw new BadRequestException('cardId is required');
+  }
+  const hand = state.hands[seat];
+  const handIdx = hand.findIndex((card) => card.id === cardId);
+  if (handIdx < 0) {
+    throw new BadRequestException('card is not in hand');
+  }
+  const played = hand[handIdx];
+
+  if (payload.bomb === true) {
+    applyGostopBomb(state, seat, played);
+    return;
+  }
+
+  const events: GostopEvent[] = [];
+  if (payload.shake === true) {
+    const monthCount = hand.filter((card) => card.month === played.month).length;
+    if (monthCount < 3) {
+      throw new BadRequestException('shake requires 3 same-month cards in hand');
+    }
+    state.shakeCount[seat] += 1;
+    events.push('shake');
+  }
+
+  hand.splice(handIdx, 1);
+  const captured: GostopCard[] = [];
+  const m = played.month;
+  const idx = floorIndexForMonth(state, m);
+
+  if (idx < 0) {
+    placeOnFloor(state, played);
+    continueGostopTurnWithFlip(state, seat, played, { kind: 'place' }, captured, events);
+    return;
+  }
+  const stack = state.floor[idx];
+  const len = stack.cards.length;
+  if (len === 1) {
+    continueGostopTurnWithFlip(state, seat, played, { kind: 'match1' }, captured, events);
+    return;
+  }
+  if (len === 2) {
+    const matchChoice = typeof payload.matchChoice === 'string' ? payload.matchChoice : undefined;
+    if (!matchChoice) {
+      state.pendingChoice = { type: 'match_pick', options: stack.cards.map((card) => card.id) };
+      state.pending = { seat, playedId: played.id, captured: [], events, pendingMonth: m, fromFlip: false };
+      state.phase = 'flip_choice';
+      touch(state);
+      return;
+    }
+    const chosenIdx = stack.cards.findIndex((card) => card.id === matchChoice);
+    if (chosenIdx < 0) {
+      throw new BadRequestException('invalid matchChoice');
+    }
+    const [chosen] = stack.cards.splice(chosenIdx, 1);
+    captured.push(played, chosen);
+    continueGostopTurnWithFlip(state, seat, played, { kind: 'match2' }, captured, events);
+    return;
+  }
+  // len === 3
+  const wasPpeok = stack.ppeok === true;
+  const floorCards = removeFloorStack(state, idx);
+  captured.push(played, ...floorCards);
+  if (wasPpeok) {
+    events.push('ppeok_eaten');
+    stealPi(state, seat, 1);
+  }
+  continueGostopTurnWithFlip(state, seat, played, { kind: 'match3' }, captured, events);
+}
+
+function applyGostopBomb(state: GostopSession, seat: number, played: GostopCard): void {
+  const m = played.month;
+  const hand = state.hands[seat];
+  const monthCards = hand.filter((card) => card.month === m);
+  if (monthCards.length < 3) {
+    throw new BadRequestException('bomb requires 3 same-month cards in hand');
+  }
+  const floorIdx = floorIndexForMonth(state, m);
+  if (floorIdx < 0) {
+    throw new BadRequestException('bomb requires a matching floor card');
+  }
+  const toPlay = monthCards.slice(0, 3);
+  for (const card of toPlay) {
+    const i = hand.findIndex((c) => c.id === card.id);
+    hand.splice(i, 1);
+  }
+  const floorCards = removeFloorStack(state, floorIdx);
+  const captured: GostopCard[] = [...toPlay, ...floorCards];
+  const events: GostopEvent[] = ['bomb'];
+  state.bombCount[seat] += 1;
+  stealPi(state, seat, 1);
+  continueGostopTurnWithFlip(state, seat, played, { kind: 'match3' }, captured, events);
+}
+
+/** play 해석 후 더미 한 장을 뒤집어 특수(뻑/쪽/따닥)와 매칭을 해석한다. */
+function continueGostopTurnWithFlip(
+  state: GostopSession,
+  seat: number,
+  played: GostopCard,
+  playInfo: GostopPlayInfo,
+  captured: GostopCard[],
+  events: GostopEvent[],
+): void {
+  const m = played.month;
+
+  if (state.deck.length === 0) {
+    // 뒤집을 더미 없음 — play 만 마무리.
+    if (playInfo.kind === 'match1') {
+      const idx = floorIndexForMonth(state, m);
+      const floorCards = removeFloorStack(state, idx);
+      captured.push(played, ...floorCards);
+    }
+    // place: 바닥에 남김 / match2·match3: 이미 획득 처리됨.
+    finalizeGostopTurn(state, seat, played.id, undefined, captured, events);
+    return;
+  }
+
+  const flipCard = state.deck.pop()!;
+  const f = flipCard.month;
+
+  if (playInfo.kind === 'match1') {
+    const idx = floorIndexForMonth(state, m);
+    if (f === m) {
+      // 뻑: 낸 패 + 바닥 1장 + 뒤집은 패 = 동월 3장 묶음. 획득 없음.
+      const floorCards = state.floor[idx].cards;
+      state.floor[idx] = { cards: [...floorCards, played, flipCard], ppeok: true };
+      if (!state.firstTurnPlayed) {
+        events.push('first_ppeok');
+        stealPi(state, seat, 1);
+      } else {
+        events.push('ppeok');
+      }
+      finalizeGostopTurn(state, seat, played.id, flipCard.id, captured, events);
+      return;
+    }
+    const floorCards = removeFloorStack(state, idx);
+    captured.push(played, ...floorCards);
+    resolveGostopFlipCard(state, seat, played, flipCard, captured, events);
+    return;
+  }
+
+  if (playInfo.kind === 'place') {
+    if (f === m) {
+      // 쪽: 낸 패가 매칭 없어 바닥에 놓였는데 뒤집은 패가 낸 패와 동월.
+      const idx = floorIndexForMonth(state, m);
+      const floorCards = removeFloorStack(state, idx); // [played]
+      captured.push(...floorCards, flipCard);
+      events.push('jjok');
+      stealPi(state, seat, 1);
+      finalizeGostopTurn(state, seat, played.id, flipCard.id, captured, events);
+      return;
+    }
+    resolveGostopFlipCard(state, seat, played, flipCard, captured, events);
+    return;
+  }
+
+  if (playInfo.kind === 'match2') {
+    if (f === m) {
+      // 따닥: 바닥 동월 2장을 낸 패 + 뒤집은 패로 모두 획득.
+      const idx = floorIndexForMonth(state, m);
+      const floorCards = removeFloorStack(state, idx); // 남은 1장
+      captured.push(...floorCards, flipCard);
+      events.push('ttadak');
+      stealPi(state, seat, 1);
+      finalizeGostopTurn(state, seat, played.id, flipCard.id, captured, events);
+      return;
+    }
+    resolveGostopFlipCard(state, seat, played, flipCard, captured, events);
+    return;
+  }
+
+  // match3: play 는 이미 획득. 뒤집은 패만 해석.
+  resolveGostopFlipCard(state, seat, played, flipCard, captured, events);
+}
+
+/** 뒤집은 패를 바닥에 대해 해석한다(동월 2장이면 flip_pick 으로 대기). */
+function resolveGostopFlipCard(
+  state: GostopSession,
+  seat: number,
+  played: GostopCard,
+  flipCard: GostopCard,
+  captured: GostopCard[],
+  events: GostopEvent[],
+): void {
+  const f = flipCard.month;
+  const idx = floorIndexForMonth(state, f);
+  if (idx < 0) {
+    placeOnFloor(state, flipCard);
+    finalizeGostopTurn(state, seat, played.id, flipCard.id, captured, events);
+    return;
+  }
+  const stack = state.floor[idx];
+  const len = stack.cards.length;
+  if (len === 1) {
+    const floorCards = removeFloorStack(state, idx);
+    captured.push(flipCard, ...floorCards);
+    finalizeGostopTurn(state, seat, played.id, flipCard.id, captured, events);
+    return;
+  }
+  if (len === 2) {
+    state.pendingChoice = { type: 'flip_pick', options: stack.cards.map((card) => card.id) };
+    state.pending = {
+      seat,
+      playedId: played.id,
+      flippedId: flipCard.id,
+      captured: captured.map((card) => card.id),
+      events,
+      pendingMonth: f,
+      fromFlip: true,
+    };
+    state.phase = 'flip_choice';
+    touch(state);
+    return;
+  }
+  // len === 3
+  const wasPpeok = stack.ppeok === true;
+  const floorCards = removeFloorStack(state, idx);
+  captured.push(flipCard, ...floorCards);
+  if (wasPpeok) {
+    events.push('ppeok_eaten');
+    stealPi(state, seat, 1);
+  }
+  finalizeGostopTurn(state, seat, played.id, flipCard.id, captured, events);
+}
+
+export function applyGostopFlipChoice(state: GostopSession, seat: number, payload: Record<string, unknown>): void {
+  if (state.phase !== 'flip_choice' || !state.pending || !state.pendingChoice) {
+    throw new BadRequestException('no pending choice');
+  }
+  const pending = state.pending;
+  if (seat !== pending.seat) {
+    throw new BadRequestException('not your choice');
+  }
+  const chosenId = typeof payload.cardId === 'string' ? payload.cardId : undefined;
+  if (!chosenId) {
+    throw new BadRequestException('cardId is required');
+  }
+  const idx = floorIndexForMonth(state, pending.pendingMonth ?? -1);
+  if (idx < 0) {
+    throw new BadRequestException('pending floor stack is gone');
+  }
+  const stack = state.floor[idx];
+  const chosenIdx = stack.cards.findIndex((card) => card.id === chosenId);
+  if (chosenIdx < 0) {
+    throw new BadRequestException('invalid choice');
+  }
+  const [chosen] = stack.cards.splice(chosenIdx, 1);
+  const played = parseGostopCardId(pending.playedId ?? '');
+  const captured = pending.captured.map((id) => parseGostopCardId(id));
+  const events = [...pending.events];
+  state.pendingChoice = undefined;
+  state.pending = undefined;
+
+  if (pending.fromFlip) {
+    // flip_pick: 뒤집은 패 + 선택한 바닥 1장 획득(나머지 1장은 바닥에 남음).
+    const flipCard = parseGostopCardId(pending.flippedId ?? '');
+    captured.push(flipCard, chosen);
+    finalizeGostopTurn(state, seat, played.id, flipCard.id, captured, events);
+    return;
+  }
+  // match_pick: 낸 패 + 선택한 바닥 1장 획득 후 더미 뒤집기(따닥 가능).
+  captured.push(played, chosen);
+  state.phase = 'playing';
+  continueGostopTurnWithFlip(state, seat, played, { kind: 'match2' }, captured, events);
+}
+
+function finalizeGostopTurn(
+  state: GostopSession,
+  seat: number,
+  playedId: string | undefined,
+  flippedId: string | undefined,
+  captured: GostopCard[],
+  events: GostopEvent[],
+): void {
+  if (captured.length > 0) {
+    state.captures[seat].push(...captured);
+  }
+  const roundOver = state.deck.length === 0 && state.hands.every((hand) => hand.length === 0);
+  if (state.floor.length === 0 && !roundOver) {
+    // 싹쓸이: 내 획득으로 바닥이 빔(마지막 턴 제외).
+    events.push('sseulssak');
+    stealPi(state, seat, 1);
+  }
+  recomputeGostopScores(state);
+  state.lastPlay = {
+    seat,
+    played: playedId,
+    flipped: flippedId,
+    captured: captured.map((card) => card.id),
+    events,
+  };
+  state.pendingChoice = undefined;
+  state.pending = undefined;
+  state.firstTurnPlayed = true;
+  state.phase = 'playing';
+  if (maybeGostopGoStop(state, seat)) {
+    return;
+  }
+  if (state.deck.length === 0 && state.hands.every((hand) => hand.length === 0)) {
+    settleGostopNagari(state);
+    return;
+  }
+  passGostopTurn(state, seat);
+  touch(state);
+}
+
+/** 현재 좌석의 합법 손패 제출 후보(간단 계열). AI/타임아웃 자동수에서 사용. */
+export function gostopLegalPlays(state: GostopSession, seat: number): string[] {
+  if (state.phase !== 'playing' || seat !== state.currentSeat) {
+    return [];
+  }
+  return state.hands[seat].map((card) => card.id);
+}

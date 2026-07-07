@@ -441,3 +441,248 @@ test('gostop is registered and descriptor is correct', () => {
   assert.ok(REGISTRY.engine('gostop'), 'gostop engine must be registered');
   assert.equal(GOSTOP_ENGINE.descriptor.key, 'gostop');
 });
+
+// ---------------------------------------------------------------------------
+// C3: turn state machine + specials (뻑/첫뻑/쪽/따닥/싹쓸이/흔들기/폭탄)
+// ---------------------------------------------------------------------------
+
+import {
+  applyGostopPlayCard,
+  applyGostopFlipChoice,
+} from '../dist/games/gostop-engine.js';
+
+// 통제된 상태를 만든다: 손패/바닥/더미를 명시. 더미의 마지막 원소가 먼저 뒤집힌다.
+function makeState(count, { hands, floor, deck, currentSeat = 0 }) {
+  const s = createGostopState(seats(count), 'local_ai', { seed: 'controlled' });
+  s.status = 'playing';
+  s.phase = 'playing';
+  s.roundNumber = 1;
+  s.dealer = 0;
+  s.currentSeat = currentSeat;
+  s.currentTurn = `seat${currentSeat}`;
+  s.balances = Array.from({ length: count }, () => 1_000_000);
+  s.hands = hands.map((h) => cards(...h));
+  s.floor = floor.map((stackIds) => ({ cards: cards(...stackIds) }));
+  s.deck = cards(...deck);
+  s.captures = Array.from({ length: count }, () => []);
+  s.scores = Array.from({ length: count }, () => 0);
+  s.goCount = Array.from({ length: count }, () => 0);
+  s.goScore = Array.from({ length: count }, () => -1);
+  s.shakeCount = Array.from({ length: count }, () => 0);
+  s.bombCount = Array.from({ length: count }, () => 0);
+  s.firstTurnPlayed = false;
+  s.lastRoundResult = undefined;
+  s.lastPlay = undefined;
+  s.pendingChoice = undefined;
+  s.pending = undefined;
+  s.goStopSeat = undefined;
+  return s;
+}
+
+function capturedIds(s, seat) {
+  return s.captures[seat].map((c) => c.id).sort();
+}
+
+test('basic match: play matches a single floor card and captures the pair', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_1_1', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_1_2']],
+    deck: ['hwatu_9_4', 'hwatu_5_3'], // flip = 5_3 (no month5 on floor → placed)
+  });
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_1_1' });
+  assert.deepEqual(capturedIds(s, 0), ['hwatu_1_1', 'hwatu_1_2']);
+  assert.ok(s.floor.some((st) => st.cards[0].month === 5));
+  assert.equal(s.lastPlay.events.length, 0);
+  assert.equal(s.currentSeat, 1); // 턴이 넘어감
+});
+
+test('첫뻑: first-turn ppeok steals 1 pi and leaves a ppeok pile', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_3_1', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_3_2']],
+    deck: ['hwatu_9_4', 'hwatu_3_3'], // flip = 3_3 (month3) → 뻑
+  });
+  s.captures[1] = cards('hwatu_5_3'); // 상대 피 1장
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_3_1' });
+  assert.ok(s.lastPlay.events.includes('first_ppeok'));
+  // 획득 없음 + 첫뻑 스틸 1피 → captures[0] = [stolen pi]
+  assert.deepEqual(capturedIds(s, 0), ['hwatu_5_3']);
+  assert.equal(s.captures[1].length, 0);
+  const ppeok = s.floor.find((st) => st.cards.length === 3 && st.ppeok);
+  assert.ok(ppeok, 'expected a ppeok pile of 3');
+  assert.equal(ppeok.cards.length, 3);
+});
+
+test('ppeok (not first turn): no steal, pile remains', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_3_1', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_3_2']],
+    deck: ['hwatu_9_4', 'hwatu_3_3'],
+  });
+  s.firstTurnPlayed = true;
+  s.captures[1] = cards('hwatu_5_3');
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_3_1' });
+  assert.ok(s.lastPlay.events.includes('ppeok'));
+  assert.equal(s.captures[0].length, 0);
+  assert.equal(s.captures[1].length, 1); // 스틸 없음
+});
+
+test('ppeok_eaten: eating a ppeok pile steals 1 pi', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_3_4', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_3_1', 'hwatu_3_2', 'hwatu_3_3']], // 뻑더미
+    deck: ['hwatu_9_4', 'hwatu_5_3'], // flip 비매칭
+  });
+  s.firstTurnPlayed = true;
+  s.floor[0].ppeok = true;
+  s.captures[1] = cards('hwatu_6_3');
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_3_4' });
+  assert.ok(s.lastPlay.events.includes('ppeok_eaten'));
+  // 4 month3 + 스틸 1피
+  assert.equal(s.captures[0].filter((c) => c.month === 3).length, 4);
+  assert.equal(s.captures[0].some((c) => c.id === 'hwatu_6_3'), true);
+  assert.equal(s.captures[1].length, 0);
+});
+
+test('쪽: played placed, flip matches it, captures both and steals 1 pi', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_5_1', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_8_1']], // month5 없음 → placed
+    deck: ['hwatu_9_4', 'hwatu_5_2'], // flip = 5_2 (month5) → 쪽
+  });
+  s.firstTurnPlayed = true;
+  s.captures[1] = cards('hwatu_6_3');
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_5_1' });
+  assert.ok(s.lastPlay.events.includes('jjok'));
+  assert.equal(s.captures[0].some((c) => c.id === 'hwatu_5_1'), true);
+  assert.equal(s.captures[0].some((c) => c.id === 'hwatu_5_2'), true);
+  assert.equal(s.captures[0].some((c) => c.id === 'hwatu_6_3'), true); // stolen
+});
+
+test('따닥: floor has 2, play+flip capture all 4 and steal 1 pi', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_5_1', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_5_3', 'hwatu_5_4']], // month5 size2
+    deck: ['hwatu_9_4', 'hwatu_5_2'], // flip = 5_2 (month5) → 따닥
+  });
+  s.firstTurnPlayed = true;
+  s.captures[1] = cards('hwatu_6_3');
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_5_1', matchChoice: 'hwatu_5_3' });
+  assert.ok(s.lastPlay.events.includes('ttadak'));
+  assert.equal(s.captures[0].filter((c) => c.month === 5).length, 4);
+  assert.equal(s.captures[0].some((c) => c.id === 'hwatu_6_3'), true); // stolen
+});
+
+test('match_pick: playing into a floor-2 without matchChoice pauses, then resumes', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_5_1', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_5_3', 'hwatu_5_4']],
+    deck: ['hwatu_9_4', 'hwatu_7_3'], // flip 비매칭(month7)
+  });
+  s.firstTurnPlayed = true;
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_5_1' });
+  assert.equal(s.phase, 'flip_choice');
+  assert.equal(s.pendingChoice.type, 'match_pick');
+  assert.deepEqual(s.pendingChoice.options.sort(), ['hwatu_5_3', 'hwatu_5_4']);
+  applyGostopFlipChoice(s, 0, { cardId: 'hwatu_5_3' });
+  // 낸 패 + 선택(5_3) 획득, 5_4 는 바닥에 남음, flip 7_3 placed.
+  assert.equal(s.captures[0].some((c) => c.id === 'hwatu_5_1'), true);
+  assert.equal(s.captures[0].some((c) => c.id === 'hwatu_5_3'), true);
+  assert.ok(s.floor.some((st) => st.cards.some((c) => c.id === 'hwatu_5_4')));
+  assert.equal(s.phase, 'playing');
+});
+
+test('flip_pick: flipped card matching a floor-2 pauses, then resumes', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_1_1', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_9_2', 'hwatu_9_3']], // month9 size2 (month1 없음 → play placed)
+    deck: ['hwatu_7_4', 'hwatu_9_1'], // flip = 9_1 (month9) → flip_pick
+  });
+  s.firstTurnPlayed = true;
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_1_1' });
+  assert.equal(s.phase, 'flip_choice');
+  assert.equal(s.pendingChoice.type, 'flip_pick');
+  applyGostopFlipChoice(s, 0, { cardId: 'hwatu_9_2' });
+  assert.equal(s.captures[0].some((c) => c.id === 'hwatu_9_1'), true);
+  assert.equal(s.captures[0].some((c) => c.id === 'hwatu_9_2'), true);
+  assert.ok(s.floor.some((st) => st.cards.some((c) => c.id === 'hwatu_9_3'))); // leftover
+  assert.ok(s.floor.some((st) => st.cards.some((c) => c.id === 'hwatu_1_1'))); // placed
+});
+
+test('싹쓸이: clearing the floor steals 1 pi (not on the last turn)', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_7_1', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_7_2'], ['hwatu_8_1']],
+    deck: ['hwatu_10_4', 'hwatu_8_2'], // flip = 8_2 matches 8_1; deck still has 10_4 → not last turn
+  });
+  s.firstTurnPlayed = true;
+  s.captures[1] = cards('hwatu_6_3');
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_7_1' });
+  assert.ok(s.lastPlay.events.includes('sseulssak'));
+  assert.equal(s.floor.length, 0);
+  assert.equal(s.captures[0].some((c) => c.id === 'hwatu_6_3'), true); // stolen
+});
+
+test('흔들기: shake marks a 2x multiplier and emits shake event', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_6_1', 'hwatu_6_2', 'hwatu_6_3', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_6_4']],
+    deck: ['hwatu_9_4', 'hwatu_5_3'],
+  });
+  s.firstTurnPlayed = true;
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_6_1', shake: true });
+  assert.equal(s.shakeCount[0], 1);
+  assert.ok(s.lastPlay.events.includes('shake'));
+  assert.equal(s.captures[0].some((c) => c.id === 'hwatu_6_1'), true);
+});
+
+test('흔들기 without 3 same-month is rejected', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_6_1', 'hwatu_6_2', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_6_4']],
+    deck: ['hwatu_9_4', 'hwatu_5_3'],
+  });
+  assert.throws(() => applyGostopPlayCard(s, 0, { cardId: 'hwatu_6_1', shake: true }));
+});
+
+test('폭탄: play 3 same-month + floor card, capture all 4, 2x and steal 1 pi', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_6_1', 'hwatu_6_2', 'hwatu_6_3', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_6_4']],
+    deck: ['hwatu_9_4', 'hwatu_5_3'],
+  });
+  s.firstTurnPlayed = true;
+  s.captures[1] = cards('hwatu_7_3');
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_6_1', bomb: true });
+  assert.equal(s.bombCount[0], 1);
+  assert.ok(s.lastPlay.events.includes('bomb'));
+  assert.equal(s.captures[0].filter((c) => c.month === 6).length, 4);
+  assert.equal(s.captures[0].some((c) => c.id === 'hwatu_7_3'), true); // stolen
+  assert.equal(s.hands[0].filter((c) => c.month === 6).length, 0); // 3장 소진
+});
+
+test('playing when it is not your turn is rejected', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_1_1'], ['hwatu_10_1']],
+    floor: [['hwatu_1_2']],
+    deck: ['hwatu_9_4', 'hwatu_5_3'],
+  });
+  assert.throws(() => applyGostopPlayCard(s, 1, { cardId: 'hwatu_10_1' }));
+});
+
+test('reaching threshold moves to go_stop instead of passing the turn', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_1_3', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_1_4']],
+    deck: ['hwatu_9_4', 'hwatu_5_1'],
+  });
+  s.firstTurnPlayed = true;
+  // 승자 좌석 0 이 이미 피 14장 → 이번 턴 매칭으로 16장(7점) 도달.
+  const piIds = [];
+  for (let m = 3; m <= 9; m += 1) piIds.push(`hwatu_${m}_3`, `hwatu_${m}_4`); // 14 피
+  s.captures[0] = cards(...piIds);
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_1_3' }); // 1_3(pi) + 1_4(pi) 획득 → 16 피 = 7점
+  assert.equal(s.phase, 'go_stop');
+  assert.equal(s.goStopSeat, 0);
+  assert.equal(s.currentSeat, 0); // 턴 유지
+});
