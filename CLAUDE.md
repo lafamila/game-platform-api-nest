@@ -25,7 +25,7 @@ This repo follows `../CLAUDE.md`, especially central auth, env handling, local-f
 - Storage: PostgreSQL via `DATABASE_URL`.
 - Game model: server-authoritative rules and result validation.
 - Game registry: public game metadata is centralized in `GameRegistry`/`GAME_DESCRIPTORS`; new server-backed games should register a `GameEngine` and then wire only the remaining service orchestration gaps.
-- Current games: `sudoku`, `gomoku`, `alkkagi`, `othello`, `sokoban`, `splendor`, `fortress`, `crazy_arcade`, `mighty`.
+- Current games: `sudoku`, `gomoku`, `alkkagi`, `othello`, `sokoban`, `splendor`, `fortress`, `crazy_arcade`, `mighty`, `seotda`.
 - Start UX contract: every newly started game session, including Crazy Arcade and room-started sessions, must support the client countdown flow. Resuming an already-active session is not a new start.
 
 ## Auth Onboarding Request Shape
@@ -123,6 +123,7 @@ Every action POST accepts an optional `clientMoveId` (uuid). The server keeps th
 - Room APIs create N-player sessions from room membership. Sudoku/Sokoban race rooms support up to 6 seats; Splendor supports 2–4; Crazy Arcade supports 2–4; Mighty is exactly 5 seats.
 - Server save/continue stores an account-owned long-term snapshot. Continuing a finished friend match forks according to game type: solo-capable puzzle games resume solo, while competitive games use `local_ai` continuation. Crazy Arcade server save is included and forks the server-authoritative snapshot to `local_ai`.
 - Mighty (`mighty`) is a hidden-information 5-player trick game. Its engine must hide non-viewer hands/kitty/deck data, expose only viewer-legal actions, and support local AI seats plus 5-player room start.
+- Seotda (`seotda`) is a hidden-information 2-5 player hwatu betting game. One session runs continuous hands with a shared, evenly-distributed balance (default 10,000, configurable via create `config.startingBalance`). The session ends the moment a player leaves (`opponent_left`) or a settlement leaves someone at 0 balance (`bankrupt`); the richest player then wins (ties break to the last hand's winner) and `gameWinner` records `reason` + `finalBalances`. Actions on the common route: `bet` (`payload.move` = `die|check|call|bbing|ddadang|half|allin`), `next_hand`, `forfeit`. Betting rounds cap raises at the minimum active balance (no side pots). `viewFor` exposes only the viewer's hand and reveals survivor hands (`revealedHands`) at settlement; deck/seed stay hidden. Local AI create accepts `config.aiOpponents` (1-4, default 1), `config.ante`, `config.baseUnit`, `config.startingBalance`. Room start supports 2-5 seats with mixed AI seats. Adopted standard rules with variants (멍구사 등 미구현) documented in the seotda engine header.
 
 ## Local Dev
 
