@@ -127,6 +127,7 @@ import {
 import { MIGHTY_ENGINE, MightySession } from './mighty-engine';
 import { SEOTDA_ENGINE, SeotdaSession, seotdaLegalMoves } from './seotda-engine';
 import { CHASER_ENGINE, ChaserSession } from './chaser-engine';
+import { GOSTOP_ENGINE, GostopSession, gostopLegalPlays } from './gostop-engine';
 
 const MATCH_READY_DELAY_MS = 4_000;
 const GOMOKU_TURN_LIMIT_MS = 15_000;
@@ -139,6 +140,8 @@ const SEOTDA_AI_RESPONSE_DELAY_MS = 1_200;
 const SEOTDA_TURN_LIMIT_MS = 30_000;
 const CHASER_AI_RESPONSE_DELAY_MS = 900;
 const CHASER_TURN_LIMIT_MS = 60_000;
+const GOSTOP_AI_RESPONSE_DELAY_MS = 1_100;
+const GOSTOP_TURN_LIMIT_MS = 40_000;
 const FORTRESS_AI_RESPONSE_DELAY_MS = 1_000;
 const ROOM_AI_RESPONSE_DELAY_MS = 850;
 const ROOM_RACE_AI_DELAY_MS: Record<Difficulty, number> = {
@@ -365,6 +368,12 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       }
       return this.createChaserSession(user, difficulty, isRecord(input.config) ? input.config : undefined);
     }
+    if (gameKey === 'gostop') {
+      if (opponentAccountId) {
+        throw new BadRequestException('gostop friend matches require a room');
+      }
+      return this.createGostopSession(user, difficulty, isRecord(input.config) ? input.config : undefined);
+    }
     throw new BadRequestException(`unsupported gameKey: ${gameKey}`);
   }
 
@@ -383,6 +392,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'mighty') return this.getMightySession(id, user);
     if (gameKey === 'seotda') return this.getSeotdaSession(id, user);
     if (gameKey === 'chaser') return this.getChaserSession(id, user);
+    if (gameKey === 'gostop') return this.getGostopSession(id, user);
     throw new BadRequestException(`unsupported gameKey: ${gameKey}`);
   }
 
@@ -479,6 +489,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     }
     if (row.game_key === 'chaser') {
       await this.applyChaserForfeit(row.id, user);
+      return;
+    }
+    if (row.game_key === 'gostop') {
+      await this.applyGostopForfeit(row.id, user);
       return;
     }
     await this.finishActiveSessionRow(row, 'forfeit');
@@ -649,6 +663,34 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       }
       if (type === 'forfeit') {
         return this.applyChaserForfeit(id, user);
+      }
+    }
+
+    if (gameKey === 'gostop') {
+      if (type === 'play_card') {
+        return this.applyGostopEngineAction(id, user, 'play_card', {
+          cardId: typeof payload.cardId === 'string' ? payload.cardId : undefined,
+          matchChoice: typeof payload.matchChoice === 'string' ? payload.matchChoice : undefined,
+          shake: payload.shake === true,
+          bomb: payload.bomb === true,
+        }, clientMoveId);
+      }
+      if (type === 'flip_choice') {
+        return this.applyGostopEngineAction(id, user, 'flip_choice', {
+          cardId: typeof payload.cardId === 'string' ? payload.cardId : undefined,
+        }, clientMoveId);
+      }
+      if (type === 'go') {
+        return this.applyGostopEngineAction(id, user, 'go', {}, clientMoveId);
+      }
+      if (type === 'stop') {
+        return this.applyGostopEngineAction(id, user, 'stop', {}, clientMoveId);
+      }
+      if (type === 'next_round') {
+        return this.applyGostopEngineAction(id, user, 'next_round', {}, clientMoveId);
+      }
+      if (type === 'forfeit') {
+        return this.applyGostopForfeit(id, user);
       }
     }
 
@@ -1221,6 +1263,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'mighty') return this.sendMightyEmote(id, user, slot);
     if (gameKey === 'seotda') return this.sendSeotdaEmote(id, user, slot);
     if (gameKey === 'chaser') return this.sendChaserEmote(id, user, slot);
+    if (gameKey === 'gostop') return this.sendGostopEmote(id, user, slot);
     throw new BadRequestException('unsupported gameKey');
   }
 
@@ -2469,6 +2512,95 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return this.sendSessionEmote('chaser', session, user, slot);
   }
 
+  async createGostopSession(
+    user: AuthAccount,
+    difficulty: Difficulty = 'medium',
+    config?: Record<string, unknown>,
+  ): Promise<unknown> {
+    this.assertDifficulty(difficulty);
+    // 2인(맞고) 또는 3인. local_ai 는 AI 상대 1~2명.
+    const aiOpponents = Math.max(1, Math.min(2, Math.trunc(Number(config?.aiOpponents ?? 1)) || 1));
+    const players = [
+      { seat: 0, accountId: user.accountId, kind: 'account' as const },
+      ...Array.from({ length: aiOpponents }, (_, index) => index + 1).map((seat) => ({
+        seat,
+        accountId: `${LOCAL_AI_ACCOUNT_ID}#${seat}`,
+        kind: 'ai' as const,
+        aiDifficulty: difficulty,
+      })),
+    ];
+    const state = GOSTOP_ENGINE.createState(players, {
+      id: '',
+      mode: 'local_ai',
+      aiDifficulty: difficulty,
+      startingBalance: config?.startingBalance,
+      pointValue: config?.pointValue,
+    });
+    const row = await this.insertGame(
+      'gostop',
+      'local_ai',
+      user.accountId,
+      null,
+      state.status,
+      state.currentTurn,
+      state.winnerSide ?? null,
+      state,
+    );
+    const saved = this.gostopFromRow(row);
+    this.emitGostopEvent(saved, 'game.session.created');
+    this.scheduleGostopAi(saved);
+    return this.gostopView(saved, user);
+  }
+
+  async getGostopSession(id: string, user: AuthAccount): Promise<unknown> {
+    const session = this.gostopFromRow(await this.requireGameRow(id, 'gostop'));
+    this.assertGostopParticipant(user, session);
+    this.scheduleGostopAi(session);
+    this.scheduleGostopTurnTimer(session);
+    return this.gostopView(session, user);
+  }
+
+  private async applyGostopEngineAction(
+    id: string,
+    user: AuthAccount,
+    type: 'play_card' | 'flip_choice' | 'go' | 'stop' | 'next_round',
+    payload: Record<string, unknown>,
+    clientMoveId?: string,
+  ): Promise<unknown> {
+    const session = this.gostopFromRow(await this.requireGameRow(id, 'gostop'));
+    this.assertGostopParticipant(user, session);
+    this.assertNotPaused(session);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return this.gostopView(session, user);
+    }
+    const seat = this.gostopSeatForUser(session, user);
+    const result = GOSTOP_ENGINE.applyAction(session, seat, { type, payload, clientMoveId });
+    this.stampGostopTurn(result.state);
+    const saved = await this.saveGostopSession(result.state);
+    this.emitGostopEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'gostop.action.played');
+    this.scheduleGostopAi(saved);
+    this.scheduleGostopTurnTimer(saved);
+    return this.gostopView(saved, user);
+  }
+
+  private async applyGostopForfeit(id: string, user: AuthAccount): Promise<unknown> {
+    const session = this.gostopFromRow(await this.requireGameRow(id, 'gostop'));
+    this.assertGostopParticipant(user, session);
+    const seat = this.gostopSeatForUser(session, user);
+    GOSTOP_ENGINE.applyAction(session, seat, { type: 'forfeit' });
+    const saved = await this.saveGostopSession(session);
+    this.clearTurnTimer(saved.id);
+    this.clearRoomAiTimer(saved.id);
+    this.emitGostopEvent(saved, 'game.session.finished');
+    return this.gostopView(saved, user);
+  }
+
+  async sendGostopEmote(id: string, user: AuthAccount, slot: number): Promise<unknown> {
+    const session = this.gostopFromRow(await this.requireGameRow(id, 'gostop'));
+    this.assertGostopParticipant(user, session);
+    return this.sendSessionEmote('gostop', session, user, slot);
+  }
+
   async createCrazyArcadeSession(
     user: AuthAccount,
     opponentAccountId?: string,
@@ -3189,7 +3321,17 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitChaserEvent(saved, 'game.session.paused');
       return this.chaserView(saved, user);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, seotda, or chaser');
+    if (gameKey === 'gostop') {
+      const session = this.gostopFromRow(await this.requireGameRow(id, 'gostop'));
+      this.assertGostopParticipant(user, session);
+      this.applyPause(session, user);
+      this.clearRoomAiTimer(id);
+      this.clearTurnTimer(id);
+      const saved = await this.saveGostopSession(session);
+      this.emitGostopEvent(saved, 'game.session.paused');
+      return this.gostopView(saved, user);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, seotda, chaser, or gostop');
   }
 
   async resumeMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
@@ -3294,7 +3436,17 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.scheduleChaserTurnTimer(saved);
       return this.chaserView(saved, user);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, seotda, or chaser');
+    if (gameKey === 'gostop') {
+      const session = this.gostopFromRow(await this.requireGameRow(id, 'gostop'));
+      this.assertGostopParticipant(user, session);
+      this.applyResume(session);
+      const saved = await this.saveGostopSession(session);
+      this.emitGostopEvent(saved, 'game.session.resumed');
+      this.scheduleGostopAi(saved);
+      this.scheduleGostopTurnTimer(saved);
+      return this.gostopView(saved, user);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, seotda, chaser, or gostop');
   }
 
   async createSessionFromMatch(gameKey: string, requesterAccountId: string, opponentAccountId: string): Promise<string> {
@@ -3363,7 +3515,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (!descriptor || descriptor.maxPlayers < members.length) {
       throw new BadRequestException('unsupported room size');
     }
-    if (!['splendor', 'sudoku', 'sokoban', 'crazy_arcade', 'mighty', 'seotda', 'chaser'].includes(room.game_key)) {
+    if (!['splendor', 'sudoku', 'sokoban', 'crazy_arcade', 'mighty', 'seotda', 'chaser', 'gostop'].includes(room.game_key)) {
       throw new BadRequestException('multi-player room start is not available for this game');
     }
     if (room.game_key === 'chaser') {
@@ -3443,6 +3595,46 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       );
       this.scheduleRoomAiFromRow(room.game_key, row);
       this.scheduleSeotdaTurnTimer(this.seotdaFromRow(row));
+      return row.id;
+    }
+    if (room.game_key === 'gostop') {
+      const state = GOSTOP_ENGINE.createState(
+        orderedMembers.map(seatInfoFromRoomMember),
+        {
+          id: '',
+          mode: 'friend_match',
+          aiDifficulty: difficultyFromSnapshot(
+            isRecord(room.config_json) ? room.config_json.difficulty : undefined,
+            'medium',
+          ),
+          startingBalance: isRecord(room.config_json) ? room.config_json.startingBalance : undefined,
+          pointValue: isRecord(room.config_json) ? room.config_json.pointValue : undefined,
+        },
+      );
+      state.roomId = room.id;
+      state.roomCode = room.room_code;
+      state.roomMode = 'multi_player';
+      state.pause = {
+        active: false,
+        counts: Object.fromEntries(orderedMembers.map((member) => [member.account_id, 0])),
+      };
+      state.seatStatus = Object.fromEntries(orderedMembers.map((member) => [`seat${member.seat}`, 'active']));
+      this.stampGostopTurn(state);
+      const row = await this.insertGame(
+        room.game_key,
+        'friend_match',
+        orderedMembers[0].account_id,
+        null,
+        'playing',
+        state.currentTurn,
+        null,
+        {
+          ...state,
+          roomPlayers: orderedMembers.map(roomPlayerSnapshot),
+        },
+      );
+      this.scheduleRoomAiFromRow(room.game_key, row);
+      this.scheduleGostopTurnTimer(this.gostopFromRow(row));
       return row.id;
     }
     if (room.game_key === 'mighty') {
@@ -4098,6 +4290,50 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return CHASER_ENGINE.viewFor(session, this.chaserSeatForUser(session, user));
   }
 
+  private gostopFromRow(row: GameRow): GostopSession {
+    return withRowDates(row.state_json as GostopSession, row);
+  }
+
+  private async saveGostopSession(session: GostopSession): Promise<GostopSession> {
+    return this.gostopFromRow(await this.updateGame(
+      session.id,
+      session.status,
+      session.status === 'playing' && session.currentTurn ? session.currentTurn : null,
+      session.winnerSide ?? null,
+      session,
+    ));
+  }
+
+  private assertGostopParticipant(user: AuthAccount, session: GostopSession): void {
+    if (!Object.values(session.players).some((accountId) => this.canActAs(user, accountId))) {
+      throw new ForbiddenException('not a participant');
+    }
+  }
+
+  private gostopSeatForUser(session: GostopSession, user: AuthAccount): number {
+    for (const [side, accountId] of Object.entries(session.players)) {
+      if (accountId === user.accountId) {
+        const match = /^seat(\d+)$/.exec(side);
+        if (match) {
+          return Number(match[1]);
+        }
+      }
+    }
+    for (const [side, accountId] of Object.entries(session.players)) {
+      if (this.canActAs(user, accountId)) {
+        const match = /^seat(\d+)$/.exec(side);
+        if (match) {
+          return Number(match[1]);
+        }
+      }
+    }
+    throw new ForbiddenException('not a participant');
+  }
+
+  private gostopView(session: GostopSession, user: AuthAccount): unknown {
+    return GOSTOP_ENGINE.viewFor(session, this.gostopSeatForUser(session, user));
+  }
+
   private async sessionSeatRows(row: GameRow): Promise<GameSessionPlayerRow[]> {
     const result = await this.db.query<GameSessionPlayerRow>(
       `SELECT *
@@ -4191,6 +4427,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.scheduleSeotdaAi(this.seotdaFromRow(row));
     } else if (gameKey === 'chaser') {
       this.scheduleChaserAi(this.chaserFromRow(row));
+    } else if (gameKey === 'gostop') {
+      this.scheduleGostopAi(this.gostopFromRow(row));
     }
   }
 
@@ -4396,13 +4634,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return undefined;
   }
 
-  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession): void {
+  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession): void {
     if (session.pause?.active) {
       throw new BadRequestException('game is paused');
     }
   }
 
-  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession, user: AuthAccount): void {
+  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession, user: AuthAccount): void {
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('pause is only available during matched games');
     }
@@ -4426,7 +4664,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     session.updatedAt = new Date(now).toISOString();
   }
 
-  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession): void {
+  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession): void {
     const pause = session.pause;
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('resume is only available during matched games');
@@ -4563,8 +4801,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async sendSessionEmote(
-    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress' | 'crazy_arcade' | 'mighty' | 'seotda' | 'chaser',
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession,
+    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress' | 'crazy_arcade' | 'mighty' | 'seotda' | 'chaser' | 'gostop',
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession,
     user: AuthAccount,
     slot: number,
   ): Promise<unknown> {
@@ -4660,6 +4898,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     }
     if (gameKey === 'chaser') {
       this.scheduleChaserAi(this.chaserFromRow(row));
+      return;
+    }
+    if (gameKey === 'gostop') {
+      this.scheduleGostopAi(this.gostopFromRow(row));
       return;
     }
     if (gameKey === 'crazy_arcade') {
@@ -5178,6 +5420,196 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.scheduleSeotdaTurnTimer(saved);
   }
 
+  private scheduleGostopAi(session: GostopSession): void {
+    if (session.status !== 'playing' || session.pause?.active) {
+      return;
+    }
+    const hasHuman = Object.values(session.players).some((acc) => !isLocalAiAccount(acc));
+    const roomAi = this.roomAiPlayers(session).find((player) => player.side === session.currentTurn);
+    const localAiTurn = session.mode === 'local_ai' && isLocalAiAccount(session.players[session.currentTurn]);
+    const actingPhase = session.phase === 'playing' || session.phase === 'flip_choice' || session.phase === 'go_stop';
+    const settledAutoNext = session.phase === 'settled' && !hasHuman;
+    if (!settledAutoNext && !(actingPhase && (roomAi || localAiTurn))) {
+      return;
+    }
+    const run = async () => {
+      try {
+        const current = this.gostopFromRow(await this.requireGameRow(session.id, 'gostop'));
+        if (current.status !== 'playing' || current.pause?.active) {
+          return;
+        }
+        const curHasHuman = Object.values(current.players).some((acc) => !isLocalAiAccount(acc));
+        if (current.phase === 'settled') {
+          if (curHasHuman) {
+            return; // 인간이 있으면 그들의 next_round 를 기다린다.
+          }
+          GOSTOP_ENGINE.applyAction(current, current.currentSeat, { type: 'next_round' });
+          this.stampGostopTurn(current);
+          const savedNext = await this.saveGostopSession(current);
+          this.emitGostopEvent(savedNext, 'gostop.action.played');
+          this.scheduleGostopAi(savedNext);
+          return;
+        }
+        const nextRoomAi = this.roomAiPlayers(current).find((player) => player.side === current.currentTurn);
+        const nextLocalAi = current.mode === 'local_ai' && isLocalAiAccount(current.players[current.currentTurn]);
+        const curActing = current.phase === 'playing' || current.phase === 'flip_choice' || current.phase === 'go_stop';
+        if (!curActing || (!nextRoomAi && !nextLocalAi)) {
+          return;
+        }
+        const action = GOSTOP_ENGINE.aiAction?.(
+          current,
+          current.currentSeat,
+          nextRoomAi?.difficulty ?? difficultyFromSnapshot(current.aiDifficulty, 'medium'),
+        );
+        if (!action) {
+          return;
+        }
+        GOSTOP_ENGINE.applyAction(current, current.currentSeat, action);
+        this.stampGostopTurn(current);
+        const saved = await this.saveGostopSession(current);
+        this.emitGostopEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'gostop.action.played');
+        this.scheduleGostopAi(saved);
+        this.scheduleGostopTurnTimer(saved);
+      } catch (error) {
+        console.warn('[gostop-ai]', error);
+      }
+    };
+    if (roomAi) {
+      this.scheduleRoomAiTimer(session.id, GOSTOP_AI_RESPONSE_DELAY_MS, run);
+    } else {
+      const timer = setTimeout(run, GOSTOP_AI_RESPONSE_DELAY_MS);
+      timer.unref?.();
+    }
+  }
+
+  /** friend_match 인간 턴(놀이/선택/고스톱)에 턴 타이머 기준 시각을 각인한다. */
+  private stampGostopTurn(session: GostopSession): void {
+    const acting = session.phase === 'playing' || session.phase === 'flip_choice' || session.phase === 'go_stop';
+    const account = session.players[session.currentTurn];
+    if (session.mode !== 'friend_match' || session.status !== 'playing' || !acting || !account || isLocalAiAccount(account)) {
+      session.turnStartedAt = undefined;
+      session.turnDeadlineAt = undefined;
+      session.networkGraceStartedAt = undefined;
+      session.networkGraceDeadlineAt = undefined;
+      session.networkGraceAccountId = undefined;
+      session.opponentLeftAt = undefined;
+      return;
+    }
+    const now = Date.now();
+    session.turnStartedAt = new Date(now).toISOString();
+    session.turnDeadlineAt = new Date(now + GOSTOP_TURN_LIMIT_MS).toISOString();
+    session.networkGraceStartedAt = undefined;
+    session.networkGraceDeadlineAt = undefined;
+    session.networkGraceAccountId = undefined;
+    session.opponentLeftAt = undefined;
+  }
+
+  private scheduleGostopTurnTimer(session: GostopSession): void {
+    this.clearTurnTimer(session.id);
+    if (session.mode !== 'friend_match' || session.status !== 'playing' || session.pause?.active) {
+      return;
+    }
+    const deadline = session.networkGraceDeadlineAt ?? session.turnDeadlineAt;
+    if (!deadline) {
+      return;
+    }
+    const delay = Math.max(100, Date.parse(deadline) - Date.now());
+    const timer = setTimeout(() => {
+      void this.handleGostopTimer(session.id).catch((error) => {
+        console.error(error);
+      });
+    }, delay);
+    timer.unref?.();
+    this.turnTimers.set(session.id, timer);
+  }
+
+  /** 타임아웃: 흔들기/폭탄 없이 첫 손패 제출, 선택은 첫 옵션, go_stop 은 자동 stop. */
+  private autoResolveGostopTimeout(session: GostopSession, seat: number): void {
+    if (session.phase === 'go_stop' && session.goStopSeat === seat) {
+      GOSTOP_ENGINE.applyAction(session, seat, { type: 'stop' });
+      return;
+    }
+    if (session.phase === 'flip_choice' && session.pending?.seat === seat) {
+      const cardId = session.pendingChoice?.options?.[0];
+      GOSTOP_ENGINE.applyAction(session, seat, { type: 'flip_choice', payload: { cardId } });
+    } else if (session.phase === 'playing' && session.currentSeat === seat) {
+      const plays = gostopLegalPlays(session, seat);
+      GOSTOP_ENGINE.applyAction(session, seat, { type: 'play_card', payload: { cardId: plays[0] } });
+    }
+    // 손패 제출이 flip_choice / go_stop 대기를 만들었고 여전히 같은 좌석이면 자동 해소.
+    for (let guard = 0; guard < 12 && session.status === 'playing'; guard += 1) {
+      if (session.phase === 'flip_choice' && session.pending?.seat === seat) {
+        const cardId = session.pendingChoice?.options?.[0];
+        GOSTOP_ENGINE.applyAction(session, seat, { type: 'flip_choice', payload: { cardId } });
+      } else if (session.phase === 'go_stop' && session.goStopSeat === seat) {
+        GOSTOP_ENGINE.applyAction(session, seat, { type: 'stop' });
+      } else {
+        break;
+      }
+    }
+  }
+
+  private async handleGostopTimer(id: string): Promise<void> {
+    const row = await this.requireGameRow(id, 'gostop');
+    if (row.mode !== 'friend_match' || row.status !== 'playing') {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const session = this.gostopFromRow(row);
+    if (session.pause?.active) {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const acting = session.phase === 'playing' || session.phase === 'flip_choice' || session.phase === 'go_stop';
+    if (!acting) {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const account = session.players[session.currentTurn];
+    if (!account || isLocalAiAccount(account)) {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const deadline = session.networkGraceDeadlineAt ?? session.turnDeadlineAt;
+    if (deadline && Date.parse(deadline) > Date.now() + 50) {
+      this.scheduleGostopTurnTimer(session);
+      return;
+    }
+    const seat = session.currentSeat;
+    if (session.networkGraceDeadlineAt) {
+      if (await this.realtime.isAccountOnline(account)) {
+        this.stampGostopTurn(session);
+        const resumed = await this.saveGostopSession(session);
+        this.emitGostopEvent(resumed, 'game.opponent_returned');
+        this.scheduleGostopTurnTimer(resumed);
+        return;
+      }
+      GOSTOP_ENGINE.applyAction(session, seat, { type: 'forfeit' });
+      const settled = await this.saveGostopSession(session);
+      this.clearTurnTimer(id);
+      this.emitGostopEvent(settled, 'game.session.finished');
+      return;
+    }
+    if (!(await this.realtime.isAccountOnline(account))) {
+      const now = Date.now();
+      session.networkGraceStartedAt = new Date(now).toISOString();
+      session.networkGraceDeadlineAt = new Date(now + DISCONNECT_GRACE_MS).toISOString();
+      session.networkGraceAccountId = account;
+      session.opponentLeftAt = new Date(now).toISOString();
+      const saved = await this.saveGostopSession(session);
+      this.emitGostopEvent(saved, 'game.opponent_left');
+      this.scheduleGostopTurnTimer(saved);
+      return;
+    }
+    // 온라인이지만 시간 초과 → 자동수.
+    this.autoResolveGostopTimeout(session, seat);
+    this.stampGostopTurn(session);
+    const saved = await this.saveGostopSession(session);
+    this.emitGostopEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'gostop.action.played');
+    this.scheduleGostopAi(saved);
+    this.scheduleGostopTurnTimer(saved);
+  }
+
   private scheduleChaserAi(session: ChaserSession): void {
     if (session.status !== 'playing' || session.pause?.active) {
       return;
@@ -5637,7 +6069,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       `SELECT * FROM game_sessions
        WHERE mode = 'friend_match'
          AND status = 'playing'
-         AND game_key IN ('gomoku', 'alkkagi', 'othello', 'fortress', 'seotda')`,
+         AND game_key IN ('gomoku', 'alkkagi', 'othello', 'fortress', 'seotda', 'gostop')`,
     );
     for (const row of result.rows) {
       if (row.game_key === 'gomoku') {
@@ -5650,6 +6082,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         this.scheduleFortressTurnTimer(this.fortressFromRow(row));
       } else if (row.game_key === 'seotda') {
         this.scheduleSeotdaTurnTimer(this.seotdaFromRow(row));
+      } else if (row.game_key === 'gostop') {
+        this.scheduleGostopTurnTimer(this.gostopFromRow(row));
       }
     }
   }
@@ -5671,7 +6105,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       `SELECT * FROM game_sessions
        WHERE mode = 'friend_match'
          AND status = 'playing'
-         AND game_key IN ('sudoku', 'sokoban', 'splendor', 'crazy_arcade', 'mighty', 'seotda')`,
+         AND game_key IN ('sudoku', 'sokoban', 'splendor', 'crazy_arcade', 'mighty', 'seotda', 'chaser', 'gostop')`,
     );
     for (const row of result.rows) {
       this.scheduleRoomAiFromRow(row.game_key, row);
@@ -5993,7 +6427,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private emitSessionEvent(
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession,
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession,
     event: string,
     payload: unknown,
   ): void {
@@ -6037,6 +6471,20 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       currentTurn: session.currentTurn,
       currentSeat: session.currentSeat,
       turnNumber: session.turnNumber,
+      updatedAt: session.updatedAt,
+    });
+  }
+
+  private emitGostopEvent(session: GostopSession, event: string): void {
+    this.emitSessionEvent(session, event, {
+      id: session.id,
+      gameKey: 'gostop',
+      status: session.status,
+      phase: session.phase,
+      rev: session.rev,
+      currentTurn: session.currentTurn,
+      currentSeat: session.currentSeat,
+      roundNumber: session.roundNumber,
       updatedAt: session.updatedAt,
     });
   }
@@ -6875,7 +7323,7 @@ function hideSudokuSolution(session: SudokuSession, user?: AuthAccount): Omit<Su
   return hideSudokuSolutionForAccount(session, user?.accountId);
 }
 
-function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession): string[] {
+function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession): string[] {
   if ('players' in session && session.players) {
     return [...new Set(Object.values(session.players).filter((accountId) => !isLocalAiAccount(accountId)))];
   }
@@ -7259,7 +7707,7 @@ function localAiResultKey(gameKey: string, sessionId: string): string {
 }
 
 function shiftDeadline(
-  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession,
+  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession,
   key: 'turnStartedAt' | 'turnDeadlineAt' | 'networkGraceStartedAt' | 'networkGraceDeadlineAt',
   deltaMs: number,
 ): void {

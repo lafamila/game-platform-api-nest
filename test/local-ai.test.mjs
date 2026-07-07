@@ -2315,3 +2315,50 @@ test('waiting keeps the abandoned match open for a later claim', async () => {
   assert.equal(finished.status, 'finished');
   service.onModuleDestroy();
 });
+
+test('gostop local session dispatches create/get/actions through the service', async () => {
+  const service = new GamesService(new FakeDb(), new FakeRealtime());
+  try {
+    const created = await service.createGameSession('gostop', user, {
+      difficulty: 'easy',
+      config: { aiOpponents: 1 },
+    });
+    assert.equal(created.gameKey, 'gostop');
+    assert.equal(created.mySeat, 0);
+    assert.equal(Array.isArray(created.myHand), true);
+    assert.equal(typeof created.deckCount, 'number');
+
+    const fetched = await service.getGameSession('gostop', created.id, user);
+    assert.equal(fetched.id, created.id);
+
+    if (fetched.phase === 'playing' && fetched.currentSeat === 0 && fetched.myHand.length > 0) {
+      const after = await service.applyGameAction('gostop', created.id, user, {
+        type: 'play_card',
+        payload: { cardId: fetched.myHand[0] },
+        clientMoveId: 'gostop-play-1',
+      });
+      assert.equal(after.gameKey, 'gostop');
+      // 멱등: 같은 clientMoveId 재전송은 현재 상태를 재응답한다.
+      const replay = await service.applyGameAction('gostop', created.id, user, {
+        type: 'play_card',
+        payload: { cardId: fetched.myHand[0] },
+        clientMoveId: 'gostop-play-1',
+      });
+      assert.equal(replay.gameKey, 'gostop');
+    }
+  } finally {
+    service.onModuleDestroy();
+  }
+});
+
+test('gostop rejects friend-match create without a room', async () => {
+  const service = new GamesService(new FakeDb(), new FakeRealtime());
+  try {
+    await assert.rejects(
+      () => service.createGameSession('gostop', user, { difficulty: 'easy', opponentAccountId: opponent.accountId }),
+      /gostop friend matches require a room/,
+    );
+  } finally {
+    service.onModuleDestroy();
+  }
+});
