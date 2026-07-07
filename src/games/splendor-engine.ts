@@ -459,22 +459,43 @@ export function applySplendorAiTurn(session: SplendorSession): void {
   if (session.status !== 'playing' || session.currentTurn !== 'opponent' || session.mode !== 'local_ai') {
     return;
   }
-  const side: SplendorSide = 'opponent';
-  const accountId = session.players.opponent;
+  applySplendorAiTurnForSide(session, 'opponent');
+}
+
+export function applySplendorAiTurnForSide(
+  session: SplendorSession,
+  side: SplendorSide,
+  difficulty?: Difficulty,
+): void {
+  if (session.status !== 'playing' || session.currentTurn !== side) {
+    return;
+  }
+  const accountId = session.players[side];
+  if (!accountId) {
+    return;
+  }
+  const previousDifficulty = session.aiDifficulty;
+  if (difficulty) {
+    session.aiDifficulty = difficulty;
+  }
   const action = chooseSplendorAiAction(session, side);
-  if (action.kind === 'buy') {
-    applySplendorBuy(session, side, accountId, action.card.id, 'ai');
-    return;
+  try {
+    if (action.kind === 'buy') {
+      applySplendorBuy(session, side, accountId, action.card.id, 'ai');
+      return;
+    }
+    if (action.kind === 'reserve') {
+      applySplendorReserve(session, side, accountId, { cardId: action.card.id, discardTokens: action.discardTokens }, 'ai');
+      return;
+    }
+    if (action.kind === 'take') {
+      applySplendorTakeTokens(session, side, accountId, action.tokens, action.discardTokens, 'ai');
+      return;
+    }
+    advanceSplendorTurn(session, side);
+  } finally {
+    session.aiDifficulty = previousDifficulty;
   }
-  if (action.kind === 'reserve') {
-    applySplendorReserve(session, side, accountId, { cardId: action.card.id, discardTokens: action.discardTokens }, 'ai');
-    return;
-  }
-  if (action.kind === 'take') {
-    applySplendorTakeTokens(session, side, accountId, action.tokens, action.discardTokens, 'ai');
-    return;
-  }
-  advanceSplendorTurn(session, side);
 }
 
 export function splendorAffordableCards(session: SplendorSession, side: SplendorSide): SplendorCard[] {

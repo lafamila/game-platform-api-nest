@@ -283,5 +283,23 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       )
     `);
     await this.query(`CREATE INDEX IF NOT EXISTS idx_sokoban_maps_difficulty ON sokoban_maps(difficulty, created_at DESC)`);
+
+    await this.query(`
+      UPDATE game_sessions
+      SET status = 'finished',
+          current_turn = NULL,
+          state_json = jsonb_set(
+            jsonb_set(
+              jsonb_set(
+                jsonb_set(state_json, '{status}', '"finished"'::jsonb, true),
+                '{finishReason}', '"server_restart"'::jsonb, true
+              ),
+              '{currentTurn}', 'null'::jsonb, true
+            ),
+            '{updatedAt}', to_jsonb(now()), true
+          ),
+          updated_at = now()
+      WHERE status NOT IN ('finished', 'cleared', 'failed')
+    `);
   }
 }

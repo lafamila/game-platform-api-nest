@@ -38,6 +38,11 @@ export class GamesController {
     return this.games.listActiveSessions(user);
   }
 
+  @Post('sessions/active/forfeit')
+  forfeitActiveSessions(@CurrentUser() user: AuthAccount) {
+    return this.games.forfeitActiveSessions(user);
+  }
+
   @Get('emotes')
   listEmotes(@CurrentUser() user: AuthAccount) {
     return this.games.listEmotes(user);
@@ -75,6 +80,11 @@ export class GamesController {
   @Post('sudoku/sessions/:id/emotes')
   sendSudokuEmote(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { slot: number }) {
     return this.games.sendSudokuEmote(id, user, Number(body.slot));
+  }
+
+  @Post('sudoku/sessions/:id/forfeit')
+  forfeitSudoku(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.forfeitSudoku(id, user);
   }
 
   @Post('games/:gameKey/sessions/:id/pause')
@@ -176,6 +186,26 @@ export class GamesController {
   @Post('rooms/:id/invite')
   inviteToRoom(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { accountId?: string }) {
     return this.games.inviteToRoom(id, user, body);
+  }
+
+  @Post('rooms/:id/ai')
+  addAiToRoom(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { difficulty?: Difficulty }) {
+    return this.games.addAiToRoom(id, user, body);
+  }
+
+  @Post('rooms/:id/accept')
+  acceptRoomInvite(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.acceptRoomInvite(id, user);
+  }
+
+  @Post('rooms/:id/reject')
+  rejectRoomInvite(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.rejectRoomInvite(id, user);
+  }
+
+  @Post('rooms/:id/emotes')
+  sendRoomEmote(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { slot?: number }) {
+    return this.games.sendRoomEmote(id, user, Number(body.slot));
   }
 
   @Post('rooms/join')

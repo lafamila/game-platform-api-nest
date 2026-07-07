@@ -188,11 +188,13 @@ function hideSudokuSolutionForSide(session: SudokuSession, side: SudokuSide): Om
     pendingDamage: session.battle?.[side]?.pendingDamage ?? 0,
     combo: session.battle?.[side]?.combo ?? 0,
     mySide: side,
+    mySeatStatus: session.seatStatus?.[side] ?? 'active',
   } as Omit<SudokuSession, 'solution'> & {
     obscuredCells: Array<{ row: number; col: number; until: string }>;
     pendingDamage: number;
     combo: number;
     mySide: SudokuSide;
+    mySeatStatus: string;
   };
 }
 

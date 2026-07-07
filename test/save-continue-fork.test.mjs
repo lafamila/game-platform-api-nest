@@ -19,6 +19,7 @@ test('N-player save -> continue forks each non-saver seat to a distinct AI id (M
       await service.joinRoom(member, { roomCode: room.room.roomCode });
       await service.setRoomReady(room.room.id, member, { ready: true });
     }
+    await service.setRoomReady(room.room.id, host, { ready: true });
     const started = await service.startRoom(room.room.id, host);
     const sourceId = started.sessionId;
 

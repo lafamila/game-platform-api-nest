@@ -175,6 +175,7 @@ export class SocialService implements OnModuleInit, OnModuleDestroy {
     );
     const accounts = await this.accountMap(accountIds);
     const onlineMap = await this.presence.onlineMap(accountIds);
+    const inGameMap = await this.games.activeGameAccountMap(accountIds);
     return {
       friends: result.rows.map((row) => {
         const accountId = row.requester_account_id === user.accountId ? row.recipient_account_id : row.requester_account_id;
@@ -183,6 +184,7 @@ export class SocialService implements OnModuleInit, OnModuleDestroy {
           accountId,
           account: accounts.get(accountId) ?? accountViewFallback(accountId),
           online: onlineMap.get(accountId) ?? false,
+          inGame: inGameMap.get(accountId) ?? false,
           createdAt: row.created_at.toISOString(),
           updatedAt: row.updated_at.toISOString(),
         };
@@ -361,6 +363,12 @@ export class SocialService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('opponent must be another account');
     }
     await this.assertAreFriends(user.accountId, input.opponentAccountId);
+    if (await this.games.isAccountInActiveGame(user.accountId)) {
+      throw new BadRequestException('account is already in game');
+    }
+    if (await this.games.isAccountInActiveGame(input.opponentAccountId)) {
+      throw new BadRequestException('opponent is in game');
+    }
     if (!(await this.presence.isOnline(input.opponentAccountId))) {
       throw new BadRequestException('opponent is offline');
     }
@@ -398,6 +406,12 @@ export class SocialService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('match request is not pending');
     }
     await this.assertAreFriends(row.requester_account_id, row.opponent_account_id);
+    if (await this.games.isAccountInActiveGame(row.requester_account_id)) {
+      throw new BadRequestException('requester is already in game');
+    }
+    if (await this.games.isAccountInActiveGame(row.opponent_account_id)) {
+      throw new BadRequestException('opponent is already in game');
+    }
     const sessionId = await this.games.createSessionFromMatch(row.game_key, row.requester_account_id, row.opponent_account_id);
     const result = await this.db.query<MatchRequestRow>(
       `UPDATE match_requests SET status = 'accepted', session_id = $2, updated_at = now() WHERE id = $1 RETURNING *`,
@@ -509,6 +523,7 @@ export class SocialService implements OnModuleInit, OnModuleDestroy {
     this.realtime.emitToAccounts(friendIds, 'friend.presence.changed', {
       accountId,
       online,
+      inGame: await this.games.isAccountInActiveGame(accountId),
     });
   }
 

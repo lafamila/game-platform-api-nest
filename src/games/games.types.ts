@@ -37,6 +37,7 @@ export interface SudokuSession {
   board: number[][];
   solution: number[][];
   players?: Record<SudokuSide, string>;
+  seatStatus?: Record<SudokuSide, 'active' | 'forfeited'>;
   boards?: Record<SudokuSide, number[][]>;
   progress?: Record<SudokuSide, SudokuProgress>;
   battle?: Record<SudokuSide, SudokuBattleState>;

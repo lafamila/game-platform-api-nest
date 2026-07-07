@@ -86,6 +86,19 @@ export class FakeDb {
       }
       return { rows: member ? [member] : [] };
     }
+    if (sql.includes('DELETE FROM game_room_members')) {
+      const before = this.roomMembers.length;
+      if (args[1] instanceof Date) {
+        this.roomMembers = this.roomMembers.filter(
+          (item) => item.room_id !== args[0] || item.status !== 'invited' || item.updated_at >= args[1],
+        );
+      } else {
+        this.roomMembers = this.roomMembers.filter(
+          (item) => !(item.room_id === args[0] && item.account_id === args[1]),
+        );
+      }
+      return { rows: [], rowCount: before - this.roomMembers.length };
+    }
     if (sql.includes('UPDATE game_rooms')) {
       const room = this.rooms.find((item) => item.id === args[0]);
       if (room) {
@@ -141,7 +154,7 @@ export class FakeDb {
         status: args[5],
         result: null,
         joined_at: new Date(),
-        left_at: null,
+        left_at: args[5] === 'active' ? null : new Date(),
       };
       if (existingIndex >= 0) {
         this.sessionPlayers[existingIndex] = { ...this.sessionPlayers[existingIndex], ...row };

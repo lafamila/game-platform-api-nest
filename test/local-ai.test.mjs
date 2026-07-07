@@ -470,7 +470,8 @@ test('mighty ai scheduler keeps one visible action per 1.5 second delay', () => 
   const scheduleBody = source.slice(scheduleStart, scheduleEnd);
 
   assert.match(scheduleBody, /MIGHTY_ENGINE\.applyAction\(current, current\.currentSeat, action\);/);
-  assert.match(scheduleBody, /}, MIGHTY_AI_RESPONSE_DELAY_MS\);/);
+  assert.match(scheduleBody, /setTimeout\(run, MIGHTY_AI_RESPONSE_DELAY_MS\)/);
+  assert.match(scheduleBody, /scheduleRoomAiTimer\(session\.id, MIGHTY_AI_RESPONSE_DELAY_MS, run\)/);
   assert.doesNotMatch(scheduleBody, /while\s*\(/);
 });
 
@@ -865,26 +866,35 @@ test('splendor local sessions follow token turns and answer with AI', async () =
 test('fortress local sessions use a long world and answer player shots', async () => {
   const service = new GamesService(new FakeDb(), new FakeRealtime());
 
-  const session = await service.createFortressSession(user, undefined, undefined, 'hard');
-  assert.equal(session.mode, 'local_ai');
-  assert.equal(session.aiDifficulty, 'hard');
-  assert.equal(session.status, 'selecting');
-  assert.ok(session.world.width > 1000);
-  assert.equal(session.tanks.opponent.accountId, '__game_platform_local_ai__');
-  assert.ok(session.tanks.opponent.tankKey);
+  // 지형/탱크 배치가 랜덤이라 특정 월드에서는 고정 각도 샷이 즉시 소멸할 수 있다.
+  // 궤적 애니메이션 검증은 최대 3개의 월드에서 시도한다.
+  let session;
+  let result;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    session = await service.createFortressSession(user, undefined, undefined, 'hard');
+    assert.equal(session.mode, 'local_ai');
+    assert.equal(session.aiDifficulty, 'hard');
+    assert.equal(session.status, 'selecting');
+    assert.ok(session.world.width > 1000);
+    assert.equal(session.tanks.opponent.accountId, '__game_platform_local_ai__');
+    assert.ok(session.tanks.opponent.tankKey);
 
-  const selected = await service.selectFortressTank(session.id, user, 'balance');
-  assert.equal(selected.status, 'playing');
-  assert.equal(selected.currentTurn, 'challenger');
-  assert.equal(selected.tanks.challenger.tankKey, 'balance');
-  assert.ok(selected.movementRemaining.challenger > 0);
-  const movementBefore = selected.movementRemaining.challenger;
+    const selected = await service.selectFortressTank(session.id, user, 'balance');
+    assert.equal(selected.status, 'playing');
+    assert.equal(selected.currentTurn, 'challenger');
+    assert.equal(selected.tanks.challenger.tankKey, 'balance');
+    assert.ok(selected.movementRemaining.challenger > 0);
+    const movementBefore = selected.movementRemaining.challenger;
 
-  const moved = await service.moveFortress(session.id, user, 10);
-  assert.equal(moved.currentTurn, 'challenger');
-  assert.ok(moved.movementRemaining.challenger < movementBefore);
+    const moved = await service.moveFortress(session.id, user, 10);
+    assert.equal(moved.currentTurn, 'challenger');
+    assert.ok(moved.movementRemaining.challenger < movementBefore);
 
-  const result = await service.shootFortress(session.id, user, 45, 82);
+    result = await service.shootFortress(session.id, user, 45, 82);
+    if (result.animation.projectile.length > 1) {
+      break;
+    }
+  }
   assert.ok(result.animation.projectile.length > 1);
   assert.equal(result.session.shots.length, 1);
   assert.equal(result.session.shots[0].source, 'manual');
@@ -1211,6 +1221,44 @@ test('sudoku and sokoban saves continue as solo puzzles after the source match f
   service.onModuleDestroy();
 });
 
+test('superadmin matched sudoku actions prefer their exact player seat', async () => {
+  const db = new FakeDb();
+  const service = new GamesService(db, new FakeRealtime());
+  try {
+    const superOpponent = {
+      ...opponent,
+      permission: 'superadmin',
+    };
+    const session = await service.createSudokuSession(user, 'medium', superOpponent.accountId);
+    let target = null;
+    for (let row = 0; row < session.puzzle.length && !target; row += 1) {
+      for (let col = 0; col < session.puzzle[row].length; col += 1) {
+        if (session.puzzle[row][col] === 0) {
+          target = { row, col };
+          break;
+        }
+      }
+    }
+    assert.ok(target);
+
+    const updated = await service.updateSudokuCell(
+      session.id,
+      superOpponent,
+      target.row,
+      target.col,
+      7,
+    );
+    const persisted = db.rows.get(session.id).state_json;
+
+    assert.equal(updated.mySide, 'opponent');
+    assert.equal(updated.board[target.row][target.col], 7);
+    assert.equal(persisted.boards.opponent[target.row][target.col], 7);
+    assert.equal(persisted.boards.challenger[target.row][target.col], 0);
+  } finally {
+    service.onModuleDestroy();
+  }
+});
+
 test('sudoku save previews keep the solution hidden', async () => {
   const service = new GamesService(new FakeDb(), new FakeRealtime());
   const session = await service.createSudokuSession(user, 'medium', opponent.accountId);
@@ -1449,6 +1497,19 @@ function firstEmptySudokuCell(puzzle) {
     }
   }
   throw new Error('sudoku puzzle has no empty cell');
+}
+
+function sudokuFilledEmptyCells(session, side) {
+  let filled = 0;
+  const board = session.boards[side];
+  for (let row = 0; row < session.puzzle.length; row += 1) {
+    for (let col = 0; col < session.puzzle[row].length; col += 1) {
+      if (session.puzzle[row][col] === 0 && board[row][col] !== 0) {
+        filled += 1;
+      }
+    }
+  }
+  return filled;
 }
 
 function storedEasySokobanMap() {
@@ -1769,9 +1830,12 @@ test('rooms start a two-player shortcut session and backfill participants', asyn
     const roomId = created.room.id;
     const roomCode = created.room.roomCode;
     assert.equal(created.room.members[0].account.loginId, 'lafamila');
+    assert.equal(created.room.members[0].ready, false);
 
     await service.inviteToRoom(roomId, user, { accountId: opponent.accountId });
+    assert.equal(realtime.events.some((event) => event.event === 'room.invited'), true);
     await service.joinRoom(opponent, { roomCode });
+    await service.setRoomReady(roomId, user, { ready: true });
     await service.setRoomReady(roomId, opponent, { ready: true });
     const started = await service.startRoom(roomId, user);
 
@@ -1779,6 +1843,224 @@ test('rooms start a two-player shortcut session and backfill participants', asyn
     assert.ok(started.sessionId);
     const players = db.sessionPlayers.filter((row) => row.session_id === started.sessionId);
     assert.deepEqual(players.map((row) => row.account_id).sort(), [opponent.accountId, user.accountId].sort());
+  } finally {
+    service.onModuleDestroy();
+  }
+});
+
+test('room invites stay hidden until accepted and can be reissued after expiry', async () => {
+  const db = new FakeDb();
+  db.friendRequests.push({
+    id: 'friend-1',
+    requester_account_id: user.accountId,
+    recipient_account_id: opponent.accountId,
+    status: 'accepted',
+  });
+  const realtime = new FakeRealtime();
+  const service = new GamesService(db, realtime);
+  try {
+    const created = await service.createRoom(user, { gameKey: 'gomoku', maxPlayers: 2 });
+    const invited = await service.inviteToRoom(created.room.id, user, { accountId: opponent.accountId });
+
+    assert.equal(invited.room.joinedCount, 1);
+    assert.equal(invited.room.members.length, 1);
+    assert.equal(invited.room.members.some((member) => member.accountId === opponent.accountId), false);
+
+    const inviteEvent = realtime.events.find((event) => event.event === 'room.invited');
+    assert.ok(inviteEvent);
+    assert.equal(inviteEvent.payload.joinedCount, 1);
+    assert.equal(inviteEvent.payload.members.length, 1);
+    assert.equal(typeof inviteEvent.payload.viewerInvitationExpiresAt, 'string');
+
+    await assert.rejects(
+      () => service.inviteToRoom(created.room.id, user, { accountId: opponent.accountId }),
+      /room invite is pending/,
+    );
+
+    const pendingInvite = db.roomMembers.find(
+      (member) => member.room_id === created.room.id && member.account_id === opponent.accountId,
+    );
+    pendingInvite.updated_at = new Date(Date.now() - 11_000);
+    const reinvited = await service.inviteToRoom(created.room.id, user, { accountId: opponent.accountId });
+
+    assert.equal(reinvited.room.joinedCount, 1);
+    assert.equal(
+      db.roomMembers.filter((member) => member.room_id === created.room.id && member.account_id === opponent.accountId)
+        .length,
+      1,
+    );
+  } finally {
+    service.onModuleDestroy();
+  }
+});
+
+test('room invitee sees room fill and cannot accept after capacity is reached', async () => {
+  const db = new FakeDb();
+  db.friendRequests.push({
+    id: 'friend-1',
+    requester_account_id: user.accountId,
+    recipient_account_id: opponent.accountId,
+    status: 'accepted',
+  });
+  const extra = { ...user, accountId: 'extra-player', subject: 'extra-player' };
+  const realtime = new FakeRealtime();
+  const service = new GamesService(db, realtime);
+  try {
+    const created = await service.createRoom(user, { gameKey: 'gomoku', maxPlayers: 2 });
+    await service.inviteToRoom(created.room.id, user, { accountId: opponent.accountId });
+    await service.joinRoom(extra, { roomCode: created.room.roomCode });
+
+    const joinedEvent = [...realtime.events]
+      .reverse()
+      .find((event) => event.event === 'room.member_joined' && event.accounts.includes(opponent.accountId));
+    assert.ok(joinedEvent);
+    assert.equal(joinedEvent.payload.joinedCount, 2);
+    assert.equal(joinedEvent.payload.members.length, 2);
+
+    await assert.rejects(() => service.acceptRoomInvite(created.room.id, opponent), /room is full/);
+    assert.equal(
+      db.roomMembers.some((member) => member.room_id === created.room.id && member.account_id === opponent.accountId),
+      false,
+    );
+  } finally {
+    service.onModuleDestroy();
+  }
+});
+
+test('rooms can add AI seats before start', async () => {
+  const db = new FakeDb();
+  const service = new GamesService(db, new FakeRealtime());
+  try {
+    const created = await service.createRoom(user, { gameKey: 'sudoku', maxPlayers: 3 });
+    const added = await service.addAiToRoom(created.room.id, user, { difficulty: 'hard' });
+    assert.equal(added.room.joinedCount, 2);
+    const aiMember = added.room.members.find((member) => member.kind === 'ai');
+    assert.ok(aiMember);
+    assert.equal(aiMember.aiDifficulty, 'hard');
+    assert.equal(aiMember.ready, true);
+
+    await service.setRoomReady(created.room.id, user, { ready: true });
+    const started = await service.startRoom(created.room.id, user);
+    const seats = db.sessionPlayers
+      .filter((row) => row.session_id === started.sessionId)
+      .sort((a, b) => a.seat - b.seat);
+    assert.equal(seats.length, 2);
+    assert.equal(seats[1].kind, 'ai');
+    assert.equal(seats[1].ai_difficulty, 'hard');
+  } finally {
+    service.onModuleDestroy();
+  }
+});
+
+test('room AI seats actively play sudoku without mutating human boards', async () => {
+  const db = new FakeDb();
+  const realtime = new FakeRealtime();
+  const service = new GamesService(db, realtime);
+  try {
+    const created = await service.createRoom(user, { gameKey: 'sudoku', maxPlayers: 3 });
+    await service.addAiToRoom(created.room.id, user, { difficulty: 'hard' });
+    await service.setRoomReady(created.room.id, user, { ready: true });
+    const started = await service.startRoom(created.room.id, user);
+
+    await wait(950);
+
+    const persisted = db.rows.get(started.sessionId).state_json;
+    const aiFilled = sudokuFilledEmptyCells(persisted, 'seat1');
+    const humanFilled = sudokuFilledEmptyCells(persisted, 'seat0');
+
+    assert.equal(aiFilled > 0, true);
+    assert.equal(humanFilled, 0);
+    assert.equal(realtime.events.some((event) => event.event === 'sudoku.cell.updated'), true);
+  } finally {
+    service.onModuleDestroy();
+  }
+});
+
+test('room AI seats solve sokoban with server-side moves', async () => {
+  const db = new FakeDb();
+  db.sokobanMaps.push({
+    id: 'room-ai-sokoban-map',
+    difficulty: 'easy',
+    map_key: 'room-ai-sokoban-map',
+    map_json: storedEasySokobanMap(),
+    metrics_json: { pushes: 2, boxLines: 1, boxChanges: 0 },
+    created_at: new Date(),
+  });
+  const realtime = new FakeRealtime();
+  const service = new GamesService(db, realtime);
+  try {
+    const created = await service.createRoom(user, { gameKey: 'sokoban', maxPlayers: 3 });
+    await service.addAiToRoom(created.room.id, user, { difficulty: 'hard' });
+    await service.setRoomReady(created.room.id, user, { ready: true });
+    const started = await service.startRoom(created.room.id, user);
+
+    await wait(1_850);
+
+    const persisted = db.rows.get(started.sessionId).state_json;
+    assert.equal(persisted.states.seat1.moves >= 2 || persisted.status === 'finished', true);
+    assert.equal(persisted.states.seat0.moves, 0);
+    assert.equal(realtime.events.some((event) => event.event === 'sokoban.move.played' || event.event === 'game.session.finished'), true);
+  } finally {
+    service.onModuleDestroy();
+  }
+});
+
+test('room AI seats take splendor and mighty turns', async () => {
+  const db = new FakeDb();
+  const service = new GamesService(db, new FakeRealtime());
+  try {
+    const splendorRoom = await service.createRoom(user, { gameKey: 'splendor', maxPlayers: 3 });
+    await service.addAiToRoom(splendorRoom.room.id, user, { difficulty: 'hard' });
+    await service.addAiToRoom(splendorRoom.room.id, user, { difficulty: 'medium' });
+    await service.setRoomReady(splendorRoom.room.id, user, { ready: true });
+    const startedSplendor = await service.startRoom(splendorRoom.room.id, user);
+
+    await service.takeSplendorTokens(startedSplendor.sessionId, user, {
+      white: 1,
+      blue: 1,
+      green: 1,
+    });
+    await wait(950);
+
+    const splendor = db.rows.get(startedSplendor.sessionId).state_json;
+    assert.equal(splendor.moves.some((move) => move.side === 'seat1' && move.source === 'ai'), true);
+    assert.notEqual(splendor.currentTurn, 'seat1');
+
+    const mightyRoom = await service.createRoom(user, { gameKey: 'mighty', maxPlayers: 5 });
+    for (const difficulty of ['easy', 'medium', 'hard', 'medium']) {
+      await service.addAiToRoom(mightyRoom.room.id, user, { difficulty });
+    }
+    await service.setRoomReady(mightyRoom.room.id, user, { ready: true });
+    const startedMighty = await service.startRoom(mightyRoom.room.id, user);
+    await service.applyGameAction('mighty', startedMighty.sessionId, user, {
+      type: 'bid',
+      payload: { pass: true },
+    });
+    await wait(1_650);
+
+    const mighty = db.rows.get(startedMighty.sessionId).state_json;
+    assert.equal(mighty.bids.length >= 2, true);
+    assert.equal(mighty.bids[1].seat, 1);
+  } finally {
+    service.onModuleDestroy();
+  }
+});
+
+test('room AI seats drive crazy arcade inputs during server ticks', async () => {
+  const db = new FakeDb();
+  const realtime = new FakeRealtime();
+  const service = new GamesService(db, realtime);
+  try {
+    const created = await service.createRoom(user, { gameKey: 'crazy_arcade', maxPlayers: 2 });
+    await service.addAiToRoom(created.room.id, user, { difficulty: 'hard' });
+    await service.setRoomReady(created.room.id, user, { ready: true });
+    const started = await service.startRoom(created.room.id, user);
+
+    await wait(280);
+
+    const persisted = db.rows.get(started.sessionId).state_json;
+    assert.match(String(persisted.inputs.seat1.direction), /^(up|right|down|left)$/);
+    assert.equal(realtime.events.some((event) => event.event === 'crazy_arcade.state.synced'), true);
   } finally {
     service.onModuleDestroy();
   }
@@ -1798,6 +2080,7 @@ test('rooms can start multi-player sessions and persist every participant seat',
     await service.joinRoom(opponent, { roomCode: splendorRoom.room.roomCode });
     await service.joinRoom(extraPlayers[0], { roomCode: splendorRoom.room.roomCode });
     await service.joinRoom(extraPlayers[1], { roomCode: splendorRoom.room.roomCode });
+    await service.setRoomReady(splendorRoom.room.id, user, { ready: true });
     await service.setRoomReady(splendorRoom.room.id, opponent, { ready: true });
     await service.setRoomReady(splendorRoom.room.id, extraPlayers[0], { ready: true });
     await service.setRoomReady(splendorRoom.room.id, extraPlayers[1], { ready: true });
@@ -1826,6 +2109,16 @@ test('rooms can start multi-player sessions and persist every participant seat',
     });
     assert.equal(afterHostTurn.currentTurn, 'seat1');
     assert.equal(afterHostTurn.playerStates.seat0.tokens.white, 1);
+    await service.forfeitSplendor(startedSplendor.sessionId, opponent);
+    const afterOpponentForfeit = db.rows.get(startedSplendor.sessionId).state_json;
+    assert.equal(afterOpponentForfeit.status, 'playing');
+    assert.equal(afterOpponentForfeit.seatStatus.seat1, 'forfeited');
+    const forfeitedSeat = db.sessionPlayers.find(
+      (row) => row.session_id === startedSplendor.sessionId && row.account_id === opponent.accountId,
+    );
+    assert.equal(forfeitedSeat.status, 'forfeited');
+    assert.equal((await service.listActiveSessions(opponent)).sessions.length, 0);
+    assert.equal((await service.listActiveSessions(user)).sessions.some((session) => session.sessionId === startedSplendor.sessionId), true);
 
     const sudokuRoom = await service.createRoom(user, { gameKey: 'sudoku', maxPlayers: 6 });
     const sudokuPlayers = [opponent, ...extraPlayers];
@@ -1833,6 +2126,7 @@ test('rooms can start multi-player sessions and persist every participant seat',
       await service.joinRoom(player, { roomCode: sudokuRoom.room.roomCode });
       await service.setRoomReady(sudokuRoom.room.id, player, { ready: true });
     }
+    await service.setRoomReady(sudokuRoom.room.id, user, { ready: true });
     const startedSudoku = await service.startRoom(sudokuRoom.room.id, user);
     const persistedSudokuPlayers = db.sessionPlayers.filter((row) => row.session_id === startedSudoku.sessionId);
     assert.equal(persistedSudokuPlayers.length, 6);
@@ -1856,12 +2150,25 @@ test('rooms can start multi-player sessions and persist every participant seat',
     assert.equal(updatedSudoku.mySide, 'seat5');
     assert.equal(updatedSudoku.board[emptySudokuCell.row][emptySudokuCell.col], 1);
     assert.equal(db.rows.get(startedSudoku.sessionId).state_json.boards.seat5[emptySudokuCell.row][emptySudokuCell.col], 1);
+    const afterSudokuForfeit = await service.forfeitSudoku(startedSudoku.sessionId, opponent);
+    assert.equal(afterSudokuForfeit.status, 'playing');
+    assert.equal(afterSudokuForfeit.mySeatStatus, 'forfeited');
+    const persistedSudokuAfterForfeit = db.rows.get(startedSudoku.sessionId).state_json;
+    assert.equal(persistedSudokuAfterForfeit.seatStatus.seat1, 'forfeited');
+    assert.equal(persistedSudokuAfterForfeit.status, 'playing');
+    const forfeitedSudokuSeat = db.sessionPlayers.find(
+      (row) => row.session_id === startedSudoku.sessionId && row.account_id === opponent.accountId,
+    );
+    assert.equal(forfeitedSudokuSeat.status, 'forfeited');
+    assert.equal((await service.listActiveSessions(opponent)).sessions.length, 0);
+    assert.equal((await service.listActiveSessions(user)).sessions.some((session) => session.sessionId === startedSudoku.sessionId), true);
 
     const sokobanRoom = await service.createRoom(user, { gameKey: 'sokoban', maxPlayers: 6 });
     for (const player of sudokuPlayers) {
       await service.joinRoom(player, { roomCode: sokobanRoom.room.roomCode });
       await service.setRoomReady(sokobanRoom.room.id, player, { ready: true });
     }
+    await service.setRoomReady(sokobanRoom.room.id, user, { ready: true });
     const startedSokoban = await service.startRoom(sokobanRoom.room.id, user);
     const persistedSokobanPlayers = db.sessionPlayers.filter((row) => row.session_id === startedSokoban.sessionId);
     assert.equal(persistedSokobanPlayers.length, 6);
@@ -1877,6 +2184,7 @@ test('rooms can start multi-player sessions and persist every participant seat',
     await service.joinRoom(opponent, { roomCode: crazyRoom.room.roomCode });
     await service.joinRoom(extraPlayers[0], { roomCode: crazyRoom.room.roomCode });
     await service.joinRoom(extraPlayers[1], { roomCode: crazyRoom.room.roomCode });
+    await service.setRoomReady(crazyRoom.room.id, user, { ready: true });
     await service.setRoomReady(crazyRoom.room.id, opponent, { ready: true });
     await service.setRoomReady(crazyRoom.room.id, extraPlayers[0], { ready: true });
     await service.setRoomReady(crazyRoom.room.id, extraPlayers[1], { ready: true });
@@ -1907,6 +2215,7 @@ test('rooms can start multi-player sessions and persist every participant seat',
       await service.joinRoom(player, { roomCode: mightyRoom.room.roomCode });
       await service.setRoomReady(mightyRoom.room.id, player, { ready: true });
     }
+    await service.setRoomReady(mightyRoom.room.id, user, { ready: true });
     const startedMighty = await service.startRoom(mightyRoom.room.id, user);
     const mightyPlayers = db.sessionPlayers
       .filter((row) => row.session_id === startedMighty.sessionId)

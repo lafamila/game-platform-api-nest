@@ -5,10 +5,12 @@ import { intEnv } from '../config/env';
 import { AuthAccount } from '../auth/auth.types';
 import { emoteGridSizeFor, hasPlayerAccess } from '../auth/roles';
 import { RealtimeService } from '../realtime/realtime.service';
+import { SeatInfo } from './engine/game-engine';
 import { createSudoku } from './sudoku-generator';
 import { createSokobanMap, createVerifiedSokobanMap, GeneratedSokobanMap } from './sokoban-generator';
 import {
   applySplendorAiTurn,
+  applySplendorAiTurnForSide,
   applySplendorForfeit,
   createSplendorDecks,
   createSplendorState,
@@ -83,9 +85,11 @@ import {
   randomAlkkagiShot,
 } from './alkkagi-engine';
 import {
+  applySokobanMove,
   createSokobanPlayerState,
   ensureSokobanPlayerState,
   firstOtherSokobanSide,
+  finishSokobanAfterMove,
   hasPosition,
   isSokobanStateSolvable,
   sessionForSokobanSide,
@@ -93,6 +97,7 @@ import {
   sokobanSides,
 } from './sokoban-engine';
 import {
+  applySudokuCell,
   cloneSudokuGrid,
   createSudokuBattleMap,
   createSudokuBattleState,
@@ -101,6 +106,7 @@ import {
   hideSudokuSolutionForAccount,
   sudokuSideForAccount,
   sudokuSides,
+  submitSudokuState,
   validateSudokuBoard,
 } from './sudoku-engine';
 import {
@@ -128,12 +134,19 @@ const FORTRESS_TURN_LIMIT_MS = 20_000;
 const LOCAL_AI_RESPONSE_DELAY_MS = 180;
 const MIGHTY_AI_RESPONSE_DELAY_MS = 1_500;
 const FORTRESS_AI_RESPONSE_DELAY_MS = 1_000;
+const ROOM_AI_RESPONSE_DELAY_MS = 850;
+const ROOM_RACE_AI_DELAY_MS: Record<Difficulty, number> = {
+  easy: 1_900,
+  medium: 1_300,
+  hard: 850,
+};
 const FORTRESS_SHOT_ANIMATION_MS = 2_800;
 const DISCONNECT_GRACE_MS = intEnv('GAME_PLATFORM_DISCONNECT_GRACE_SECONDS', 60) * 1000;
 const CRAZY_ARCADE_SERVER_TICK_MS = 120;
 const EMOTE_COOLDOWN_MS = 3_000;
 const MATCH_PAUSE_LIMIT = 3;
 const MATCH_PAUSE_RESUME_LOCK_MS = 3_000;
+const ROOM_INVITE_TTL_MS = 10_000;
 const CLIENT_MOVE_HISTORY_LIMIT = 20;
 const EMOTE_COLORS = new Set(['red', 'orange', 'yellow', 'green', 'blue', 'indigo', 'purple', 'black', 'white']);
 const LOCAL_AI_ACCOUNT_ID = '__game_platform_local_ai__';
@@ -207,6 +220,13 @@ interface LocalAiResultInput {
   payload: Record<string, unknown>;
 }
 
+interface RoomAiSeat {
+  side: string;
+  accountId: string;
+  seat: number;
+  difficulty: Difficulty;
+}
+
 interface GameRoomRow {
   id: string;
   room_code: string;
@@ -239,6 +259,7 @@ interface GameRoomMemberRow {
 @Injectable()
 export class GamesService implements OnModuleInit, OnModuleDestroy {
   private readonly turnTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly roomAiTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly crazyArcadeTickTimers = new Map<string, ReturnType<typeof setInterval>>();
   private readonly crazyArcadeInputQueues = new Map<string, Promise<unknown>>();
   private readonly emoteCooldowns = new Map<string, number>();
@@ -255,6 +276,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     await this.prepareSokobanMapPool();
     await this.restoreActiveTurnTimers();
     await this.restoreCrazyArcadeTicks();
+    await this.restoreRoomAiTimers();
     this.scheduleAbandonedSessionGc();
   }
 
@@ -263,6 +285,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       clearTimeout(timer);
     }
     this.turnTimers.clear();
+    for (const timer of this.roomAiTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.roomAiTimers.clear();
     for (const timer of this.crazyArcadeTickTimers.values()) {
       clearInterval(timer);
     }
@@ -286,6 +312,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (!this.gameRegistry.has(gameKey)) {
       throw new BadRequestException('unsupported gameKey');
     }
+    await this.forfeitActiveSessions(user);
     const difficulty = input.difficulty ?? 'medium';
     const opponentAccountId = typeof input.opponentAccountId === 'string' && input.opponentAccountId.length > 0
       ? input.opponentAccountId
@@ -340,18 +367,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   async listActiveSessions(user: AuthAccount): Promise<{ sessions: ActiveGameSessionSummary[] }> {
-    const result = await this.db.query<GameRow>(
-      `SELECT DISTINCT gs.*
-       FROM game_sessions gs
-       JOIN game_session_players gsp ON gsp.session_id = gs.id
-       WHERE gs.status NOT IN ('finished', 'cleared', 'failed')
-         AND gsp.account_id = $1
-         AND gsp.status = 'active'
-       ORDER BY gs.updated_at DESC
-       LIMIT 50`,
-      [user.accountId],
-    );
-    const sessions = await Promise.all(result.rows.map(async (row) => {
+    const rows = await this.activeSessionRowsForAccount(user.accountId, 50);
+    const sessions = await Promise.all(rows.map(async (row) => {
       const state = row.state_json as { rev?: number; players?: Record<string, string> };
       const seats = await this.sessionSeatRows(row);
       const currentTurnAccountId = currentTurnAccountIdForRow(row, seats);
@@ -371,6 +388,72 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       };
     }));
     return { sessions };
+  }
+
+  async forfeitActiveSessions(user: AuthAccount): Promise<{ forfeited: number }> {
+    const rows = await this.activeSessionRowsForAccount(user.accountId);
+    let forfeited = 0;
+    for (const row of rows) {
+      await this.forfeitActiveSessionRow(row, user);
+      forfeited += 1;
+    }
+    return { forfeited };
+  }
+
+  private async activeSessionRowsForAccount(accountId: string, limit?: number): Promise<GameRow[]> {
+    const limitClause = limit ? `\n       LIMIT ${limit}` : '';
+    const result = await this.db.query<GameRow>(
+      `SELECT DISTINCT gs.*
+       FROM game_sessions gs
+       JOIN game_session_players gsp ON gsp.session_id = gs.id
+       WHERE gs.status NOT IN ('finished', 'cleared', 'failed')
+         AND gsp.account_id = $1
+         AND gsp.kind = 'account'
+         AND gsp.status = 'active'
+       ORDER BY gs.updated_at DESC${limitClause}`,
+      [accountId],
+    );
+    return result.rows;
+  }
+
+  private async forfeitActiveSessionRow(row: GameRow, user: AuthAccount): Promise<void> {
+    if (row.game_key === 'sudoku') {
+      await this.forfeitSudoku(row.id, user);
+      return;
+    }
+    if (row.game_key === 'gomoku') {
+      await this.forfeitGomoku(row.id, user);
+      return;
+    }
+    if (row.game_key === 'alkkagi') {
+      await this.forfeitAlkkagi(row.id, user);
+      return;
+    }
+    if (row.game_key === 'othello') {
+      await this.forfeitOthello(row.id, user);
+      return;
+    }
+    if (row.game_key === 'sokoban') {
+      await this.forfeitSokoban(row.id, user);
+      return;
+    }
+    if (row.game_key === 'splendor') {
+      await this.forfeitSplendor(row.id, user);
+      return;
+    }
+    if (row.game_key === 'fortress') {
+      await this.forfeitFortress(row.id, user);
+      return;
+    }
+    if (row.game_key === 'crazy_arcade') {
+      await this.forfeitCrazyArcade(row.id, user);
+      return;
+    }
+    if (row.game_key === 'mighty') {
+      await this.applyMightyForfeit(row.id, user);
+      return;
+    }
+    await this.finishActiveSessionRow(row, 'forfeit');
   }
 
   async applyGameAction(
@@ -519,6 +602,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     input: { gameKey?: string; maxPlayers?: number; visibility?: string; config?: Record<string, unknown> },
   ): Promise<{ room: unknown }> {
     this.assertCanUseRooms(user);
+    await this.forfeitActiveSessions(user);
+    if (await this.isAccountInActiveGame(user.accountId)) {
+      throw new BadRequestException('account is already in game');
+    }
     const gameKey = input.gameKey ?? '';
     const descriptor = this.gameRegistry.get(gameKey);
     if (!descriptor) {
@@ -544,8 +631,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     );
     await this.db.query(
       `INSERT INTO game_room_members (room_id, account_id, seat, status, ready)
-       VALUES ($1, $2, 0, 'joined', true)
-       ON CONFLICT (room_id, account_id) DO UPDATE SET status = 'joined', ready = true, updated_at = now()`,
+       VALUES ($1, $2, 0, 'joined', false)
+       ON CONFLICT (room_id, account_id) DO UPDATE SET status = 'joined', ready = false, updated_at = now()`,
       [result.rows[0].id, user.accountId],
     );
     return { room: await this.roomView(result.rows[0], user.accountId) };
@@ -554,13 +641,21 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   async getRoom(id: string, user: AuthAccount): Promise<{ room: unknown }> {
     const room = await this.requireRoom(id);
     await this.assertRoomVisible(room, user);
+    await this.cleanupExpiredRoomInvites(room.id);
     return { room: await this.roomView(room, user.accountId) };
   }
 
   async inviteToRoom(id: string, user: AuthAccount, input: { accountId?: string }): Promise<{ room: unknown }> {
     this.assertCanUseRooms(user);
+    if (await this.isAccountInActiveGame(user.accountId)) {
+      throw new BadRequestException('account is already in game');
+    }
     const room = await this.requireRoom(id);
-    await this.assertRoomMember(room.id, user.accountId);
+    await this.cleanupExpiredRoomInvites(room.id);
+    const inviter = await this.assertRoomMember(room.id, user.accountId);
+    if (inviter.status !== 'joined') {
+      throw new BadRequestException('room member must join before inviting');
+    }
     if (room.status !== 'waiting') {
       throw new BadRequestException('room is not waiting');
     }
@@ -568,15 +663,26 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (!accountId || accountId === user.accountId) {
       throw new BadRequestException('accountId must be another account');
     }
+    if (await this.isAccountInActiveGame(accountId)) {
+      throw new BadRequestException('opponent is in game');
+    }
     await this.assertFriends(user.accountId, accountId);
     if (!(await this.realtime.isAccountOnline(accountId))) {
       throw new BadRequestException('opponent is offline');
     }
     const members = await this.roomMembers(room.id);
-    if (members.length >= room.max_players && !members.some((member) => member.account_id === accountId)) {
+    const targetMember = members.find((member) => member.account_id === accountId);
+    if (targetMember?.status === 'joined') {
+      throw new BadRequestException('account is already in room');
+    }
+    if (targetMember?.status === 'invited' && !this.roomInviteExpired(targetMember)) {
+      throw new BadRequestException('room invite is pending');
+    }
+    const joinedMembers = members.filter((member) => member.status === 'joined');
+    if (joinedMembers.length >= room.max_players) {
       throw new BadRequestException('room is full');
     }
-    const seat = members.find((member) => member.account_id === accountId)?.seat ?? nextRoomSeat(members);
+    const seat = targetMember?.seat ?? nextRoomSeat(members);
     await this.db.query(
       `INSERT INTO game_room_members (room_id, account_id, seat, status, ready)
        VALUES ($1, $2, $3, 'invited', false)
@@ -585,9 +691,144 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     );
     const updated = await this.requireRoom(id);
     const view = await this.roomView(updated, user.accountId);
-    this.realtime.emitToAccounts([accountId], 'room.invited', view);
-    await this.emitRoomEvent(updated, 'room.member_invited', view);
+    const recipientView = await this.roomView(updated, accountId);
+    this.realtime.emitToAccounts([accountId], 'room.invited', recipientView);
+    await this.emitRoomEvent(updated, 'room.member_invited');
     return { room: view };
+  }
+
+  async addAiToRoom(id: string, user: AuthAccount, input: { difficulty?: Difficulty }): Promise<{ room: unknown }> {
+    this.assertCanUseRooms(user);
+    const room = await this.requireRoom(id);
+    await this.cleanupExpiredRoomInvites(room.id);
+    const member = await this.assertRoomMember(room.id, user.accountId);
+    if (member.status !== 'joined') {
+      throw new BadRequestException('room member must join before adding AI');
+    }
+    if (room.status !== 'waiting') {
+      throw new BadRequestException('room is not waiting');
+    }
+    const descriptor = this.gameRegistry.get(room.game_key);
+    if (!descriptor?.supportsAi) {
+      throw new BadRequestException('AI is not available for this game');
+    }
+    const members = await this.roomMembers(room.id);
+    const joinedMembers = members.filter((item) => item.status === 'joined');
+    if (joinedMembers.length >= room.max_players) {
+      throw new BadRequestException('room is full');
+    }
+    const difficulty = difficultyFromSnapshot(input.difficulty, 'medium');
+    const seat = nextRoomSeat(members);
+    const aiAccountId = roomAiAccountId(room.id, seat, difficulty);
+    await this.db.query(
+      `INSERT INTO game_room_members (room_id, account_id, seat, status, ready)
+       VALUES ($1, $2, $3, 'joined', true)
+       ON CONFLICT (room_id, account_id) DO UPDATE SET status = 'joined', ready = true, updated_at = now()`,
+      [room.id, aiAccountId, seat],
+    );
+    const updated = await this.requireRoom(id);
+    await this.emitRoomEvent(updated, 'room.member_joined');
+    return { room: await this.roomView(updated, user.accountId) };
+  }
+
+  async acceptRoomInvite(id: string, user: AuthAccount): Promise<{ room: unknown }> {
+    this.assertCanUseRooms(user);
+    await this.forfeitActiveSessions(user);
+    if (await this.isAccountInActiveGame(user.accountId)) {
+      throw new BadRequestException('account is already in game');
+    }
+    const room = await this.requireRoom(id);
+    if (room.status !== 'waiting') {
+      throw new BadRequestException('room is not waiting');
+    }
+    const member = await this.assertRoomMember(room.id, user.accountId);
+    if (member.status !== 'invited' && member.status !== 'joined') {
+      throw new BadRequestException('room invite is not pending');
+    }
+    if (member.status === 'invited' && this.roomInviteExpired(member)) {
+      await this.db.query(`DELETE FROM game_room_members WHERE room_id = $1 AND account_id = $2`, [
+        room.id,
+        user.accountId,
+      ]);
+      await this.emitRoomEvent(room, 'room.member_left');
+      throw new BadRequestException('room invite expired');
+    }
+    const joinedMembers = (await this.roomMembers(room.id)).filter((item) => item.status === 'joined');
+    if (member.status !== 'joined' && joinedMembers.length >= room.max_players) {
+      await this.db.query(`DELETE FROM game_room_members WHERE room_id = $1 AND account_id = $2`, [
+        room.id,
+        user.accountId,
+      ]);
+      await this.emitRoomEvent(room, 'room.member_left');
+      throw new BadRequestException('room is full');
+    }
+    await this.db.query(
+      `UPDATE game_room_members
+       SET status = 'joined', ready = false, updated_at = now()
+       WHERE room_id = $1 AND account_id = $2`,
+      [room.id, user.accountId],
+    );
+    const updated = await this.requireRoom(room.id);
+    await this.emitRoomEvent(updated, 'room.member_joined');
+    return { room: await this.roomView(updated, user.accountId) };
+  }
+
+  async rejectRoomInvite(id: string, user: AuthAccount): Promise<{ ok: true }> {
+    const room = await this.requireRoom(id);
+    const member = await this.assertRoomMember(room.id, user.accountId);
+    if (member.status !== 'invited') {
+      throw new BadRequestException('room invite is not pending');
+    }
+    await this.db.query(
+      `DELETE FROM game_room_members WHERE room_id = $1 AND account_id = $2`,
+      [room.id, user.accountId],
+    );
+    const updated = await this.requireRoom(room.id);
+    await this.emitRoomEvent(updated, 'room.member_left');
+    return { ok: true };
+  }
+
+  async sendRoomEmote(id: string, user: AuthAccount, slot: number): Promise<unknown> {
+    if (!hasPlayerAccess(user)) {
+      throw new ForbiddenException('player permission is required for custom emotes');
+    }
+    validateEmoteSlot(slot);
+    const room = await this.requireRoom(id);
+    if (room.status !== 'waiting') {
+      throw new BadRequestException('custom emotes are only available in waiting rooms');
+    }
+    const member = await this.assertRoomMember(room.id, user.accountId);
+    if (member.status !== 'joined') {
+      throw new BadRequestException('room member must join before sending emotes');
+    }
+    const cooldownKey = `room:${room.id}:${user.accountId}`;
+    const cooldownUntil = this.emoteCooldowns.get(cooldownKey) ?? 0;
+    if (cooldownUntil > Date.now()) {
+      throw new BadRequestException('emote cooldown active');
+    }
+    const row = await this.db.one<CustomEmoteRow>(
+      `SELECT account_id, slot, grid_size, cells_json, updated_at
+       FROM custom_emotes
+       WHERE account_id = $1 AND slot = $2`,
+      [user.accountId, slot],
+    );
+    if (!row) {
+      throw new BadRequestException('custom emote slot is empty');
+    }
+    const emote = emoteFromRow(row);
+    const event = {
+      id: room.id,
+      roomId: room.id,
+      senderAccountId: user.accountId,
+      senderLabel: accountDisplayLabel(user),
+      slot: emote.slot,
+      gridSize: emote.gridSize,
+      cells: emote.cells,
+      sentAt: new Date().toISOString(),
+    };
+    this.emoteCooldowns.set(cooldownKey, Date.now() + EMOTE_COOLDOWN_MS);
+    await this.emitRoomEvent(room, 'room.emote.sent', event);
+    return event;
   }
 
   async joinRoom(user: AuthAccount, input: { roomCode?: string }): Promise<{ room: unknown }> {
@@ -600,11 +841,14 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (room.status !== 'waiting') {
       throw new BadRequestException('room is not waiting');
     }
+    await this.cleanupExpiredRoomInvites(room.id);
     const members = await this.roomMembers(room.id);
-    if (members.length >= room.max_players && !members.some((member) => member.account_id === user.accountId)) {
+    const joinedMembers = members.filter((member) => member.status === 'joined');
+    const existingMember = members.find((member) => member.account_id === user.accountId);
+    if (joinedMembers.length >= room.max_players && existingMember?.status !== 'joined') {
       throw new BadRequestException('room is full');
     }
-    const seat = members.find((member) => member.account_id === user.accountId)?.seat ?? nextRoomSeat(members);
+    const seat = existingMember?.seat ?? nextRoomSeat(members);
     await this.db.query(
       `INSERT INTO game_room_members (room_id, account_id, seat, status, ready)
        VALUES ($1, $2, $3, 'joined', false)
@@ -613,13 +857,16 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     );
     const updated = await this.requireRoom(room.id);
     const view = await this.roomView(updated, user.accountId);
-    await this.emitRoomEvent(updated, 'room.member_joined', view);
+    await this.emitRoomEvent(updated, 'room.member_joined');
     return { room: view };
   }
 
   async setRoomReady(id: string, user: AuthAccount, input: { ready?: boolean }): Promise<{ room: unknown }> {
     const room = await this.requireRoom(id);
-    await this.assertRoomMember(room.id, user.accountId);
+    const member = await this.assertRoomMember(room.id, user.accountId);
+    if (member.status !== 'joined') {
+      throw new BadRequestException('room member must join before ready');
+    }
     if (room.status !== 'waiting') {
       throw new BadRequestException('room is not waiting');
     }
@@ -630,7 +877,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       [room.id, user.accountId, input.ready !== false],
     );
     const view = await this.roomView(room, user.accountId);
-    await this.emitRoomEvent(room, 'room.member_ready', view);
+    await this.emitRoomEvent(room, 'room.member_ready');
     return { room: view };
   }
 
@@ -642,6 +889,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (room.status !== 'waiting') {
       throw new BadRequestException('room is not waiting');
     }
+    await this.cleanupExpiredRoomInvites(room.id);
     const descriptor = this.gameRegistry.get(room.game_key);
     if (!descriptor) {
       throw new BadRequestException('unsupported gameKey');
@@ -663,7 +911,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       [room.id, sessionId],
     );
     const view = await this.roomView(updated ?? room, user.accountId);
-    await this.emitRoomEvent(updated ?? room, 'room.started', { ...view, sessionId });
+    await this.emitRoomEvent(updated ?? room, 'room.started', { sessionId });
     return { room: view, sessionId };
   }
 
@@ -1040,6 +1288,41 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     const session = this.sudokuFromRow(await this.requireGameRow(id, 'sudoku'));
     this.assertSudokuParticipant(user, session);
     return this.sendSessionEmote('sudoku', session, user, slot);
+  }
+
+  async forfeitSudoku(id: string, user: AuthAccount): Promise<Omit<SudokuSession, 'solution'>> {
+    const session = this.sudokuFromRow(await this.requireGameRow(id, 'sudoku'));
+    this.assertSudokuParticipant(user, session);
+    if (session.status !== 'playing') {
+      return hideSudokuSolution(session, user);
+    }
+    const loser = this.sudokuSideForUser(session, user);
+    if (session.players && loser) {
+      session.seatStatus ??= Object.fromEntries(sudokuSides(session).map((side) => [side, 'active']));
+      session.seatStatus[loser] = 'forfeited';
+      const remaining = sudokuSides(session).filter((side) => session.seatStatus?.[side] !== 'forfeited');
+      if (remaining.length <= 1) {
+        const winner = remaining[0];
+        session.status = 'finished';
+        session.winnerSide = winner;
+        session.winnerAccountId = winner ? session.players[winner] : undefined;
+        session.finishReason = 'forfeit';
+      } else {
+        session.status = 'playing';
+        session.winnerSide = undefined;
+        session.winnerAccountId = undefined;
+        session.finishReason = undefined;
+      }
+    } else {
+      session.status = 'failed';
+      session.winnerSide = undefined;
+      session.winnerAccountId = undefined;
+      session.finishReason = 'forfeit';
+    }
+    session.updatedAt = new Date().toISOString();
+    const saved = this.sudokuFromRow(await this.updateGame(id, session.status, null, session.winnerSide ?? null, session));
+    this.emitSudokuEvent(saved, saved.status === 'playing' ? 'sudoku.cell.updated' : 'game.session.finished');
+    return hideSudokuSolution(saved, user);
   }
 
   async createGomokuSession(
@@ -1554,8 +1837,18 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   async forfeitSokoban(id: string, user: AuthAccount): Promise<SokobanSession> {
     const session = this.sokobanFromRow(await this.requireGameRow(id, 'sokoban'));
     this.assertSokobanParticipant(user, session);
-    if (session.status !== 'playing' || !session.players) {
+    if (session.status !== 'playing') {
       return sessionForSokobanUser(session, user);
+    }
+    if (!session.players) {
+      session.status = 'finished';
+      session.winnerSide = undefined;
+      session.winnerAccountId = undefined;
+      session.finishReason = 'forfeit';
+      session.updatedAt = new Date().toISOString();
+      const saved = this.sokobanFromRow(await this.updateGame(id, session.status, null, null, session));
+      this.emitSokobanEvent(saved, 'game.session.finished');
+      return sessionForSokobanUser(saved, user);
     }
     const loser = this.sokobanSideForUser(session, user) ?? 'challenger';
     const winner = firstOtherSokobanSide(session, loser);
@@ -2562,6 +2855,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       const session = this.sudokuFromRow(await this.requireGameRow(id, 'sudoku'));
       this.assertSudokuParticipant(user, session);
       this.applyPause(session, user);
+      this.clearRoomAiTimer(id);
       const saved = this.sudokuFromRow(await this.updateGame(id, session.status, null, null, session));
       this.emitSudokuEvent(saved, 'game.session.paused');
       return hideSudokuSolution(saved, user);
@@ -2597,6 +2891,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       const session = this.sokobanFromRow(await this.requireGameRow(id, 'sokoban'));
       this.assertSokobanParticipant(user, session);
       this.applyPause(session, user);
+      this.clearRoomAiTimer(id);
       const saved = this.sokobanFromRow(await this.updateGame(id, session.status, null, session.winnerSide ?? null, session));
       this.emitSokobanEvent(saved, 'game.session.paused');
       return sessionForSokobanUser(saved, user);
@@ -2605,6 +2900,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
       this.assertSplendorParticipant(user, session);
       this.applyPause(session, user);
+      this.clearRoomAiTimer(id);
       const saved = await this.saveSplendorSession(session);
       this.emitSessionEvent(saved, 'game.session.paused', splendorClientSession(saved));
       return splendorClientSession(saved, user.accountId);
@@ -2631,6 +2927,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       const session = this.mightyFromRow(await this.requireGameRow(id, 'mighty'));
       this.assertMightyParticipant(user, session);
       this.applyPause(session, user);
+      this.clearRoomAiTimer(id);
       const saved = await this.saveMightySession(session);
       this.emitMightyEvent(saved, 'game.session.paused');
       return this.mightyView(saved, user);
@@ -2645,6 +2942,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.applyResume(session);
       const saved = this.sudokuFromRow(await this.updateGame(id, session.status, null, null, session));
       this.emitSudokuEvent(saved, 'game.session.resumed');
+      this.scheduleRoomSudokuAi(saved);
       return hideSudokuSolution(saved, user);
     }
     if (gameKey === 'gomoku') {
@@ -2680,6 +2978,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.applyResume(session);
       const saved = this.sokobanFromRow(await this.updateGame(id, session.status, null, session.winnerSide ?? null, session));
       this.emitSokobanEvent(saved, 'game.session.resumed');
+      this.scheduleRoomSokobanAi(saved);
       return sessionForSokobanUser(saved, user);
     }
     if (gameKey === 'splendor') {
@@ -2688,6 +2987,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.applyResume(session);
       const saved = await this.saveSplendorSession(session);
       this.emitSessionEvent(saved, 'game.session.resumed', splendorClientSession(saved));
+      this.scheduleSplendorAi(saved);
       return splendorClientSession(saved, user.accountId);
     }
     if (gameKey === 'fortress') {
@@ -2756,8 +3056,31 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async createSessionFromRoom(room: GameRoomRow, members: GameRoomMemberRow[]): Promise<string> {
-    if (members.length === 2) {
-      return this.createSessionFromMatch(room.game_key, members[0].account_id, members[1].account_id);
+    const orderedMembers = [...members].sort((a, b) => a.seat - b.seat);
+    const hasAiMember = orderedMembers.some((member) => isLocalAiAccount(member.account_id));
+    if (orderedMembers.length === 2 && !hasAiMember) {
+      return this.createSessionFromMatch(room.game_key, orderedMembers[0].account_id, orderedMembers[1].account_id);
+    }
+    if (orderedMembers.length === 2 && hasAiMember) {
+      const humanMember = orderedMembers.find((member) => !isLocalAiAccount(member.account_id));
+      if (humanMember) {
+        const fakeUser: AuthAccount = {
+          accountId: humanMember.account_id,
+          subject: humanMember.account_id,
+          serviceKey: 'game-platform',
+          permission: 'player',
+          claims: {},
+        };
+        const difficulty = difficultyFromSnapshot(
+          isRecord(room.config_json) ? room.config_json.difficulty : undefined,
+          roomAiDifficultyFromAccountId(orderedMembers.find((member) => isLocalAiAccount(member.account_id))?.account_id ?? ''),
+        );
+        if (room.game_key === 'gomoku') return (await this.createGomokuSession(fakeUser, undefined, 'local_ai', difficulty)).id;
+        if (room.game_key === 'alkkagi') return (await this.createAlkkagiSession(fakeUser, undefined, 'local_ai', difficulty)).id;
+        if (room.game_key === 'othello') return (await this.createOthelloSession(fakeUser, undefined, 'local_ai', difficulty)).id;
+        if (room.game_key === 'splendor') return (await this.createSplendorSession(fakeUser, undefined, 'local_ai', difficulty)).id;
+        if (room.game_key === 'fortress') return (await this.createFortressSession(fakeUser, undefined, 'local_ai', difficulty)).id;
+      }
     }
     const descriptor = this.gameRegistry.get(room.game_key);
     if (!descriptor || descriptor.maxPlayers < members.length) {
@@ -2766,14 +3089,9 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (!['splendor', 'sudoku', 'sokoban', 'crazy_arcade', 'mighty'].includes(room.game_key)) {
       throw new BadRequestException('multi-player room start is not available for this game');
     }
-    const orderedMembers = [...members].sort((a, b) => a.seat - b.seat);
     if (room.game_key === 'mighty') {
       const state = MIGHTY_ENGINE.createState(
-        orderedMembers.map((member) => ({
-          seat: member.seat,
-          accountId: member.account_id,
-          kind: 'account',
-        })),
+        orderedMembers.map(seatInfoFromRoomMember),
         {
           id: '',
           mode: 'friend_match',
@@ -2801,14 +3119,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         null,
         {
           ...state,
-          roomPlayers: orderedMembers.map((member) => ({
-            seat: member.seat,
-            accountId: member.account_id,
-            kind: 'account',
-            status: 'active',
-          })),
+          roomPlayers: orderedMembers.map(roomPlayerSnapshot),
         },
       );
+      this.scheduleRoomAiFromRow(room.game_key, row);
       return row.id;
     }
     if (room.game_key === 'splendor') {
@@ -2832,14 +3146,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
           roomId: room.id,
           roomCode: room.room_code,
           roomMode: 'multi_player',
-          roomPlayers: orderedMembers.map((member) => ({
-            seat: member.seat,
-            accountId: member.account_id,
-            kind: 'account',
-            status: 'active',
-          })),
+          roomPlayers: orderedMembers.map(roomPlayerSnapshot),
         },
       );
+      this.scheduleRoomAiFromRow(room.game_key, row);
       return row.id;
     }
     if (room.game_key === 'sudoku') {
@@ -2864,18 +3174,14 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         board,
         solution,
         players,
+        seatStatus: Object.fromEntries(Object.keys(players).map((side) => [side, 'active'])),
         boards,
         progress: {},
         battle: {},
         roomId: room.id,
         roomCode: room.room_code,
         roomMode: 'multi_player',
-        roomPlayers: orderedMembers.map((member) => ({
-          seat: member.seat,
-          accountId: member.account_id,
-          kind: 'account',
-          status: 'active',
-        })),
+        roomPlayers: orderedMembers.map(roomPlayerSnapshot),
         pause: {
           active: false,
           counts: Object.fromEntries(orderedMembers.map((member) => [member.account_id, 0])),
@@ -2896,6 +3202,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         null,
         state,
       );
+      this.scheduleRoomAiFromRow(room.game_key, row);
       return row.id;
     }
     if (room.game_key === 'sokoban') {
@@ -2925,12 +3232,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         roomId: room.id,
         roomCode: room.room_code,
         roomMode: 'multi_player',
-        roomPlayers: orderedMembers.map((member) => ({
-          seat: member.seat,
-          accountId: member.account_id,
-          kind: 'account',
-          status: 'active',
-        })),
+        roomPlayers: orderedMembers.map(roomPlayerSnapshot),
         pause: {
           active: false,
           counts: Object.fromEntries(orderedMembers.map((member) => [member.account_id, 0])),
@@ -2949,6 +3251,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         null,
         state,
       );
+      this.scheduleRoomAiFromRow(room.game_key, row);
       return row.id;
     }
     if (room.game_key === 'crazy_arcade') {
@@ -2976,12 +3279,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         roomId: room.id,
         roomCode: room.room_code,
         roomMode: 'multi_player',
-        roomPlayers: orderedMembers.map((member) => ({
-          seat: member.seat,
-          accountId: member.account_id,
-          kind: 'account',
-          status: 'active',
-        })),
+        roomPlayers: orderedMembers.map(roomPlayerSnapshot),
         pause: {
           active: false,
           counts: Object.fromEntries(orderedMembers.map((member) => [member.account_id, 0])),
@@ -3001,6 +3299,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         state,
       );
       this.ensureCrazyArcadeTick(this.crazyArcadeFromRow(row));
+      this.scheduleRoomAiFromRow(room.game_key, row);
       return row.id;
     }
     const players = Object.fromEntries(orderedMembers.map((member) => [`seat${member.seat}`, member.account_id]));
@@ -3015,12 +3314,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       roomMode: 'multi_player',
       gameKey: room.game_key,
       players,
-      roomPlayers: orderedMembers.map((member) => ({
-        seat: member.seat,
-        accountId: member.account_id,
-        kind: 'account',
-        status: 'active',
-      })),
+      roomPlayers: orderedMembers.map(roomPlayerSnapshot),
       currentSeat,
       turnOrder,
       status: 'playing',
@@ -3037,6 +3331,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       null,
       state,
     );
+    this.scheduleRoomAiFromRow(room.game_key, row);
     return row.id;
   }
 
@@ -3066,13 +3361,18 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     const seats = inferSessionSeats(row.game_key, row.state_json, row.owner_account_id, row.opponent_account_id);
     for (const seat of seats) {
       await this.db.query(
-        `INSERT INTO game_session_players (session_id, seat, account_id, kind, ai_difficulty, status)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO game_session_players (session_id, seat, account_id, kind, ai_difficulty, status, left_at)
+         VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $6 <> 'active' THEN now() ELSE NULL END)
          ON CONFLICT (session_id, seat) DO UPDATE SET
            account_id = EXCLUDED.account_id,
            kind = EXCLUDED.kind,
            ai_difficulty = EXCLUDED.ai_difficulty,
-           status = EXCLUDED.status`,
+           status = EXCLUDED.status,
+           left_at = CASE
+             WHEN EXCLUDED.status = 'active' THEN NULL
+             WHEN game_session_players.left_at IS NULL THEN now()
+             ELSE game_session_players.left_at
+           END`,
         [row.id, seat.seat, seat.accountId, seat.kind, seat.aiDifficulty ?? null, seat.status],
       );
     }
@@ -3119,6 +3419,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       throw new GameStateConflictError();
     }
     stateRecord.rev = nextRev;
+    await this.syncSessionPlayers(row);
     return row;
   }
 
@@ -3128,6 +3429,30 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       throw new NotFoundException('Game session not found');
     }
     return row;
+  }
+
+  private async finishActiveSessionRow(row: GameRow, reason: string): Promise<GameRow> {
+    const now = new Date().toISOString();
+    const state = isRecord(row.state_json) ? row.state_json : {};
+    const nextState = {
+      ...state,
+      status: 'finished',
+      finishReason: reason,
+      currentTurn: null,
+      updatedAt: now,
+      pause: undefined,
+      networkGraceStartedAt: undefined,
+      networkGraceDeadlineAt: undefined,
+      networkGraceAccountId: undefined,
+    };
+    const updated = await this.db.one<GameRow>(
+      `UPDATE game_sessions
+       SET status = 'finished', current_turn = NULL, state_json = $2::jsonb, updated_at = now()
+       WHERE id = $1
+       RETURNING *`,
+      [row.id, JSON.stringify(nextState)],
+    );
+    return updated ?? row;
   }
 
   private async prepareSokobanMapPool(): Promise<void> {
@@ -3307,6 +3632,14 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
 
   private mightySeatForUser(session: MightySession, user: AuthAccount): number {
     for (const [side, accountId] of Object.entries(session.players)) {
+      if (accountId === user.accountId) {
+        const match = /^seat(\d+)$/.exec(side);
+        if (match) {
+          return Number(match[1]);
+        }
+      }
+    }
+    for (const [side, accountId] of Object.entries(session.players)) {
       if (this.canActAs(user, accountId)) {
         const match = /^seat(\d+)$/.exec(side);
         if (match) {
@@ -3474,8 +3807,30 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return result.rows;
   }
 
+  private roomInviteExpired(member: GameRoomMemberRow): boolean {
+    if (member.status !== 'invited') {
+      return false;
+    }
+    return Date.now() - member.updated_at.getTime() >= ROOM_INVITE_TTL_MS;
+  }
+
+  private roomInviteExpiresAt(member: GameRoomMemberRow): string {
+    return new Date(member.updated_at.getTime() + ROOM_INVITE_TTL_MS).toISOString();
+  }
+
+  private async cleanupExpiredRoomInvites(roomId: string): Promise<void> {
+    const expiresBefore = new Date(Date.now() - ROOM_INVITE_TTL_MS);
+    await this.db.query(
+      `DELETE FROM game_room_members
+       WHERE room_id = $1 AND status = 'invited' AND updated_at < $2`,
+      [roomId, expiresBefore],
+    );
+  }
+
   private async roomView(room: GameRoomRow, viewerAccountId: string): Promise<Record<string, unknown>> {
     const members = await this.roomMembers(room.id);
+    const joinedMembers = members.filter((member) => member.status === 'joined');
+    const viewerMember = members.find((member) => member.account_id === viewerAccountId);
     return {
       id: room.id,
       roomCode: room.room_code,
@@ -3486,16 +3841,54 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       config: room.config_json,
       status: room.status,
       sessionId: room.session_id,
-      viewerSeat: members.find((member) => member.account_id === viewerAccountId)?.seat,
-      members: members.map(roomMemberView),
+      viewerSeat: viewerMember?.status === 'joined' ? viewerMember.seat : undefined,
+      viewerInvitationExpiresAt:
+        viewerMember?.status === 'invited' ? this.roomInviteExpiresAt(viewerMember) : undefined,
+      joinedCount: joinedMembers.length,
+      members: joinedMembers.map(roomMemberView),
       createdAt: room.created_at.toISOString(),
       updatedAt: room.updated_at.toISOString(),
     };
   }
 
-  private async emitRoomEvent(room: GameRoomRow, event: string, payload: unknown): Promise<void> {
+  private async emitRoomEvent(room: GameRoomRow, event: string, payload?: unknown): Promise<void> {
     const members = await this.roomMembers(room.id);
-    this.realtime.emitToAccounts(members.map((member) => member.account_id), event, payload);
+    for (const member of members) {
+      const view = await this.roomView(room, member.account_id);
+      this.realtime.emitToAccounts([member.account_id], event, {
+        ...view,
+        ...(isRecord(payload) ? payload : {}),
+      });
+    }
+  }
+
+  async isAccountInActiveGame(accountId: string): Promise<boolean> {
+    const result = await this.activeGameAccountMap([accountId]);
+    return result.get(accountId) ?? false;
+  }
+
+  async activeGameAccountMap(accountIds: string[]): Promise<Map<string, boolean>> {
+    const ids = [...new Set(accountIds.filter(Boolean))];
+    const map = new Map<string, boolean>(ids.map((id) => [id, false]));
+    if (ids.length === 0) {
+      return map;
+    }
+    const result = await this.db.query<{ account_id: string }>(
+      `SELECT DISTINCT gsp.account_id
+       FROM game_session_players gsp
+       JOIN game_sessions gs ON gs.id = gsp.session_id
+       WHERE gsp.account_id = ANY($1::text[])
+         AND gsp.kind = 'account'
+         AND gsp.status = 'active'
+         AND gs.status NOT IN ('finished', 'cleared', 'failed')`,
+      [ids],
+    );
+    for (const row of result.rows) {
+      if (row.account_id) {
+        map.set(row.account_id, true);
+      }
+    }
+    return map;
   }
 
   private async assertFriends(leftAccountId: string, rightAccountId: string): Promise<void> {
@@ -3539,6 +3932,11 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   private sudokuSideForUser(session: SudokuSession, user: AuthAccount): SudokuSide | undefined {
     if (!session.players) {
       return undefined;
+    }
+    for (const [side, accountId] of Object.entries(session.players)) {
+      if (accountId === user.accountId) {
+        return side;
+      }
     }
     for (const [side, accountId] of Object.entries(session.players)) {
       if (this.canActAs(user, accountId)) {
@@ -3613,6 +4011,11 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       return undefined;
     }
     for (const [side, accountId] of Object.entries(session.players)) {
+      if (accountId === user.accountId) {
+        return side;
+      }
+    }
+    for (const [side, accountId] of Object.entries(session.players)) {
       if (typeof accountId === 'string' && this.canActAs(user, accountId)) {
         return side;
       }
@@ -3669,6 +4072,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private crazyArcadeSideForUser(session: CrazyArcadeSession, user: AuthAccount): CrazyArcadeSide {
+    const exactSide = this.crazyArcadeSideForAccount(session, user.accountId);
+    if (exactSide) {
+      return exactSide;
+    }
     for (const [side, accountId] of Object.entries(session.players)) {
       if (this.canActAs(user, accountId)) {
         return side as CrazyArcadeSide;
@@ -3692,6 +4099,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   private sokobanSideForUser(session: SokobanSession, user: AuthAccount): SokobanSide | undefined {
     if (!session.players) {
       return undefined;
+    }
+    const exactSide = sokobanSideForAccount(session, user.accountId);
+    if (exactSide) {
+      return exactSide;
     }
     for (const [side, accountId] of Object.entries(session.players)) {
       if (this.canActAs(user, accountId)) {
@@ -3733,6 +4144,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       gameKey,
       sessionId: session.id,
       senderAccountId: user.accountId,
+      senderLabel: accountDisplayLabel(user),
       senderSide: this.sessionSideForUser(session, user),
       slot: emote.slot,
       gridSize: emote.gridSize,
@@ -3771,27 +4183,285 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.applyGomokuMove(session, LOCAL_AI_ACCOUNT_ID, move.row, move.col, 'ai');
   }
 
-  private scheduleSplendorAi(session: SplendorSession): void {
-    if (session.mode !== 'local_ai' || session.status !== 'playing' || session.currentTurn !== 'opponent') {
+  private scheduleRoomAiFromRow(gameKey: string, row: GameRow): void {
+    if (row.status !== 'playing') {
+      this.clearRoomAiTimer(row.id);
       return;
     }
-    setTimeout(async () => {
+    if (gameKey === 'sudoku') {
+      this.scheduleRoomSudokuAi(this.sudokuFromRow(row));
+      return;
+    }
+    if (gameKey === 'sokoban') {
+      this.scheduleRoomSokobanAi(this.sokobanFromRow(row));
+      return;
+    }
+    if (gameKey === 'splendor') {
+      this.scheduleSplendorAi(this.splendorFromRow(row));
+      return;
+    }
+    if (gameKey === 'mighty') {
+      this.scheduleMightyAi(this.mightyFromRow(row));
+      return;
+    }
+    if (gameKey === 'crazy_arcade') {
+      const session = this.crazyArcadeFromRow(row);
+      if (this.roomAiPlayers(session).length > 0) {
+        this.ensureCrazyArcadeTick(session);
+      }
+    }
+  }
+
+  private scheduleRoomAiTimer(sessionId: string, delayMs: number, callback: () => Promise<void>): void {
+    if (this.roomAiTimers.has(sessionId)) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.roomAiTimers.delete(sessionId);
+      void callback().catch((error) => {
+        console.warn('[room-ai]', error);
+      });
+    }, delayMs);
+    timer.unref?.();
+    this.roomAiTimers.set(sessionId, timer);
+  }
+
+  private clearRoomAiTimer(sessionId: string): void {
+    const timer = this.roomAiTimers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.roomAiTimers.delete(sessionId);
+    }
+  }
+
+  private roomAiPlayers(session: {
+    id?: string;
+    status?: string;
+    players?: Record<string, string>;
+    roomPlayers?: unknown;
+    roomMode?: string;
+    seatStatus?: Record<string, string>;
+  }): RoomAiSeat[] {
+    if (session.roomMode !== 'multi_player' || session.status !== 'playing') {
+      return [];
+    }
+    const players = isRecord(session.players) ? session.players as Record<string, string> : {};
+    const roomPlayers = Array.isArray(session.roomPlayers)
+      ? session.roomPlayers.map((item) => isRecord(item) ? item : {})
+      : [];
+    const seatStatus = isRecord(session.seatStatus) ? session.seatStatus as Record<string, string> : {};
+    return Object.entries(players)
+      .filter(([, accountId]) => isLocalAiAccount(accountId))
+      .map(([side, accountId]) => {
+        const seat = seatIndexFromSide(side);
+        const roomPlayer = roomPlayers.find((item) => {
+          if (item.accountId === accountId) return true;
+          return typeof seat === 'number' && item.seat === seat;
+        });
+        return {
+          side,
+          accountId,
+          seat: seat ?? 0,
+          difficulty: difficultyFromSnapshot(roomPlayer?.aiDifficulty, roomAiDifficultyFromAccountId(accountId)),
+        };
+      })
+      .filter((player) => !['forfeited', 'left', 'finished'].includes(seatStatus[player.side] ?? 'active'));
+  }
+
+  private scheduleRoomSudokuAi(session: SudokuSession): void {
+    const aiPlayers = this.roomAiPlayers(session) as Array<RoomAiSeat & { side: SudokuSide }>;
+    if (aiPlayers.length === 0 || session.pause?.active) {
+      this.clearRoomAiTimer(session.id);
+      return;
+    }
+    const delayMs = Math.min(...aiPlayers.map((player) => ROOM_RACE_AI_DELAY_MS[player.difficulty]));
+    this.scheduleRoomAiTimer(session.id, delayMs, () => this.runRoomSudokuAi(session.id));
+  }
+
+  private async runRoomSudokuAi(id: string): Promise<void> {
+    const session = this.sudokuFromRow(await this.requireGameRow(id, 'sudoku'));
+    const aiPlayers = this.roomAiPlayers(session) as Array<RoomAiSeat & { side: SudokuSide }>;
+    if (aiPlayers.length === 0 || session.pause?.active) {
+      this.clearRoomAiTimer(id);
+      return;
+    }
+    let changed = false;
+    for (const ai of aiPlayers) {
+      if (session.status !== 'playing') {
+        break;
+      }
+      changed = this.advanceSudokuAiSide(session, ai.side, ai.difficulty) || changed;
+    }
+    if (!changed) {
+      this.scheduleRoomSudokuAi(session);
+      return;
+    }
+    const saved = this.sudokuFromRow(await this.updateGame(session.id, session.status, null, session.winnerSide ?? null, session));
+    this.emitSudokuEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'sudoku.cell.updated');
+    if (saved.status === 'playing') {
+      this.scheduleRoomSudokuAi(saved);
+    }
+  }
+
+  private advanceSudokuAiSide(session: SudokuSession, side: SudokuSide, difficulty: Difficulty): boolean {
+    const move = this.nextSudokuAiCell(session, side, difficulty);
+    if (!move) {
+      return submitSudokuState(session, side);
+    }
+    applySudokuCell(session, side, move.row, move.col, session.solution[move.row][move.col]);
+    if (!this.nextSudokuAiCell(session, side, difficulty)) {
+      submitSudokuState(session, side);
+    }
+    return true;
+  }
+
+  private nextSudokuAiCell(
+    session: SudokuSession,
+    side: SudokuSide,
+    difficulty: Difficulty,
+  ): { row: number; col: number } | undefined {
+    const board = ensureSudokuPlayerBoard(session, side);
+    const candidates: Array<{ row: number; col: number; pressure: number }> = [];
+    for (let row = 0; row < session.puzzle.length; row += 1) {
+      for (let col = 0; col < session.puzzle[row].length; col += 1) {
+        if (session.puzzle[row][col] !== 0 || board[row][col] !== 0) {
+          continue;
+        }
+        const rowFilled = board[row].filter(Boolean).length;
+        const colFilled = board.map((item) => item[col]).filter(Boolean).length;
+        const boxRow = Math.floor(row / 3) * 3;
+        const boxCol = Math.floor(col / 3) * 3;
+        let boxFilled = 0;
+        for (let r = boxRow; r < boxRow + 3; r += 1) {
+          for (let c = boxCol; c < boxCol + 3; c += 1) {
+            if (board[r][c] !== 0) boxFilled += 1;
+          }
+        }
+        candidates.push({ row, col, pressure: rowFilled + colFilled + boxFilled });
+      }
+    }
+    if (candidates.length === 0) {
+      return undefined;
+    }
+    if (difficulty === 'easy') {
+      return candidates[Math.floor(Math.random() * candidates.length)];
+    }
+    candidates.sort((a, b) => b.pressure - a.pressure);
+    const cap = difficulty === 'hard' ? 1 : Math.min(4, candidates.length);
+    return candidates[Math.floor(Math.random() * cap)];
+  }
+
+  private scheduleRoomSokobanAi(session: SokobanSession): void {
+    const aiPlayers = this.roomAiPlayers(session) as Array<RoomAiSeat & { side: SokobanSide }>;
+    if (aiPlayers.length === 0 || session.pause?.active) {
+      this.clearRoomAiTimer(session.id);
+      return;
+    }
+    const delayMs = Math.min(...aiPlayers.map((player) => ROOM_RACE_AI_DELAY_MS[player.difficulty]));
+    this.scheduleRoomAiTimer(session.id, delayMs, () => this.runRoomSokobanAi(session.id));
+  }
+
+  private async runRoomSokobanAi(id: string): Promise<void> {
+    const session = this.sokobanFromRow(await this.requireGameRow(id, 'sokoban'));
+    const aiPlayers = this.roomAiPlayers(session) as Array<RoomAiSeat & { side: SokobanSide }>;
+    if (aiPlayers.length === 0 || session.pause?.active) {
+      this.clearRoomAiTimer(id);
+      return;
+    }
+    let changed = false;
+    for (const ai of aiPlayers) {
+      if (session.status !== 'playing') {
+        break;
+      }
+      const playerState = ensureSokobanPlayerState(session, ai.side);
+      const direction = solveSokobanNextDirection(session, playerState, ai.difficulty);
+      if (!direction) {
+        continue;
+      }
+      const result = applySokobanMove(session, playerState, direction);
+      if (!result.moved) {
+        continue;
+      }
+      finishSokobanAfterMove(session, playerState, ai.side, result.pushedBox);
+      session.updatedAt = new Date().toISOString();
+      changed = true;
+    }
+    if (!changed) {
+      this.scheduleRoomSokobanAi(session);
+      return;
+    }
+    const saved = this.sokobanFromRow(await this.updateGame(session.id, session.status, null, session.winnerSide ?? null, session));
+    this.emitSokobanEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'sokoban.move.played');
+    if (saved.status === 'playing') {
+      this.scheduleRoomSokobanAi(saved);
+    }
+  }
+
+  private applyRoomCrazyArcadeAiInputs(session: CrazyArcadeSession): void {
+    const aiPlayers = this.roomAiPlayers(session) as Array<RoomAiSeat & { side: CrazyArcadeSide }>;
+    if (aiPlayers.length === 0) {
+      return;
+    }
+    const directions = ['up', 'right', 'down', 'left'];
+    const now = Date.now();
+    session.inputs ??= {};
+    for (const ai of aiPlayers) {
+      const phaseMs = ai.difficulty === 'hard' ? 520 : ai.difficulty === 'medium' ? 720 : 980;
+      const phase = Math.floor(now / phaseMs + ai.seat) % directions.length;
+      const bombPeriod = ai.difficulty === 'hard' ? 2_400 : ai.difficulty === 'medium' ? 3_200 : 4_400;
+      const bomb = Math.floor(now / bombPeriod + ai.seat) % 3 === 0;
+      session.inputs[ai.side] = {
+        ...(session.inputs[ai.side] ?? {}),
+        direction: directions[phase],
+        bomb,
+        carry: false,
+        updatedAt: new Date(now).toISOString(),
+      };
+    }
+  }
+
+  private scheduleSplendorAi(session: SplendorSession): void {
+    const currentAccountId = session.players[session.currentTurn];
+    const isLocalAiTurn = session.mode === 'local_ai' &&
+      session.currentTurn === 'opponent' &&
+      isLocalAiAccount(currentAccountId);
+    const roomAi = this.roomAiPlayers(session).find((player) => player.side === session.currentTurn);
+    if (session.status !== 'playing' || session.pause?.active || (!isLocalAiTurn && !roomAi)) {
+      return;
+    }
+    const run = async () => {
       try {
         const current = this.splendorFromRow(await this.requireGameRow(session.id, 'splendor'));
-        if (current.status !== 'playing' || current.mode !== 'local_ai' || current.currentTurn !== 'opponent') {
+        const nextAccountId = current.players[current.currentTurn];
+        const nextLocalAiTurn = current.mode === 'local_ai' &&
+          current.currentTurn === 'opponent' &&
+          isLocalAiAccount(nextAccountId);
+        const nextRoomAi = this.roomAiPlayers(current).find((player) => player.side === current.currentTurn);
+        if (current.status !== 'playing' || current.pause?.active || (!nextLocalAiTurn && !nextRoomAi)) {
           return;
         }
-        applySplendorAiTurn(current);
+        if (nextRoomAi) {
+          applySplendorAiTurnForSide(current, current.currentTurn, nextRoomAi.difficulty);
+        } else {
+          applySplendorAiTurn(current);
+        }
         const saved = await this.saveSplendorSession(current);
         this.emitSessionEvent(
           saved,
           saved.status === 'finished' ? 'game.session.finished' : 'splendor.action.played',
           splendorClientSession(saved),
         );
+        this.scheduleSplendorAi(saved);
       } catch (error) {
         console.warn('[splendor-ai]', error);
       }
-    }, LOCAL_AI_RESPONSE_DELAY_MS);
+    };
+    if (roomAi) {
+      this.scheduleRoomAiTimer(session.id, ROOM_AI_RESPONSE_DELAY_MS, run);
+    } else {
+      const timer = setTimeout(run, LOCAL_AI_RESPONSE_DELAY_MS);
+      timer.unref?.();
+    }
   }
 
   private scheduleFortressAi(session: FortressSession): void {
@@ -3833,29 +4503,31 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private scheduleMightyAi(session: MightySession): void {
+    const roomAi = this.roomAiPlayers(session).find((player) => player.side === session.currentTurn);
+    const localAiTurn = session.mode === 'local_ai' && isLocalAiAccount(session.players[session.currentTurn]);
     if (
-      session.mode !== 'local_ai' ||
       session.status !== 'playing' ||
       session.pause?.active ||
-      !isLocalAiAccount(session.players[session.currentTurn])
+      (!localAiTurn && !roomAi)
     ) {
       return;
     }
-    const timer = setTimeout(async () => {
+    const run = async () => {
       try {
         const current = this.mightyFromRow(await this.requireGameRow(session.id, 'mighty'));
+        const nextRoomAi = this.roomAiPlayers(current).find((player) => player.side === current.currentTurn);
+        const nextLocalAiTurn = current.mode === 'local_ai' && isLocalAiAccount(current.players[current.currentTurn]);
         if (
-          current.mode !== 'local_ai' ||
           current.status !== 'playing' ||
           current.pause?.active ||
-          !isLocalAiAccount(current.players[current.currentTurn])
+          (!nextLocalAiTurn && !nextRoomAi)
         ) {
           return;
         }
         const action = MIGHTY_ENGINE.aiAction?.(
           current,
           current.currentSeat,
-          difficultyFromSnapshot(current.aiDifficulty, 'medium'),
+          nextRoomAi?.difficulty ?? difficultyFromSnapshot(current.aiDifficulty, 'medium'),
         );
         if (!action) {
           return;
@@ -3870,8 +4542,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       } catch (error) {
         console.warn('[mighty-ai]', error);
       }
-    }, MIGHTY_AI_RESPONSE_DELAY_MS);
-    timer.unref?.();
+    };
+    if (roomAi) {
+      this.scheduleRoomAiTimer(session.id, MIGHTY_AI_RESPONSE_DELAY_MS, run);
+    } else {
+      const timer = setTimeout(run, MIGHTY_AI_RESPONSE_DELAY_MS);
+      timer.unref?.();
+    }
   }
 
   private startFortressTimedTurn(session: FortressSession, delayMs = 0): void {
@@ -4200,6 +4877,18 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private async restoreRoomAiTimers(): Promise<void> {
+    const result = await this.db.query<GameRow>(
+      `SELECT * FROM game_sessions
+       WHERE mode = 'friend_match'
+         AND status = 'playing'
+         AND game_key IN ('sudoku', 'sokoban', 'splendor', 'crazy_arcade', 'mighty')`,
+    );
+    for (const row of result.rows) {
+      this.scheduleRoomAiFromRow(row.game_key, row);
+    }
+  }
+
   private ensureCrazyArcadeTick(session: CrazyArcadeSession): void {
     if (!this.isCrazyArcadeRealtimeTickable(session)) {
       this.clearCrazyArcadeTickTimer(session.id);
@@ -4247,6 +4936,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       await this.startCrazyArcadeDisconnectGrace(session, disconnected.accountId);
       return;
     }
+    this.applyRoomCrazyArcadeAiInputs(session);
     const saved = await this.saveCrazyArcadeSession(advanceCrazyArcadeServer(session));
     this.emitSessionEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'crazy_arcade.state.synced', saved);
     if (!this.isCrazyArcadeRealtimeTickable(saved)) {
@@ -4267,6 +4957,9 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     session: CrazyArcadeSession,
   ): Promise<{ side: CrazyArcadeSide; accountId: string } | undefined> {
     for (const [side, accountId] of Object.entries(session.players)) {
+      if (isLocalAiAccount(accountId)) {
+        continue;
+      }
       if (!(await this.realtime.isAccountOnline(accountId))) {
         return { side: side as CrazyArcadeSide, accountId };
       }
@@ -4548,6 +5241,115 @@ export class GameStateConflictError extends ConflictException {
   constructor() {
     super({ statusCode: 409, code: 'STATE_CONFLICT', message: 'Game state changed. Refresh and retry.', error: 'Conflict' });
   }
+}
+
+type SokobanAiDirection = 'up' | 'down' | 'left' | 'right';
+
+const SOKOBAN_AI_DELTAS: Array<{ direction: SokobanAiDirection; row: number; col: number }> = [
+  { direction: 'up', row: -1, col: 0 },
+  { direction: 'right', row: 0, col: 1 },
+  { direction: 'down', row: 1, col: 0 },
+  { direction: 'left', row: 0, col: -1 },
+];
+
+function seatIndexFromSide(side: string): number | undefined {
+  const match = /^seat(\d+)$/.exec(side);
+  return match ? Number(match[1]) : undefined;
+}
+
+function solveSokobanNextDirection(
+  session: SokobanSession,
+  state: SokobanPlayerState,
+  difficulty: Difficulty,
+): SokobanAiDirection | undefined {
+  if (state.solved || state.boxes.every((box) => hasPosition(session.goals, box))) {
+    return undefined;
+  }
+  const maxNodes = difficulty === 'hard' ? 60_000 : difficulty === 'medium' ? 30_000 : 12_000;
+  const start = {
+    player: { ...state.player },
+    boxes: state.boxes.map((box) => ({ ...box })),
+    path: [] as SokobanAiDirection[],
+  };
+  const queue = [start];
+  const seen = new Set<string>([sokobanAiSearchKey(start.player, start.boxes)]);
+  let index = 0;
+  while (index < queue.length && seen.size <= maxNodes) {
+    const current = queue[index++];
+    if (current.boxes.every((box) => hasPosition(session.goals, box))) {
+      return current.path[0];
+    }
+    for (const delta of SOKOBAN_AI_DELTAS) {
+      const next = stepSokobanAiState(session, current.player, current.boxes, delta);
+      if (!next) {
+        continue;
+      }
+      const key = sokobanAiSearchKey(next.player, next.boxes);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      queue.push({
+        ...next,
+        path: [...current.path, delta.direction],
+      });
+    }
+  }
+  return undefined;
+}
+
+function stepSokobanAiState(
+  session: SokobanSession,
+  player: SokobanPosition,
+  boxes: SokobanPosition[],
+  delta: { row: number; col: number },
+): { player: SokobanPosition; boxes: SokobanPosition[] } | undefined {
+  const nextPlayer = { row: player.row + delta.row, col: player.col + delta.col };
+  if (!isSokobanAiFloor(session, nextPlayer) || hasPosition(session.walls, nextPlayer)) {
+    return undefined;
+  }
+  const boxIndex = boxes.findIndex((box) => box.row === nextPlayer.row && box.col === nextPlayer.col);
+  if (boxIndex < 0) {
+    return { player: nextPlayer, boxes: boxes.map((box) => ({ ...box })) };
+  }
+  const pushed = { row: nextPlayer.row + delta.row, col: nextPlayer.col + delta.col };
+  if (
+    !isSokobanAiFloor(session, pushed) ||
+    hasPosition(session.walls, pushed) ||
+    boxes.some((box, index) => index !== boxIndex && box.row === pushed.row && box.col === pushed.col)
+  ) {
+    return undefined;
+  }
+  const nextBoxes = boxes.map((box, index) => index === boxIndex ? pushed : { ...box });
+  return { player: nextPlayer, boxes: nextBoxes };
+}
+
+function isSokobanAiFloor(session: SokobanSession, position: SokobanPosition): boolean {
+  const bounds = sokobanAiBounds(session);
+  return position.row >= bounds.minRow &&
+    position.row <= bounds.maxRow &&
+    position.col >= bounds.minCol &&
+    position.col <= bounds.maxCol;
+}
+
+function sokobanAiBounds(session: SokobanSession): { minRow: number; maxRow: number; minCol: number; maxCol: number } {
+  const positions = [...session.walls, ...session.goals, session.initialPlayer, ...session.initialBoxes];
+  return positions.reduce(
+    (bounds, position) => ({
+      minRow: Math.min(bounds.minRow, position.row),
+      maxRow: Math.max(bounds.maxRow, position.row),
+      minCol: Math.min(bounds.minCol, position.col),
+      maxCol: Math.max(bounds.maxCol, position.col),
+    }),
+    { minRow: 0, maxRow: 0, minCol: 0, maxCol: 0 },
+  );
+}
+
+function sokobanAiSearchKey(player: SokobanPosition, boxes: SokobanPosition[]): string {
+  return `${player.row},${player.col}|${boxes
+    .map((box) => `${box.row},${box.col}`)
+    .sort()
+    .join(';')}`;
 }
 
 function playingStatusFromSnapshot(value: unknown): 'playing' | 'finished' {
@@ -5274,6 +6076,47 @@ function isLocalAiAccount(accountId: string): boolean {
   );
 }
 
+function roomAiAccountId(roomId: string, seat: number, difficulty: Difficulty): string {
+  return `${LOCAL_AI_ACCOUNT_ID}#room-${roomId}-${seat}-${difficulty}`;
+}
+
+function roomAiDifficultyFromAccountId(accountId: string): Difficulty {
+  const parts = accountId.split('-');
+  const difficulty = parts[parts.length - 1];
+  return difficultyFromSnapshot(difficulty, 'medium');
+}
+
+function accountDisplayLabel(account: Pick<AuthAccount, 'accountId' | 'loginId' | 'name'>): string {
+  const loginId = account.loginId?.trim() ?? '';
+  const name = account.name?.trim() ?? '';
+  if (loginId && name && loginId !== name) {
+    return `${loginId} · ${name}`;
+  }
+  return loginId || name || account.accountId;
+}
+
+function seatInfoFromRoomMember(member: GameRoomMemberRow): SeatInfo {
+  const ai = isLocalAiAccount(member.account_id);
+  return {
+    seat: member.seat,
+    accountId: member.account_id,
+    kind: ai ? 'ai' : 'account',
+    aiDifficulty: ai ? roomAiDifficultyFromAccountId(member.account_id) : undefined,
+    status: member.status === 'joined' ? 'active' : 'left',
+  };
+}
+
+function roomPlayerSnapshot(member: GameRoomMemberRow): Record<string, unknown> {
+  const ai = isLocalAiAccount(member.account_id);
+  return {
+    seat: member.seat,
+    accountId: member.account_id,
+    kind: ai ? 'ai' : 'account',
+    aiDifficulty: ai ? roomAiDifficultyFromAccountId(member.account_id) : undefined,
+    status: 'active',
+  };
+}
+
 function inferSessionSeats(
   gameKey: string,
   stateValue: unknown,
@@ -5288,17 +6131,21 @@ function inferSessionSeats(
 }> {
   const state = isRecord(stateValue) ? stateValue : {};
   if (Array.isArray(state.roomPlayers)) {
+    const seatStatus = isRecord(state.seatStatus) ? state.seatStatus : {};
     return state.roomPlayers
       .map((item, index) => {
         const record = isRecord(item) ? item : {};
         const accountId = typeof record.accountId === 'string' ? record.accountId : '';
         const kind: 'account' | 'ai' = record.kind === 'ai' || isLocalAiAccount(accountId) ? 'ai' : 'account';
+        const seat = typeof record.seat === 'number' && Number.isInteger(record.seat) ? record.seat : index;
+        const side = `seat${seat}`;
+        const syncedStatus = typeof seatStatus[side] === 'string' ? seatStatus[side] : record.status;
         return {
-          seat: typeof record.seat === 'number' && Number.isInteger(record.seat) ? record.seat : index,
+          seat,
           accountId: kind === 'ai' ? null : accountId,
           kind,
           aiDifficulty: kind === 'ai' ? difficultyFromSnapshot(record.aiDifficulty, difficultyFromSnapshot(state.aiDifficulty, 'medium')) : undefined,
-          status: typeof record.status === 'string' ? record.status : 'active',
+          status: typeof syncedStatus === 'string' ? syncedStatus : 'active',
         };
       })
       .filter((item) => item.kind === 'ai' || Boolean(item.accountId));
@@ -5352,16 +6199,20 @@ function currentTurnAccountIdForRow(row: GameRow, seats: GameSessionPlayerRow[])
 }
 
 function roomMemberView(row: GameRoomMemberRow): Record<string, unknown> {
+  const ai = isLocalAiAccount(row.account_id);
+  const aiDifficulty = ai ? roomAiDifficultyFromAccountId(row.account_id) : undefined;
   return {
     accountId: row.account_id,
     account: {
       accountId: row.account_id,
-      loginId: row.account_login_id || row.account_id,
-      name: row.account_name || '',
+      loginId: ai ? `AI ${aiDifficulty}` : row.account_login_id || row.account_id,
+      name: ai ? 'AI' : row.account_name || '',
       email: row.account_email || '',
       status: row.account_status || '',
       permissionKey: row.account_permission_key || '',
     },
+    kind: ai ? 'ai' : 'account',
+    aiDifficulty,
     seat: row.seat,
     status: row.status,
     ready: row.ready,
@@ -5643,9 +6494,8 @@ function validateOthelloIndex(value: number, name: string): void {
 
 function sessionForSokobanUser(session: SokobanSession, user: AuthAccount): SokobanSession {
   const side = session.players
-    ? user.permission === 'superadmin'
-      ? sokobanSides(session)[0]
-      : sokobanSideForAccount(session, user.accountId)
+    ? sokobanSideForAccount(session, user.accountId) ??
+      (user.permission === 'superadmin' ? sokobanSides(session)[0] : undefined)
     : undefined;
   if (!side) {
     return session;
