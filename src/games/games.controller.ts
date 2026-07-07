@@ -107,6 +107,16 @@ export class GamesController {
     return this.games.applyGameAction(gameKey, id, user, body);
   }
 
+  @Post('games/:gameKey/sessions/:id/emotes')
+  sendGameEmote(
+    @Param('gameKey') gameKey: string,
+    @Param('id') id: string,
+    @CurrentUser() user: AuthAccount,
+    @Body() body: { slot: number },
+  ) {
+    return this.games.sendGameEmote(gameKey, id, user, Number(body.slot));
+  }
+
   @Post('games/:gameKey/sessions/:id/claim-win')
   claimDisconnectedWin(@Param('gameKey') gameKey: string, @Param('id') id: string, @CurrentUser() user: AuthAccount) {
     return this.games.claimDisconnectedWin(gameKey, id, user);

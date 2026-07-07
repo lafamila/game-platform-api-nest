@@ -24,6 +24,9 @@ This repo follows `../CLAUDE.md`, especially central auth, env handling, local-f
 - Client model: `game-platform-api-nest` owns the confidential OIDC client. Flutter/native clients must store only a game-platform session token, not OIDC client secrets, refresh tokens, or auth service credentials.
 - Storage: PostgreSQL via `DATABASE_URL`.
 - Game model: server-authoritative rules and result validation.
+- Game registry: public game metadata is centralized in `GameRegistry`/`GAME_DESCRIPTORS`; new server-backed games should register a `GameEngine` and then wire only the remaining service orchestration gaps.
+- Current games: `sudoku`, `gomoku`, `alkkagi`, `othello`, `sokoban`, `splendor`, `fortress`, `crazy_arcade`, `mighty`.
+- Start UX contract: every newly started game session, including Crazy Arcade and room-started sessions, must support the client countdown flow. Resuming an already-active session is not a new start.
 
 ## Auth Onboarding Request Shape
 
@@ -109,7 +112,17 @@ Abandoned sessions (no update for `GAME_PLATFORM_SESSION_ABANDON_DAYS`) are fini
 
 ### Idempotent submission (`clientMoveId`)
 
-Every action POST accepts an optional `clientMoveId` (uuid). The server keeps the last 20 accepted ids per account in `state_json` and, on a repeat, re-responds with the current session in that route's normal shape instead of re-applying — so a timeout retry cannot double-move. The check runs after the participant/status/pause guards and before turn/input validation, so a retry stays idempotent even after the turn has advanced (it returns current state rather than a "not your turn"/"cell occupied" error). Wired routes: `gomoku/othello/sokoban moves`, `alkkagi/fortress shots`, `fortress moves`, `splendor tokens/reserve/buy`. Shot routes return an empty animation on a duplicate (`alkkagi: { frameMs: 16, frames: [] }`; `fortress`: no-op animation with the current terrain/tanks). Excluded by design: Crazy Arcade `sync`/`input` (host-authoritative last-write) and sudoku cell writes (value assignment is naturally idempotent).
+Every action POST accepts an optional `clientMoveId` (uuid). The server keeps the last 20 accepted ids per account in `state_json` and, on a repeat, re-responds with the current session in that route's normal shape instead of re-applying — so a timeout retry cannot double-move. The check runs after the participant/status/pause guards and before turn/input validation, so a retry stays idempotent even after the turn has advanced (it returns current state rather than a "not your turn"/"cell occupied" error). Wired routes include the generic `POST /api/games/:gameKey/sessions/:id/actions` path and the legacy game-specific wrappers. Shot routes return an empty animation on a duplicate (`alkkagi: { frameMs: 16, frames: [] }`; `fortress`: no-op animation with the current terrain/tanks). Sudoku cell writes are naturally idempotent; Crazy Arcade input is idempotent when sent through the common action route with `clientMoveId`.
+
+## Platform Game APIs (Phase 3–6)
+
+- `GET /api/games` exposes registry metadata including room bounds, save support, timers, and hidden-information flags.
+- `POST /api/games/:gameKey/sessions` and `GET /api/games/:gameKey/sessions/:id` are the preferred common create/get routes. Legacy game-specific create/get routes remain for compatibility.
+- `POST /api/games/:gameKey/sessions/:id/actions` is the preferred common action route. Game-specific action routes should delegate to the same engine/service path.
+- `POST /api/games/:gameKey/sessions/:id/pause|resume|save|emotes|claim-win|wait` are common session adjunct routes where the game supports the concept.
+- Room APIs create N-player sessions from room membership. Sudoku/Sokoban race rooms support up to 6 seats; Splendor supports 2–4; Crazy Arcade supports 2–4; Mighty is exactly 5 seats.
+- Server save/continue stores an account-owned long-term snapshot. Continuing a finished friend match forks according to game type: solo-capable puzzle games resume solo, while competitive games use `local_ai` continuation. Crazy Arcade server save is included and forks the server-authoritative snapshot to `local_ai`.
+- Mighty (`mighty`) is a hidden-information 5-player trick game. Its engine must hide non-viewer hands/kitty/deck data, expose only viewer-legal actions, and support local AI seats plus 5-player room start.
 
 ## Local Dev
 
@@ -128,8 +141,23 @@ Normal local development uses `auth-api-nest` on `http://localhost:3032`, Postgr
 - `GET /api/health`
 - `GET /api/games`
 - `GET /api/sessions/active`
+- `POST /api/games/:gameKey/sessions`
+- `GET /api/games/:gameKey/sessions/:id`
+- `POST /api/games/:gameKey/sessions/:id/actions`
+- `POST /api/games/:gameKey/sessions/:id/pause`
+- `POST /api/games/:gameKey/sessions/:id/resume`
+- `POST /api/games/:gameKey/sessions/:id/save`
+- `POST /api/games/:gameKey/sessions/:id/emotes`
 - `POST /api/games/:gameKey/sessions/:id/claim-win`
 - `POST /api/games/:gameKey/sessions/:id/wait`
+- `GET /api/saves`
+- `POST /api/saves/:id/continue`
+- `GET /api/rooms`
+- `POST /api/rooms`
+- `GET /api/rooms/:id`
+- `POST /api/rooms/:id/invite`
+- `POST /api/rooms/:id/ready`
+- `POST /api/rooms/:id/start`
 - `POST /api/sudoku/sessions`
 - `GET /api/sudoku/sessions/:id`
 - `PATCH /api/sudoku/sessions/:id/cells`

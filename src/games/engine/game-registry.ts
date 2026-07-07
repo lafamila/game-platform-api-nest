@@ -3,6 +3,7 @@ import { ALKKAGI_ENGINE } from '../alkkagi-engine';
 import { CRAZY_ARCADE_ENGINE } from '../crazy-arcade-engine';
 import { FORTRESS_ENGINE } from '../fortress-engine';
 import { GOMOKU_ENGINE } from '../gomoku-engine';
+import { MIGHTY_ENGINE } from '../mighty-engine';
 import { OTHELLO_ENGINE } from '../othello-engine';
 import { SOKOBAN_ENGINE } from '../sokoban-engine';
 import { SPLENDOR_ENGINE } from '../splendor-engine';
@@ -17,6 +18,7 @@ export const GAME_ENGINES = [
   SPLENDOR_ENGINE,
   FORTRESS_ENGINE,
   CRAZY_ARCADE_ENGINE,
+  MIGHTY_ENGINE,
 ];
 
 export const GAME_DESCRIPTORS: GameDescriptor[] = [
@@ -28,6 +30,7 @@ export const GAME_DESCRIPTORS: GameDescriptor[] = [
   SPLENDOR_ENGINE.descriptor,
   FORTRESS_ENGINE.descriptor,
   CRAZY_ARCADE_ENGINE.descriptor,
+  MIGHTY_ENGINE.descriptor,
 ];
 
 export class GameRegistry {

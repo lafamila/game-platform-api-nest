@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { FakeDb, FakeRealtime } from './helpers/fake-db.mjs';
@@ -32,6 +33,7 @@ import {
 } from '../dist/games/sudoku-engine.js';
 import { ALKKAGI_ENGINE } from '../dist/games/alkkagi-engine.js';
 import { FORTRESS_ENGINE } from '../dist/games/fortress-engine.js';
+import { MIGHTY_ENGINE } from '../dist/games/mighty-engine.js';
 
 const user = {
   accountId: 'player-1',
@@ -54,6 +56,7 @@ test('game registry descriptors are defensive and drive player bounds', () => {
   const othello = games.find((game) => game.key === 'othello');
   const splendor = games.find((game) => game.key === 'splendor');
   const crazyArcade = games.find((game) => game.key === 'crazy_arcade');
+  const mighty = games.find((game) => game.key === 'mighty');
 
   assert.equal(sudoku.maxPlayers, 6);
   assert.equal(sokoban.maxPlayers, 6);
@@ -62,6 +65,9 @@ test('game registry descriptors are defensive and drive player bounds', () => {
   assert.equal(splendor.maxPlayers, 4);
   assert.equal(crazyArcade.graceSeconds, 60);
   assert.equal(crazyArcade.supportsMatchSave, true);
+  assert.equal(mighty.minPlayers, 5);
+  assert.equal(mighty.maxPlayers, 5);
+  assert.equal(mighty.hiddenInfo, true);
   assert.equal(GAME_REGISTRY.engine('sudoku')?.descriptor.key, 'sudoku');
   assert.equal(GAME_REGISTRY.engine('gomoku')?.descriptor.key, 'gomoku');
   assert.equal(GAME_REGISTRY.engine('alkkagi')?.descriptor.key, 'alkkagi');
@@ -73,6 +79,7 @@ test('game registry descriptors are defensive and drive player bounds', () => {
   assert.equal(GAME_REGISTRY.engine('fortress')?.descriptor.turnTimerSeconds, 20);
   assert.equal(GAME_REGISTRY.engine('crazy_arcade')?.descriptor.key, 'crazy_arcade');
   assert.equal(GAME_REGISTRY.engine('crazy_arcade')?.descriptor.turnType, 'realtimeServer');
+  assert.equal(GAME_REGISTRY.engine('mighty')?.descriptor.key, 'mighty');
 
   sudoku.modes.push('broken');
   const freshSudoku = service.listGames().find((game) => game.key === 'sudoku');
@@ -100,6 +107,7 @@ test('generic session create and get dispatch through registered game keys', asy
       'splendor',
       'fortress',
       'crazy_arcade',
+      'mighty',
     ]) {
       const created = await service.createGameSession(gameKey, user, { difficulty: 'easy' });
       assert.equal(created.id.length > 0, true);
@@ -344,6 +352,126 @@ test('crazy arcade engine contract creates realtime snapshots for dynamic seats'
   const thirdPlayerView = CRAZY_ARCADE_ENGINE.viewFor(session, 2);
   assert.equal(thirdPlayerView.mySide, 'seat2');
   assert.equal(thirdPlayerView.snapshot.playerSide, 'seat2');
+});
+
+test('mighty engine contract hides hands and advances bidding to kitty', () => {
+  const session = MIGHTY_ENGINE.createState([
+    { seat: 0, kind: 'account', accountId: user.accountId },
+    { seat: 1, kind: 'account', accountId: 'player-2' },
+    { seat: 2, kind: 'account', accountId: 'player-3' },
+    { seat: 3, kind: 'account', accountId: 'player-4' },
+    { seat: 4, kind: 'account', accountId: 'player-5' },
+  ], { id: 'mighty-engine-1', mode: 'friend_match', seed: 'mighty-test-seed' });
+
+  assert.equal(MIGHTY_ENGINE.descriptor.key, 'mighty');
+  assert.equal(MIGHTY_ENGINE.descriptor.minPlayers, 5);
+  assert.equal(session.hands.length, 5);
+  assert.equal(session.hands.every((hand) => hand.length === 10), true);
+  assert.equal(session.kitty.length, 3);
+
+  const seat0View = MIGHTY_ENGINE.viewFor(session, 0);
+  const seat1View = MIGHTY_ENGINE.viewFor(session, 1);
+  assert.equal(seat0View.myHand.length, 10);
+  assert.equal(seat1View.myHand.length, 10);
+  assert.notDeepEqual(seat0View.myHand, seat1View.myHand);
+  assert.equal(Object.prototype.hasOwnProperty.call(seat0View, 'hands'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(seat0View, 'rngSeed'), false);
+
+  MIGHTY_ENGINE.applyAction(session, 0, {
+    type: 'bid',
+    payload: { count: 13, trump: 'S' },
+  });
+  for (const seat of [1, 2, 3, 4]) {
+    MIGHTY_ENGINE.applyAction(session, seat, {
+      type: 'bid',
+      payload: { pass: true },
+    });
+  }
+
+  assert.equal(session.phase, 'kitty');
+  assert.equal(session.declarerSeat, 0);
+  assert.equal(session.currentSeat, 0);
+  assert.equal(session.hands[0].length, 13);
+  assert.equal(MIGHTY_ENGINE.viewFor(session, 0).kitty.length, 3);
+  assert.equal(Object.prototype.hasOwnProperty.call(MIGHTY_ENGINE.viewFor(session, 1), 'kitty'), false);
+});
+
+test('mighty ai difficulties change bidding confidence', () => {
+  const session = MIGHTY_ENGINE.createState([
+    { seat: 0, kind: 'account', accountId: user.accountId },
+    { seat: 1, kind: 'ai', accountId: '__game_platform_local_ai__#1' },
+    { seat: 2, kind: 'ai', accountId: '__game_platform_local_ai__#2' },
+    { seat: 3, kind: 'ai', accountId: '__game_platform_local_ai__#3' },
+    { seat: 4, kind: 'ai', accountId: '__game_platform_local_ai__#4' },
+  ], { id: 'mighty-ai-bid', mode: 'local_ai', seed: 'mighty-ai-bid-seed', firstBidder: 0 });
+
+  session.hands[0] = [
+    { suit: 'S', rank: 14 },
+    { suit: 'S', rank: 13 },
+    { suit: 'S', rank: 12 },
+    { suit: 'S', rank: 11 },
+    { suit: 'S', rank: 10 },
+    { suit: 'S', rank: 9 },
+    { suit: 'D', rank: 14 },
+    { suit: 'H', rank: 14 },
+    { suit: 'C', rank: 14 },
+    { suit: 'JOKER', rank: 0 },
+  ];
+
+  const easy = MIGHTY_ENGINE.aiAction(session, 0, 'easy');
+  const hard = MIGHTY_ENGINE.aiAction(session, 0, 'hard');
+
+  assert.equal(easy.type, 'bid');
+  assert.equal(hard.type, 'bid');
+  assert.equal(hard.payload.pass, false);
+  assert.equal(hard.payload.count > (easy.payload.pass ? 0 : easy.payload.count), true);
+});
+
+test('mighty hard ai uses the cheapest winning card for a point trick', () => {
+  const session = MIGHTY_ENGINE.createState([
+    { seat: 0, kind: 'account', accountId: user.accountId },
+    { seat: 1, kind: 'ai', accountId: '__game_platform_local_ai__#1' },
+    { seat: 2, kind: 'ai', accountId: '__game_platform_local_ai__#2' },
+    { seat: 3, kind: 'ai', accountId: '__game_platform_local_ai__#3' },
+    { seat: 4, kind: 'ai', accountId: '__game_platform_local_ai__#4' },
+  ], { id: 'mighty-ai-play', mode: 'local_ai', seed: 'mighty-ai-play-seed' });
+
+  session.phase = 'playing';
+  session.trump = 'S';
+  session.bidCount = 13;
+  session.declarerSeat = 0;
+  session.friend = { type: 'none', revealed: true };
+  session.currentSeat = 2;
+  session.currentTurn = 'seat2';
+  session.currentTrick = {
+    leadSeat: 1,
+    plays: [
+      { seat: 1, card: { suit: 'H', rank: 10 } },
+    ],
+  };
+  session.hands[2] = [
+    { suit: 'H', rank: 11 },
+    { suit: 'H', rank: 3 },
+    { suit: 'S', rank: 2 },
+    { suit: 'JOKER', rank: 0 },
+  ];
+
+  const action = MIGHTY_ENGINE.aiAction(session, 2, 'hard');
+
+  assert.equal(action.type, 'play');
+  assert.equal(action.payload.card, 'H11');
+});
+
+test('mighty ai scheduler keeps one visible action per 1.5 second delay', () => {
+  const source = readFileSync(new URL('../src/games/games.service.ts', import.meta.url), 'utf8');
+  assert.match(source, /const MIGHTY_AI_RESPONSE_DELAY_MS = 1_500;/);
+  const scheduleStart = source.indexOf('private scheduleMightyAi');
+  const scheduleEnd = source.indexOf('private startFortressTimedTurn', scheduleStart);
+  const scheduleBody = source.slice(scheduleStart, scheduleEnd);
+
+  assert.match(scheduleBody, /MIGHTY_ENGINE\.applyAction\(current, current\.currentSeat, action\);/);
+  assert.match(scheduleBody, /}, MIGHTY_AI_RESPONSE_DELAY_MS\);/);
+  assert.doesNotMatch(scheduleBody, /while\s*\(/);
 });
 
 test('crazy arcade server snapshots keep dynamic seat winners', () => {
@@ -1773,6 +1901,32 @@ test('rooms can start multi-player sessions and persist every participant seat',
     const movedCrazy = await service.updateCrazyArcadeInput(startedCrazy.sessionId, extraPlayers[0], { direction: 'right' });
     assert.equal(movedCrazy.mySide, 'seat2');
     assert.ok(movedCrazy.snapshot.player.center.dx > beforeMoveX);
+
+    const mightyRoom = await service.createRoom(user, { gameKey: 'mighty', maxPlayers: 5 });
+    for (const player of [opponent, extraPlayers[0], extraPlayers[1], extraPlayers[2]]) {
+      await service.joinRoom(player, { roomCode: mightyRoom.room.roomCode });
+      await service.setRoomReady(mightyRoom.room.id, player, { ready: true });
+    }
+    const startedMighty = await service.startRoom(mightyRoom.room.id, user);
+    const mightyPlayers = db.sessionPlayers
+      .filter((row) => row.session_id === startedMighty.sessionId)
+      .sort((a, b) => a.seat - b.seat);
+    assert.deepEqual(mightyPlayers.map((row) => row.seat), [0, 1, 2, 3, 4]);
+    assert.deepEqual(
+      mightyPlayers.map((row) => row.account_id),
+      [user.accountId, opponent.accountId, extraPlayers[0].accountId, extraPlayers[1].accountId, extraPlayers[2].accountId],
+    );
+    const persistedMighty = db.rows.get(startedMighty.sessionId).state_json;
+    assert.equal(persistedMighty.roomMode, 'multi_player');
+    assert.equal(persistedMighty.phase, 'bidding');
+    assert.equal(persistedMighty.hands.length, 5);
+    const hostMightyView = await service.getMightySession(startedMighty.sessionId, user);
+    const secondMightyView = await service.getMightySession(startedMighty.sessionId, opponent);
+    assert.equal(hostMightyView.mySeat, 0);
+    assert.equal(secondMightyView.mySeat, 1);
+    assert.equal(hostMightyView.myHand.length, 10);
+    assert.equal(secondMightyView.myHand.length, 10);
+    assert.notDeepEqual(hostMightyView.myHand, secondMightyView.myHand);
   } finally {
     service.onModuleDestroy();
   }

@@ -118,6 +118,7 @@ import {
   OTHELLO_SIZE,
   othelloLegalMoves,
 } from './othello-engine';
+import { MIGHTY_ENGINE, MightySession } from './mighty-engine';
 
 const MATCH_READY_DELAY_MS = 4_000;
 const GOMOKU_TURN_LIMIT_MS = 15_000;
@@ -125,6 +126,7 @@ const ALKKAGI_TURN_LIMIT_MS = 10_000;
 const OTHELLO_TURN_LIMIT_MS = 20_000;
 const FORTRESS_TURN_LIMIT_MS = 20_000;
 const LOCAL_AI_RESPONSE_DELAY_MS = 180;
+const MIGHTY_AI_RESPONSE_DELAY_MS = 1_500;
 const FORTRESS_AI_RESPONSE_DELAY_MS = 1_000;
 const FORTRESS_SHOT_ANIMATION_MS = 2_800;
 const DISCONNECT_GRACE_MS = intEnv('GAME_PLATFORM_DISCONNECT_GRACE_SECONDS', 60) * 1000;
@@ -312,6 +314,12 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'crazy_arcade') {
       return this.createCrazyArcadeSession(user, opponentAccountId, undefined, difficulty);
     }
+    if (gameKey === 'mighty') {
+      if (opponentAccountId) {
+        throw new BadRequestException('mighty friend matches require a 5-player room');
+      }
+      return this.createMightySession(user, difficulty);
+    }
     throw new BadRequestException(`unsupported gameKey: ${gameKey}`);
   }
 
@@ -327,6 +335,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'splendor') return this.getSplendorSession(id, user);
     if (gameKey === 'fortress') return this.getFortressSession(id, user);
     if (gameKey === 'crazy_arcade') return this.getCrazyArcadeSession(id, user);
+    if (gameKey === 'mighty') return this.getMightySession(id, user);
     throw new BadRequestException(`unsupported gameKey: ${gameKey}`);
   }
 
@@ -467,6 +476,39 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
 
     if (gameKey === 'crazy_arcade' && type === 'input') {
       return this.updateCrazyArcadeInput(id, user, payload, clientMoveId);
+    }
+
+    if (gameKey === 'mighty') {
+      if (type === 'bid') {
+        const count = Number(payload.count);
+        return this.applyMightyEngineAction(id, user, 'bid', {
+          pass: payload.pass === true,
+          count: Number.isFinite(count) ? count : undefined,
+          trump: typeof payload.trump === 'string' ? payload.trump : undefined,
+        }, clientMoveId);
+      }
+      if (type === 'kitty') {
+        const count = Number(payload.count);
+        return this.applyMightyEngineAction(id, user, 'kitty', {
+          trump: typeof payload.trump === 'string' ? payload.trump : undefined,
+          count: Number.isFinite(count) ? count : undefined,
+          discard: Array.isArray(payload.discard) ? payload.discard : [],
+        }, clientMoveId);
+      }
+      if (type === 'friend') {
+        return this.applyMightyEngineAction(id, user, 'friend', {
+          friendType: typeof payload.friendType === 'string' ? payload.friendType : undefined,
+          card: typeof payload.card === 'string' ? payload.card : undefined,
+        }, clientMoveId);
+      }
+      if (type === 'play') {
+        return this.applyMightyEngineAction(id, user, 'play', {
+          card: typeof payload.card === 'string' ? payload.card : undefined,
+        }, clientMoveId);
+      }
+      if (type === 'forfeit') {
+        return this.applyMightyForfeit(id, user);
+      }
     }
 
     throw new BadRequestException(`unsupported action type for ${gameKey}`);
@@ -859,6 +901,19 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       [user.accountId, slot, gridSize, JSON.stringify(cells)],
     );
     return emoteFromRow(result.rows[0]);
+  }
+
+  async sendGameEmote(gameKey: string, id: string, user: AuthAccount, slot: number): Promise<unknown> {
+    if (gameKey === 'sudoku') return this.sendSudokuEmote(id, user, slot);
+    if (gameKey === 'gomoku') return this.sendGomokuEmote(id, user, slot);
+    if (gameKey === 'alkkagi') return this.sendAlkkagiEmote(id, user, slot);
+    if (gameKey === 'othello') return this.sendOthelloEmote(id, user, slot);
+    if (gameKey === 'sokoban') return this.sendSokobanEmote(id, user, slot);
+    if (gameKey === 'splendor') return this.sendSplendorEmote(id, user, slot);
+    if (gameKey === 'fortress') return this.sendFortressEmote(id, user, slot);
+    if (gameKey === 'crazy_arcade') return this.sendCrazyArcadeEmote(id, user, slot);
+    if (gameKey === 'mighty') return this.sendMightyEmote(id, user, slot);
+    throw new BadRequestException('unsupported gameKey');
   }
 
   async createSudokuSession(
@@ -1796,6 +1851,94 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return fortressClientSession(saved, user.accountId);
   }
 
+  async createMightySession(
+    user: AuthAccount,
+    difficulty: Difficulty = 'medium',
+  ): Promise<unknown> {
+    this.assertDifficulty(difficulty);
+    const players = [
+      { seat: 0, accountId: user.accountId, kind: 'account' as const },
+      ...[1, 2, 3, 4].map((seat) => ({
+        seat,
+        accountId: `${LOCAL_AI_ACCOUNT_ID}#${seat}`,
+        kind: 'ai' as const,
+        aiDifficulty: difficulty,
+      })),
+    ];
+    const state = MIGHTY_ENGINE.createState(players, {
+      id: '',
+      mode: 'local_ai',
+      aiDifficulty: difficulty,
+    });
+    const row = await this.insertGame(
+      'mighty',
+      'local_ai',
+      user.accountId,
+      null,
+      state.status,
+      state.currentTurn,
+      state.winnerSide ?? null,
+      state,
+    );
+    const saved = this.mightyFromRow(row);
+    this.emitMightyEvent(saved, 'game.session.created');
+    this.scheduleMightyAi(saved);
+    return this.mightyView(saved, user);
+  }
+
+  async getMightySession(id: string, user: AuthAccount): Promise<unknown> {
+    const session = this.mightyFromRow(await this.requireGameRow(id, 'mighty'));
+    this.assertMightyParticipant(user, session);
+    this.scheduleMightyAi(session);
+    return this.mightyView(session, user);
+  }
+
+  private async applyMightyEngineAction(
+    id: string,
+    user: AuthAccount,
+    type: 'bid' | 'kitty' | 'friend' | 'play',
+    payload: Record<string, unknown>,
+    clientMoveId?: string,
+  ): Promise<unknown> {
+    const session = this.mightyFromRow(await this.requireGameRow(id, 'mighty'));
+    this.assertMightyParticipant(user, session);
+    this.assertNotPaused(session);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return this.mightyView(session, user);
+    }
+    const seat = this.mightySeatForUser(session, user);
+    const result = MIGHTY_ENGINE.applyAction(session, seat, { type, payload, clientMoveId });
+    const saved = await this.saveMightySession(result.state);
+    this.emitMightyEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'mighty.action.played');
+    this.scheduleMightyAi(saved);
+    return this.mightyView(saved, user);
+  }
+
+  private async applyMightyForfeit(id: string, user: AuthAccount): Promise<unknown> {
+    const session = this.mightyFromRow(await this.requireGameRow(id, 'mighty'));
+    this.assertMightyParticipant(user, session);
+    const seat = this.mightySeatForUser(session, user);
+    session.status = 'finished';
+    session.phase = 'finished';
+    session.finishReason = 'forfeit';
+    session.winnerTeam = seat === session.declarerSeat ? 'defenders' : 'declarer';
+    session.winnerSeats = [0, 1, 2, 3, 4].filter((candidate) => candidate !== seat);
+    session.winnerSide = session.winnerSeats.length > 0 ? `seat${session.winnerSeats[0]}` : undefined;
+    session.winnerAccountId = session.winnerSide ? session.players[session.winnerSide] : undefined;
+    session.currentTurn = '';
+    session.currentSeat = seat;
+    session.updatedAt = new Date().toISOString();
+    const saved = await this.saveMightySession(session);
+    this.emitMightyEvent(saved, 'game.session.finished');
+    return this.mightyView(saved, user);
+  }
+
+  async sendMightyEmote(id: string, user: AuthAccount, slot: number): Promise<unknown> {
+    const session = this.mightyFromRow(await this.requireGameRow(id, 'mighty'));
+    this.assertMightyParticipant(user, session);
+    return this.sendSessionEmote('mighty', session, user, slot);
+  }
+
   async createCrazyArcadeSession(
     user: AuthAccount,
     opponentAccountId?: string,
@@ -2484,7 +2627,15 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitSessionEvent(saved, 'game.session.paused', saved);
       return sessionForCrazyArcadeUser(saved, user);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, or crazy_arcade');
+    if (gameKey === 'mighty') {
+      const session = this.mightyFromRow(await this.requireGameRow(id, 'mighty'));
+      this.assertMightyParticipant(user, session);
+      this.applyPause(session, user);
+      const saved = await this.saveMightySession(session);
+      this.emitMightyEvent(saved, 'game.session.paused');
+      return this.mightyView(saved, user);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, or mighty');
   }
 
   async resumeMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
@@ -2557,7 +2708,16 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitSessionEvent(saved, 'game.session.resumed', saved);
       return sessionForCrazyArcadeUser(saved, user);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, or crazy_arcade');
+    if (gameKey === 'mighty') {
+      const session = this.mightyFromRow(await this.requireGameRow(id, 'mighty'));
+      this.assertMightyParticipant(user, session);
+      this.applyResume(session);
+      const saved = await this.saveMightySession(session);
+      this.emitMightyEvent(saved, 'game.session.resumed');
+      this.scheduleMightyAi(saved);
+      return this.mightyView(saved, user);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, or mighty');
   }
 
   async createSessionFromMatch(gameKey: string, requesterAccountId: string, opponentAccountId: string): Promise<string> {
@@ -2603,10 +2763,54 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (!descriptor || descriptor.maxPlayers < members.length) {
       throw new BadRequestException('unsupported room size');
     }
-    if (!['splendor', 'sudoku', 'sokoban', 'crazy_arcade'].includes(room.game_key)) {
+    if (!['splendor', 'sudoku', 'sokoban', 'crazy_arcade', 'mighty'].includes(room.game_key)) {
       throw new BadRequestException('multi-player room start is not available for this game');
     }
     const orderedMembers = [...members].sort((a, b) => a.seat - b.seat);
+    if (room.game_key === 'mighty') {
+      const state = MIGHTY_ENGINE.createState(
+        orderedMembers.map((member) => ({
+          seat: member.seat,
+          accountId: member.account_id,
+          kind: 'account',
+        })),
+        {
+          id: '',
+          mode: 'friend_match',
+          aiDifficulty: difficultyFromSnapshot(
+            isRecord(room.config_json) ? room.config_json.difficulty : undefined,
+            'medium',
+          ),
+        },
+      );
+      state.roomId = room.id;
+      state.roomCode = room.room_code;
+      state.roomMode = 'multi_player';
+      state.pause = {
+        active: false,
+        counts: Object.fromEntries(orderedMembers.map((member) => [member.account_id, 0])),
+      };
+      state.seatStatus = Object.fromEntries(orderedMembers.map((member) => [`seat${member.seat}`, 'active']));
+      const row = await this.insertGame(
+        room.game_key,
+        'friend_match',
+        orderedMembers[0].account_id,
+        null,
+        'playing',
+        state.currentTurn,
+        null,
+        {
+          ...state,
+          roomPlayers: orderedMembers.map((member) => ({
+            seat: member.seat,
+            accountId: member.account_id,
+            kind: 'account',
+            status: 'active',
+          })),
+        },
+      );
+      return row.id;
+    }
     if (room.game_key === 'splendor') {
       const state = createSplendorStateForPlayers(
         orderedMembers.map((member) => ({
@@ -3023,6 +3227,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return withRowDates(row.state_json as CrazyArcadeSession, row);
   }
 
+  private mightyFromRow(row: GameRow): MightySession {
+    return withRowDates(row.state_json as MightySession, row);
+  }
+
   private async saveSplendorSession(session: SplendorSession): Promise<SplendorSession> {
     return this.splendorFromRow(await this.updateGame(
       session.id,
@@ -3048,6 +3256,16 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       session.id,
       session.status,
       null,
+      session.winnerSide ?? null,
+      session,
+    ));
+  }
+
+  private async saveMightySession(session: MightySession): Promise<MightySession> {
+    return this.mightyFromRow(await this.updateGame(
+      session.id,
+      session.status,
+      session.status === 'playing' ? session.currentTurn : null,
       session.winnerSide ?? null,
       session,
     ));
@@ -3079,6 +3297,28 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (!participants.some((accountId) => this.canActAs(user, accountId))) {
       throw new ForbiddenException('not a participant');
     }
+  }
+
+  private assertMightyParticipant(user: AuthAccount, session: MightySession): void {
+    if (!Object.values(session.players).some((accountId) => this.canActAs(user, accountId))) {
+      throw new ForbiddenException('not a participant');
+    }
+  }
+
+  private mightySeatForUser(session: MightySession, user: AuthAccount): number {
+    for (const [side, accountId] of Object.entries(session.players)) {
+      if (this.canActAs(user, accountId)) {
+        const match = /^seat(\d+)$/.exec(side);
+        if (match) {
+          return Number(match[1]);
+        }
+      }
+    }
+    throw new ForbiddenException('not a participant');
+  }
+
+  private mightyView(session: MightySession, user: AuthAccount): unknown {
+    return MIGHTY_ENGINE.viewFor(session, this.mightySeatForUser(session, user));
   }
 
   private async sessionSeatRows(row: GameRow): Promise<GameSessionPlayerRow[]> {
@@ -3142,6 +3382,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (row.game_key === 'splendor') return splendorClientSession(this.splendorFromRow(row), user.accountId);
     if (row.game_key === 'fortress') return fortressClientSession(this.fortressFromRow(row), user.accountId);
     if (row.game_key === 'crazy_arcade') return sessionForCrazyArcadeUser(this.crazyArcadeFromRow(row), user);
+    if (row.game_key === 'mighty') return this.mightyView(this.mightyFromRow(row), user);
     throw new BadRequestException('unsupported gameKey');
   }
 
@@ -3165,6 +3406,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.scheduleSplendorAi(this.splendorFromRow(row));
     } else if (gameKey === 'fortress') {
       this.scheduleFortressAi(this.fortressFromRow(row));
+    } else if (gameKey === 'mighty') {
+      this.scheduleMightyAi(this.mightyFromRow(row));
     }
   }
 
@@ -3305,13 +3548,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return undefined;
   }
 
-  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession): void {
+  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession): void {
     if (session.pause?.active) {
       throw new BadRequestException('game is paused');
     }
   }
 
-  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession, user: AuthAccount): void {
+  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession, user: AuthAccount): void {
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('pause is only available during matched games');
     }
@@ -3335,7 +3578,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     session.updatedAt = new Date(now).toISOString();
   }
 
-  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession): void {
+  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession): void {
     const pause = session.pause;
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('resume is only available during matched games');
@@ -3459,8 +3702,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async sendSessionEmote(
-    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress' | 'crazy_arcade',
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession,
+    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress' | 'crazy_arcade' | 'mighty',
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession,
     user: AuthAccount,
     slot: number,
   ): Promise<unknown> {
@@ -3586,6 +3829,48 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         console.warn('[fortress-ai]', error);
       }
     }, FORTRESS_AI_RESPONSE_DELAY_MS);
+    timer.unref?.();
+  }
+
+  private scheduleMightyAi(session: MightySession): void {
+    if (
+      session.mode !== 'local_ai' ||
+      session.status !== 'playing' ||
+      session.pause?.active ||
+      !isLocalAiAccount(session.players[session.currentTurn])
+    ) {
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        const current = this.mightyFromRow(await this.requireGameRow(session.id, 'mighty'));
+        if (
+          current.mode !== 'local_ai' ||
+          current.status !== 'playing' ||
+          current.pause?.active ||
+          !isLocalAiAccount(current.players[current.currentTurn])
+        ) {
+          return;
+        }
+        const action = MIGHTY_ENGINE.aiAction?.(
+          current,
+          current.currentSeat,
+          difficultyFromSnapshot(current.aiDifficulty, 'medium'),
+        );
+        if (!action) {
+          return;
+        }
+        MIGHTY_ENGINE.applyAction(current, current.currentSeat, action);
+        const saved = await this.saveMightySession(current);
+        this.emitMightyEvent(
+          saved,
+          saved.status === 'finished' ? 'game.session.finished' : 'mighty.action.played',
+        );
+        this.scheduleMightyAi(saved);
+      } catch (error) {
+        console.warn('[mighty-ai]', error);
+      }
+    }, MIGHTY_AI_RESPONSE_DELAY_MS);
     timer.unref?.();
   }
 
@@ -4226,11 +4511,24 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private emitSessionEvent(
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession,
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession,
     event: string,
     payload: unknown,
   ): void {
     this.realtime.emitToAccounts(sessionAccountIds(session), event, payload);
+  }
+
+  private emitMightyEvent(session: MightySession, event: string): void {
+    this.emitSessionEvent(session, event, {
+      id: session.id,
+      gameKey: 'mighty',
+      status: session.status,
+      phase: session.phase,
+      rev: session.rev,
+      currentTurn: session.currentTurn,
+      currentSeat: session.currentSeat,
+      updatedAt: session.updatedAt,
+    });
   }
 
   private emitSudokuEvent(session: SudokuSession, event: string): void {
@@ -4958,7 +5256,7 @@ function hideSudokuSolution(session: SudokuSession, user?: AuthAccount): Omit<Su
   return hideSudokuSolutionForAccount(session, user?.accountId);
 }
 
-function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession): string[] {
+function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession): string[] {
   if ('players' in session && session.players) {
     return [...new Set(Object.values(session.players).filter((accountId) => !isLocalAiAccount(accountId)))];
   }
@@ -5293,7 +5591,7 @@ function localAiResultKey(gameKey: string, sessionId: string): string {
 }
 
 function shiftDeadline(
-  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession,
+  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession,
   key: 'turnStartedAt' | 'turnDeadlineAt' | 'networkGraceStartedAt' | 'networkGraceDeadlineAt',
   deltaMs: number,
 ): void {
