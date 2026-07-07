@@ -5,6 +5,7 @@ import { FORTRESS_ENGINE } from '../fortress-engine';
 import { GOMOKU_ENGINE } from '../gomoku-engine';
 import { MIGHTY_ENGINE } from '../mighty-engine';
 import { OTHELLO_ENGINE } from '../othello-engine';
+import { SEOTDA_ENGINE } from '../seotda-engine';
 import { SOKOBAN_ENGINE } from '../sokoban-engine';
 import { SPLENDOR_ENGINE } from '../splendor-engine';
 import { SUDOKU_ENGINE } from '../sudoku-engine';
@@ -19,6 +20,7 @@ export const GAME_ENGINES = [
   FORTRESS_ENGINE,
   CRAZY_ARCADE_ENGINE,
   MIGHTY_ENGINE,
+  SEOTDA_ENGINE,
 ];
 
 export const GAME_DESCRIPTORS: GameDescriptor[] = [
@@ -31,6 +33,7 @@ export const GAME_DESCRIPTORS: GameDescriptor[] = [
   FORTRESS_ENGINE.descriptor,
   CRAZY_ARCADE_ENGINE.descriptor,
   MIGHTY_ENGINE.descriptor,
+  SEOTDA_ENGINE.descriptor,
 ];
 
 export class GameRegistry {
