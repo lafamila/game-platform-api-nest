@@ -160,7 +160,7 @@ async function upsertServiceCredential(pool, argon2, serviceId, keyId, secret) {
     `INSERT INTO service_credentials
      (id, service_id, key_id, secret_hash, name, description, scopes, status, created_at, updated_at)
      VALUES ($1, $2, $3, $4, 'Local game-platform API', 'Local account search credential',
-       ARRAY['account.search']::text[], 'active', now(), now())
+       ARRAY['account.search','permission.read']::text[], 'active', now(), now())
      ON CONFLICT (key_id)
      DO UPDATE SET service_id = EXCLUDED.service_id, secret_hash = EXCLUDED.secret_hash,
        scopes = EXCLUDED.scopes, status = 'active', updated_at = now(), disabled_at = null`,

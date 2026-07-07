@@ -37,7 +37,7 @@ export class SessionController {
       setSessionCookie(response, result.session.id, intEnv('GAME_PLATFORM_SESSION_MAX_AGE_SECONDS', 604800));
     }
     if (result.redirectUri) {
-      if (result.redirectUri.startsWith('gameplatform:')) {
+      if (isAppRedirectUri(result.redirectUri)) {
         response.type('html').send(appRedirectHtml(result.redirectUri, result));
         return;
       }
@@ -220,6 +220,15 @@ function buildReturnLinks(redirectUri: string): { customUri: string; androidInte
     customUri: redirectUri,
     androidIntentUri: `intent://${androidIntentPath}#Intent;scheme=${parsed.protocol.replace(':', '')};package=com.example.game_platform_app_flutter;end`,
   };
+}
+
+function isAppRedirectUri(redirectUri: string): boolean {
+  try {
+    const parsed = new URL(redirectUri);
+    return parsed.protocol !== 'http:' && parsed.protocol !== 'https:';
+  } catch {
+    return false;
+  }
 }
 
 function escapeHtml(value: string): string {

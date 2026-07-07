@@ -15,9 +15,18 @@ import { SocialController } from './social/social.controller';
 import { SocialService } from './social/social.service';
 import { DiagnosticsController } from './diagnostics/diagnostics.controller';
 import { DiagnosticsService } from './diagnostics/diagnostics.service';
+import { AppVersionController } from './app-version.controller';
 
 @Module({
-  controllers: [HealthController, SessionController, GamesController, SocialController, DiagnosticsController, RealtimeController],
+  controllers: [
+    HealthController,
+    AppVersionController,
+    SessionController,
+    GamesController,
+    SocialController,
+    DiagnosticsController,
+    RealtimeController,
+  ],
   providers: [
     DatabaseService,
     AuthService,

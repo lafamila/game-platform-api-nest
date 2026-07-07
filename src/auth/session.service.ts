@@ -640,7 +640,12 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     } catch {
       throw new BadRequestException('returnUri must be a valid URL');
     }
-    if (parsed.protocol === 'gameplatform:') {
+    const allowedReturnSchemes = new Set(
+      listEnv('GAME_PLATFORM_ALLOWED_RETURN_SCHEMES', 'gameplatform')
+        .map((value) => value.trim().replace(/:$/, '').toLowerCase())
+        .filter(Boolean),
+    );
+    if (allowedReturnSchemes.has(parsed.protocol.replace(':', '').toLowerCase())) {
       return parsed.toString();
     }
     const allowedOrigins = new Set([
