@@ -125,6 +125,7 @@ import {
   othelloLegalMoves,
 } from './othello-engine';
 import { MIGHTY_ENGINE, MightySession } from './mighty-engine';
+import { SEOTDA_ENGINE, SeotdaSession, seotdaLegalMoves } from './seotda-engine';
 
 const MATCH_READY_DELAY_MS = 4_000;
 const GOMOKU_TURN_LIMIT_MS = 15_000;
@@ -133,6 +134,8 @@ const OTHELLO_TURN_LIMIT_MS = 20_000;
 const FORTRESS_TURN_LIMIT_MS = 20_000;
 const LOCAL_AI_RESPONSE_DELAY_MS = 180;
 const MIGHTY_AI_RESPONSE_DELAY_MS = 1_500;
+const SEOTDA_AI_RESPONSE_DELAY_MS = 1_200;
+const SEOTDA_TURN_LIMIT_MS = 30_000;
 const FORTRESS_AI_RESPONSE_DELAY_MS = 1_000;
 const ROOM_AI_RESPONSE_DELAY_MS = 850;
 const ROOM_RACE_AI_DELAY_MS: Record<Difficulty, number> = {
@@ -307,7 +310,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   async createGameSession(
     gameKey: string,
     user: AuthAccount,
-    input: { opponentAccountId?: string; difficulty?: Difficulty },
+    input: { opponentAccountId?: string; difficulty?: Difficulty; config?: Record<string, unknown> },
   ): Promise<unknown> {
     if (!this.gameRegistry.has(gameKey)) {
       throw new BadRequestException('unsupported gameKey');
@@ -347,6 +350,12 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       }
       return this.createMightySession(user, difficulty);
     }
+    if (gameKey === 'seotda') {
+      if (opponentAccountId) {
+        throw new BadRequestException('seotda friend matches require a room');
+      }
+      return this.createSeotdaSession(user, difficulty, isRecord(input.config) ? input.config : undefined);
+    }
     throw new BadRequestException(`unsupported gameKey: ${gameKey}`);
   }
 
@@ -363,6 +372,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'fortress') return this.getFortressSession(id, user);
     if (gameKey === 'crazy_arcade') return this.getCrazyArcadeSession(id, user);
     if (gameKey === 'mighty') return this.getMightySession(id, user);
+    if (gameKey === 'seotda') return this.getSeotdaSession(id, user);
     throw new BadRequestException(`unsupported gameKey: ${gameKey}`);
   }
 
@@ -451,6 +461,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     }
     if (row.game_key === 'mighty') {
       await this.applyMightyForfeit(row.id, user);
+      return;
+    }
+    if (row.game_key === 'seotda') {
+      await this.applySeotdaForfeit(row.id, user);
       return;
     }
     await this.finishActiveSessionRow(row, 'forfeit');
@@ -591,6 +605,20 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       }
       if (type === 'forfeit') {
         return this.applyMightyForfeit(id, user);
+      }
+    }
+
+    if (gameKey === 'seotda') {
+      if (type === 'bet') {
+        return this.applySeotdaEngineAction(id, user, 'bet', {
+          move: typeof payload.move === 'string' ? payload.move : undefined,
+        }, clientMoveId);
+      }
+      if (type === 'next_hand') {
+        return this.applySeotdaEngineAction(id, user, 'next_hand', {}, clientMoveId);
+      }
+      if (type === 'forfeit') {
+        return this.applySeotdaForfeit(id, user);
       }
     }
 
@@ -1161,6 +1189,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'fortress') return this.sendFortressEmote(id, user, slot);
     if (gameKey === 'crazy_arcade') return this.sendCrazyArcadeEmote(id, user, slot);
     if (gameKey === 'mighty') return this.sendMightyEmote(id, user, slot);
+    if (gameKey === 'seotda') return this.sendSeotdaEmote(id, user, slot);
     throw new BadRequestException('unsupported gameKey');
   }
 
@@ -2232,6 +2261,95 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return this.sendSessionEmote('mighty', session, user, slot);
   }
 
+  async createSeotdaSession(
+    user: AuthAccount,
+    difficulty: Difficulty = 'medium',
+    config?: Record<string, unknown>,
+  ): Promise<unknown> {
+    this.assertDifficulty(difficulty);
+    const aiOpponents = Math.max(1, Math.min(4, Math.trunc(Number(config?.aiOpponents ?? 1)) || 1));
+    const players = [
+      { seat: 0, accountId: user.accountId, kind: 'account' as const },
+      ...Array.from({ length: aiOpponents }, (_, index) => index + 1).map((seat) => ({
+        seat,
+        accountId: `${LOCAL_AI_ACCOUNT_ID}#${seat}`,
+        kind: 'ai' as const,
+        aiDifficulty: difficulty,
+      })),
+    ];
+    const state = SEOTDA_ENGINE.createState(players, {
+      id: '',
+      mode: 'local_ai',
+      aiDifficulty: difficulty,
+      startingBalance: config?.startingBalance,
+      ante: config?.ante,
+      baseUnit: config?.baseUnit,
+    });
+    const row = await this.insertGame(
+      'seotda',
+      'local_ai',
+      user.accountId,
+      null,
+      state.status,
+      state.currentTurn,
+      state.winnerSide ?? null,
+      state,
+    );
+    const saved = this.seotdaFromRow(row);
+    this.emitSeotdaEvent(saved, 'game.session.created');
+    this.scheduleSeotdaAi(saved);
+    return this.seotdaView(saved, user);
+  }
+
+  async getSeotdaSession(id: string, user: AuthAccount): Promise<unknown> {
+    const session = this.seotdaFromRow(await this.requireGameRow(id, 'seotda'));
+    this.assertSeotdaParticipant(user, session);
+    this.scheduleSeotdaAi(session);
+    this.scheduleSeotdaTurnTimer(session);
+    return this.seotdaView(session, user);
+  }
+
+  private async applySeotdaEngineAction(
+    id: string,
+    user: AuthAccount,
+    type: 'bet' | 'next_hand',
+    payload: Record<string, unknown>,
+    clientMoveId?: string,
+  ): Promise<unknown> {
+    const session = this.seotdaFromRow(await this.requireGameRow(id, 'seotda'));
+    this.assertSeotdaParticipant(user, session);
+    this.assertNotPaused(session);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return this.seotdaView(session, user);
+    }
+    const seat = this.seotdaSeatForUser(session, user);
+    const result = SEOTDA_ENGINE.applyAction(session, seat, { type, payload, clientMoveId });
+    this.stampSeotdaTurn(result.state);
+    const saved = await this.saveSeotdaSession(result.state);
+    this.emitSeotdaEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'seotda.action.played');
+    this.scheduleSeotdaAi(saved);
+    this.scheduleSeotdaTurnTimer(saved);
+    return this.seotdaView(saved, user);
+  }
+
+  private async applySeotdaForfeit(id: string, user: AuthAccount): Promise<unknown> {
+    const session = this.seotdaFromRow(await this.requireGameRow(id, 'seotda'));
+    this.assertSeotdaParticipant(user, session);
+    const seat = this.seotdaSeatForUser(session, user);
+    SEOTDA_ENGINE.applyAction(session, seat, { type: 'forfeit' });
+    const saved = await this.saveSeotdaSession(session);
+    this.clearTurnTimer(saved.id);
+    this.clearRoomAiTimer(saved.id);
+    this.emitSeotdaEvent(saved, 'game.session.finished');
+    return this.seotdaView(saved, user);
+  }
+
+  async sendSeotdaEmote(id: string, user: AuthAccount, slot: number): Promise<unknown> {
+    const session = this.seotdaFromRow(await this.requireGameRow(id, 'seotda'));
+    this.assertSeotdaParticipant(user, session);
+    return this.sendSessionEmote('seotda', session, user, slot);
+  }
+
   async createCrazyArcadeSession(
     user: AuthAccount,
     opponentAccountId?: string,
@@ -2932,7 +3050,17 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitMightyEvent(saved, 'game.session.paused');
       return this.mightyView(saved, user);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, or mighty');
+    if (gameKey === 'seotda') {
+      const session = this.seotdaFromRow(await this.requireGameRow(id, 'seotda'));
+      this.assertSeotdaParticipant(user, session);
+      this.applyPause(session, user);
+      this.clearRoomAiTimer(id);
+      this.clearTurnTimer(id);
+      const saved = await this.saveSeotdaSession(session);
+      this.emitSeotdaEvent(saved, 'game.session.paused');
+      return this.seotdaView(saved, user);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, or seotda');
   }
 
   async resumeMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
@@ -3017,7 +3145,17 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.scheduleMightyAi(saved);
       return this.mightyView(saved, user);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, or mighty');
+    if (gameKey === 'seotda') {
+      const session = this.seotdaFromRow(await this.requireGameRow(id, 'seotda'));
+      this.assertSeotdaParticipant(user, session);
+      this.applyResume(session);
+      const saved = await this.saveSeotdaSession(session);
+      this.emitSeotdaEvent(saved, 'game.session.resumed');
+      this.scheduleSeotdaAi(saved);
+      this.scheduleSeotdaTurnTimer(saved);
+      return this.seotdaView(saved, user);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, or seotda');
   }
 
   async createSessionFromMatch(gameKey: string, requesterAccountId: string, opponentAccountId: string): Promise<string> {
@@ -3086,8 +3224,49 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (!descriptor || descriptor.maxPlayers < members.length) {
       throw new BadRequestException('unsupported room size');
     }
-    if (!['splendor', 'sudoku', 'sokoban', 'crazy_arcade', 'mighty'].includes(room.game_key)) {
+    if (!['splendor', 'sudoku', 'sokoban', 'crazy_arcade', 'mighty', 'seotda'].includes(room.game_key)) {
       throw new BadRequestException('multi-player room start is not available for this game');
+    }
+    if (room.game_key === 'seotda') {
+      const state = SEOTDA_ENGINE.createState(
+        orderedMembers.map(seatInfoFromRoomMember),
+        {
+          id: '',
+          mode: 'friend_match',
+          aiDifficulty: difficultyFromSnapshot(
+            isRecord(room.config_json) ? room.config_json.difficulty : undefined,
+            'medium',
+          ),
+          startingBalance: isRecord(room.config_json) ? room.config_json.startingBalance : undefined,
+          ante: isRecord(room.config_json) ? room.config_json.ante : undefined,
+          baseUnit: isRecord(room.config_json) ? room.config_json.baseUnit : undefined,
+        },
+      );
+      state.roomId = room.id;
+      state.roomCode = room.room_code;
+      state.roomMode = 'multi_player';
+      state.pause = {
+        active: false,
+        counts: Object.fromEntries(orderedMembers.map((member) => [member.account_id, 0])),
+      };
+      state.seatStatus = Object.fromEntries(orderedMembers.map((member) => [`seat${member.seat}`, 'active']));
+      this.stampSeotdaTurn(state);
+      const row = await this.insertGame(
+        room.game_key,
+        'friend_match',
+        orderedMembers[0].account_id,
+        null,
+        'playing',
+        state.currentTurn,
+        null,
+        {
+          ...state,
+          roomPlayers: orderedMembers.map(roomPlayerSnapshot),
+        },
+      );
+      this.scheduleRoomAiFromRow(room.game_key, row);
+      this.scheduleSeotdaTurnTimer(this.seotdaFromRow(row));
+      return row.id;
     }
     if (room.game_key === 'mighty') {
       const state = MIGHTY_ENGINE.createState(
@@ -3654,6 +3833,50 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return MIGHTY_ENGINE.viewFor(session, this.mightySeatForUser(session, user));
   }
 
+  private seotdaFromRow(row: GameRow): SeotdaSession {
+    return withRowDates(row.state_json as SeotdaSession, row);
+  }
+
+  private async saveSeotdaSession(session: SeotdaSession): Promise<SeotdaSession> {
+    return this.seotdaFromRow(await this.updateGame(
+      session.id,
+      session.status,
+      session.status === 'playing' && session.currentTurn ? session.currentTurn : null,
+      session.winnerSide ?? null,
+      session,
+    ));
+  }
+
+  private assertSeotdaParticipant(user: AuthAccount, session: SeotdaSession): void {
+    if (!Object.values(session.players).some((accountId) => this.canActAs(user, accountId))) {
+      throw new ForbiddenException('not a participant');
+    }
+  }
+
+  private seotdaSeatForUser(session: SeotdaSession, user: AuthAccount): number {
+    for (const [side, accountId] of Object.entries(session.players)) {
+      if (accountId === user.accountId) {
+        const match = /^seat(\d+)$/.exec(side);
+        if (match) {
+          return Number(match[1]);
+        }
+      }
+    }
+    for (const [side, accountId] of Object.entries(session.players)) {
+      if (this.canActAs(user, accountId)) {
+        const match = /^seat(\d+)$/.exec(side);
+        if (match) {
+          return Number(match[1]);
+        }
+      }
+    }
+    throw new ForbiddenException('not a participant');
+  }
+
+  private seotdaView(session: SeotdaSession, user: AuthAccount): unknown {
+    return SEOTDA_ENGINE.viewFor(session, this.seotdaSeatForUser(session, user));
+  }
+
   private async sessionSeatRows(row: GameRow): Promise<GameSessionPlayerRow[]> {
     const result = await this.db.query<GameSessionPlayerRow>(
       `SELECT *
@@ -3716,6 +3939,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (row.game_key === 'fortress') return fortressClientSession(this.fortressFromRow(row), user.accountId);
     if (row.game_key === 'crazy_arcade') return sessionForCrazyArcadeUser(this.crazyArcadeFromRow(row), user);
     if (row.game_key === 'mighty') return this.mightyView(this.mightyFromRow(row), user);
+    if (row.game_key === 'seotda') return this.seotdaView(this.seotdaFromRow(row), user);
     throw new BadRequestException('unsupported gameKey');
   }
 
@@ -3741,6 +3965,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.scheduleFortressAi(this.fortressFromRow(row));
     } else if (gameKey === 'mighty') {
       this.scheduleMightyAi(this.mightyFromRow(row));
+    } else if (gameKey === 'seotda') {
+      this.scheduleSeotdaAi(this.seotdaFromRow(row));
     }
   }
 
@@ -3946,13 +4172,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return undefined;
   }
 
-  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession): void {
+  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession): void {
     if (session.pause?.active) {
       throw new BadRequestException('game is paused');
     }
   }
 
-  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession, user: AuthAccount): void {
+  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession, user: AuthAccount): void {
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('pause is only available during matched games');
     }
@@ -3976,7 +4202,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     session.updatedAt = new Date(now).toISOString();
   }
 
-  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession): void {
+  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession): void {
     const pause = session.pause;
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('resume is only available during matched games');
@@ -4113,8 +4339,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async sendSessionEmote(
-    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress' | 'crazy_arcade' | 'mighty',
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession,
+    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress' | 'crazy_arcade' | 'mighty' | 'seotda',
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession,
     user: AuthAccount,
     slot: number,
   ): Promise<unknown> {
@@ -4202,6 +4428,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     }
     if (gameKey === 'mighty') {
       this.scheduleMightyAi(this.mightyFromRow(row));
+      return;
+    }
+    if (gameKey === 'seotda') {
+      this.scheduleSeotdaAi(this.seotdaFromRow(row));
       return;
     }
     if (gameKey === 'crazy_arcade') {
@@ -4551,6 +4781,175 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private scheduleSeotdaAi(session: SeotdaSession): void {
+    if (session.status !== 'playing' || session.pause?.active) {
+      return;
+    }
+    const hasHuman = Object.values(session.players).some((acc) => !isLocalAiAccount(acc));
+    const roomAi = this.roomAiPlayers(session).find((player) => player.side === session.currentTurn);
+    const localAiTurn = session.mode === 'local_ai' && isLocalAiAccount(session.players[session.currentTurn]);
+    const bettingPhase = session.phase === 'betting_1' || session.phase === 'betting_2';
+    const settledAutoNext = session.phase === 'settled' && !hasHuman;
+    if (!settledAutoNext && !(bettingPhase && (roomAi || localAiTurn))) {
+      return;
+    }
+    const run = async () => {
+      try {
+        const current = this.seotdaFromRow(await this.requireGameRow(session.id, 'seotda'));
+        if (current.status !== 'playing' || current.pause?.active) {
+          return;
+        }
+        const curHasHuman = Object.values(current.players).some((acc) => !isLocalAiAccount(acc));
+        if (current.phase === 'settled') {
+          // 남은 인간 0명이면 자동으로 다음 판. 인간이 있으면 그들의 next_hand 를 기다린다.
+          if (curHasHuman) {
+            return;
+          }
+          SEOTDA_ENGINE.applyAction(current, current.currentSeat, { type: 'next_hand' });
+          this.stampSeotdaTurn(current);
+          const savedNext = await this.saveSeotdaSession(current);
+          this.emitSeotdaEvent(savedNext, 'seotda.action.played');
+          this.scheduleSeotdaAi(savedNext);
+          return;
+        }
+        const nextRoomAi = this.roomAiPlayers(current).find((player) => player.side === current.currentTurn);
+        const nextLocalAi = current.mode === 'local_ai' && isLocalAiAccount(current.players[current.currentTurn]);
+        const curBetting = current.phase === 'betting_1' || current.phase === 'betting_2';
+        if (!curBetting || (!nextRoomAi && !nextLocalAi)) {
+          return;
+        }
+        const action = SEOTDA_ENGINE.aiAction?.(
+          current,
+          current.currentSeat,
+          nextRoomAi?.difficulty ?? difficultyFromSnapshot(current.aiDifficulty, 'medium'),
+        );
+        if (!action) {
+          return;
+        }
+        SEOTDA_ENGINE.applyAction(current, current.currentSeat, action);
+        this.stampSeotdaTurn(current);
+        const saved = await this.saveSeotdaSession(current);
+        this.emitSeotdaEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'seotda.action.played');
+        this.scheduleSeotdaAi(saved);
+        this.scheduleSeotdaTurnTimer(saved);
+      } catch (error) {
+        console.warn('[seotda-ai]', error);
+      }
+    };
+    if (roomAi) {
+      this.scheduleRoomAiTimer(session.id, SEOTDA_AI_RESPONSE_DELAY_MS, run);
+    } else {
+      const timer = setTimeout(run, SEOTDA_AI_RESPONSE_DELAY_MS);
+      timer.unref?.();
+    }
+  }
+
+  /** friend_match 인간 베팅 턴에 턴 타이머 기준 시각을 각인한다. AI/local 턴은 타이머를 두지 않는다. */
+  private stampSeotdaTurn(session: SeotdaSession): void {
+    const betting = session.phase === 'betting_1' || session.phase === 'betting_2';
+    const account = session.players[session.currentTurn];
+    if (session.mode !== 'friend_match' || session.status !== 'playing' || !betting || !account || isLocalAiAccount(account)) {
+      session.turnStartedAt = undefined;
+      session.turnDeadlineAt = undefined;
+      session.networkGraceStartedAt = undefined;
+      session.networkGraceDeadlineAt = undefined;
+      session.networkGraceAccountId = undefined;
+      session.opponentLeftAt = undefined;
+      return;
+    }
+    const now = Date.now();
+    session.turnStartedAt = new Date(now).toISOString();
+    session.turnDeadlineAt = new Date(now + SEOTDA_TURN_LIMIT_MS).toISOString();
+    session.networkGraceStartedAt = undefined;
+    session.networkGraceDeadlineAt = undefined;
+    session.networkGraceAccountId = undefined;
+    session.opponentLeftAt = undefined;
+  }
+
+  private scheduleSeotdaTurnTimer(session: SeotdaSession): void {
+    this.clearTurnTimer(session.id);
+    if (session.mode !== 'friend_match' || session.status !== 'playing' || session.pause?.active) {
+      return;
+    }
+    const deadline = session.networkGraceDeadlineAt ?? session.turnDeadlineAt;
+    if (!deadline) {
+      return;
+    }
+    const delay = Math.max(100, Date.parse(deadline) - Date.now());
+    const timer = setTimeout(() => {
+      void this.handleSeotdaTimer(session.id).catch((error) => {
+        console.error(error);
+      });
+    }, delay);
+    timer.unref?.();
+    this.turnTimers.set(session.id, timer);
+  }
+
+  private async handleSeotdaTimer(id: string): Promise<void> {
+    const row = await this.requireGameRow(id, 'seotda');
+    if (row.mode !== 'friend_match' || row.status !== 'playing') {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const session = this.seotdaFromRow(row);
+    if (session.pause?.active) {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const betting = session.phase === 'betting_1' || session.phase === 'betting_2';
+    if (!betting) {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const account = session.players[session.currentTurn];
+    if (!account || isLocalAiAccount(account)) {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const deadline = session.networkGraceDeadlineAt ?? session.turnDeadlineAt;
+    if (deadline && Date.parse(deadline) > Date.now() + 50) {
+      this.scheduleSeotdaTurnTimer(session);
+      return;
+    }
+    const seat = session.currentSeat;
+    if (session.networkGraceDeadlineAt) {
+      // grace 만료: 복귀했으면 턴 재개, 아니면 즉시 정산(opponent_left).
+      if (await this.realtime.isAccountOnline(account)) {
+        this.stampSeotdaTurn(session);
+        const resumed = await this.saveSeotdaSession(session);
+        this.emitSeotdaEvent(resumed, 'game.opponent_returned');
+        this.scheduleSeotdaTurnTimer(resumed);
+        return;
+      }
+      SEOTDA_ENGINE.applyAction(session, seat, { type: 'forfeit' });
+      const settled = await this.saveSeotdaSession(session);
+      this.clearTurnTimer(id);
+      this.emitSeotdaEvent(settled, 'game.session.finished');
+      return;
+    }
+    if (!(await this.realtime.isAccountOnline(account))) {
+      // 오프라인 감지 → grace 진입.
+      const now = Date.now();
+      session.networkGraceStartedAt = new Date(now).toISOString();
+      session.networkGraceDeadlineAt = new Date(now + DISCONNECT_GRACE_MS).toISOString();
+      session.networkGraceAccountId = account;
+      session.opponentLeftAt = new Date(now).toISOString();
+      const saved = await this.saveSeotdaSession(session);
+      this.emitSeotdaEvent(saved, 'game.opponent_left');
+      this.scheduleSeotdaTurnTimer(saved);
+      return;
+    }
+    // 온라인이지만 시간 초과 → 자동 die(체크 가능하면 check).
+    const moves = seotdaLegalMoves(session, seat);
+    const move = moves.includes('check') ? 'check' : 'die';
+    SEOTDA_ENGINE.applyAction(session, seat, { type: 'bet', payload: { move } });
+    this.stampSeotdaTurn(session);
+    const saved = await this.saveSeotdaSession(session);
+    this.emitSeotdaEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'seotda.action.played');
+    this.scheduleSeotdaAi(saved);
+    this.scheduleSeotdaTurnTimer(saved);
+  }
+
   private startFortressTimedTurn(session: FortressSession, delayMs = 0): void {
     if (!['friend_match', 'local_ai'].includes(session.mode ?? '') || session.status !== 'playing' || session.pause?.active) {
       return;
@@ -4850,7 +5249,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       `SELECT * FROM game_sessions
        WHERE mode = 'friend_match'
          AND status = 'playing'
-         AND game_key IN ('gomoku', 'alkkagi', 'othello', 'fortress')`,
+         AND game_key IN ('gomoku', 'alkkagi', 'othello', 'fortress', 'seotda')`,
     );
     for (const row of result.rows) {
       if (row.game_key === 'gomoku') {
@@ -4861,6 +5260,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         this.scheduleTurnTimer(this.othelloFromRow(row), 'othello');
       } else if (row.game_key === 'fortress') {
         this.scheduleFortressTurnTimer(this.fortressFromRow(row));
+      } else if (row.game_key === 'seotda') {
+        this.scheduleSeotdaTurnTimer(this.seotdaFromRow(row));
       }
     }
   }
@@ -4882,7 +5283,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       `SELECT * FROM game_sessions
        WHERE mode = 'friend_match'
          AND status = 'playing'
-         AND game_key IN ('sudoku', 'sokoban', 'splendor', 'crazy_arcade', 'mighty')`,
+         AND game_key IN ('sudoku', 'sokoban', 'splendor', 'crazy_arcade', 'mighty', 'seotda')`,
     );
     for (const row of result.rows) {
       this.scheduleRoomAiFromRow(row.game_key, row);
@@ -5204,7 +5605,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private emitSessionEvent(
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession,
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession,
     event: string,
     payload: unknown,
   ): void {
@@ -5220,6 +5621,20 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       rev: session.rev,
       currentTurn: session.currentTurn,
       currentSeat: session.currentSeat,
+      updatedAt: session.updatedAt,
+    });
+  }
+
+  private emitSeotdaEvent(session: SeotdaSession, event: string): void {
+    this.emitSessionEvent(session, event, {
+      id: session.id,
+      gameKey: 'seotda',
+      status: session.status,
+      phase: session.phase,
+      rev: session.rev,
+      currentTurn: session.currentTurn,
+      currentSeat: session.currentSeat,
+      handNumber: session.handNumber,
       updatedAt: session.updatedAt,
     });
   }
@@ -6058,7 +6473,7 @@ function hideSudokuSolution(session: SudokuSession, user?: AuthAccount): Omit<Su
   return hideSudokuSolutionForAccount(session, user?.accountId);
 }
 
-function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession): string[] {
+function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession): string[] {
   if ('players' in session && session.players) {
     return [...new Set(Object.values(session.players).filter((accountId) => !isLocalAiAccount(accountId)))];
   }
@@ -6442,7 +6857,7 @@ function localAiResultKey(gameKey: string, sessionId: string): string {
 }
 
 function shiftDeadline(
-  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession,
+  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession,
   key: 'turnStartedAt' | 'turnDeadlineAt' | 'networkGraceStartedAt' | 'networkGraceDeadlineAt',
   deltaMs: number,
 ): void {

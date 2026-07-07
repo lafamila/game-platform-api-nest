@@ -118,6 +118,10 @@ export interface SeotdaSession {
 
   turnStartedAt?: string;
   turnDeadlineAt?: string;
+  networkGraceStartedAt?: string;
+  networkGraceDeadlineAt?: string;
+  networkGraceAccountId?: string;
+  opponentLeftAt?: string;
   pause?: { active: boolean; requestedByAccountId?: string; startedAt?: string; resumableAt?: string; counts?: Record<string, number> };
   roomId?: string;
   roomCode?: string;

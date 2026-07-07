@@ -19,7 +19,7 @@ export class GamesController {
   createGameSession(
     @Param('gameKey') gameKey: string,
     @CurrentUser() user: AuthAccount,
-    @Body() body: { opponentAccountId?: string; difficulty?: Difficulty },
+    @Body() body: { opponentAccountId?: string; difficulty?: Difficulty; config?: Record<string, unknown> },
   ) {
     return this.games.createGameSession(gameKey, user, body);
   }

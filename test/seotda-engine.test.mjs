@@ -14,6 +14,7 @@ import {
   applySeotdaForfeit,
   parseSeotdaCardId,
 } from '../dist/games/seotda-engine.js';
+import { GAME_REGISTRY } from '../dist/games/engine/game-registry.js';
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -350,6 +351,19 @@ test('5-player mixed (accounts + AI) start deals one card each', () => {
   assert.equal(state.phase, 'betting_1');
   assert.ok(state.hands.every((h) => h.length === 1));
   assert.ok(state.balances.every((b) => b === SEOTDA_DEFAULT_STARTING_BALANCE - SEOTDA_DEFAULT_ANTE));
+});
+
+test('seotda is registered in the game registry with 2-5 player bounds', () => {
+  const descriptor = GAME_REGISTRY.get('seotda');
+  assert.ok(descriptor, 'seotda descriptor must be registered');
+  assert.equal(descriptor.minPlayers, 2);
+  assert.equal(descriptor.maxPlayers, 5);
+  assert.equal(descriptor.hiddenInfo, true);
+  assert.equal(descriptor.supportsAi, true);
+  assert.equal(descriptor.supportsMatchSave, true);
+  assert.equal(descriptor.status, 'playable');
+  assert.deepEqual([...descriptor.modes].sort(), ['friend_match', 'local_ai']);
+  assert.ok(GAME_REGISTRY.engine('seotda'), 'seotda engine must be registered');
 });
 
 // ---------------------------------------------------------------------------
