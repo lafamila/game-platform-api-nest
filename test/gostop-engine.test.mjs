@@ -185,3 +185,259 @@ test('total aggregates all categories', () => {
   );
   assert.equal(b.total, 3 + 5 + 3);
 });
+
+// ---------------------------------------------------------------------------
+// C2: state / deal / 총통 / 재딜 / settlement / go-stop / viewFor / registry
+// ---------------------------------------------------------------------------
+
+import {
+  createGostopState,
+  startGostopRound,
+  settleGostopRound,
+  settleGostopNagari,
+  applyGostopGo,
+  applyGostopStop,
+  applyGostopNextRound,
+  applyGostopForfeit,
+  applyGoBonus,
+  gostopThreshold,
+  recomputeGostopScores,
+  gostopViewFor,
+  GOSTOP_ENGINE,
+  GOSTOP_DEFAULT_STARTING_BALANCE,
+} from '../dist/games/gostop-engine.js';
+import { GAME_REGISTRY as REGISTRY } from '../dist/games/engine/game-registry.js';
+
+function seats(count) {
+  return Array.from({ length: count }, (_, i) => ({ accountId: `p${i}` }));
+}
+
+test('deal shape: 맞고 손10/바닥8, 3인 손7/바닥6, deck = rest', () => {
+  const two = createGostopState(seats(2), 'local_ai', { seed: 'deal-2' });
+  assert.equal(two.hands[0].length, 10);
+  assert.equal(two.hands[1].length, 10);
+  const floorCount2 = two.floor.reduce((n, s) => n + s.cards.length, 0);
+  assert.equal(floorCount2, 8);
+  assert.equal(two.deck.length, 48 - 20 - 8);
+
+  const three = createGostopState(seats(3), 'local_ai', { seed: 'deal-3' });
+  assert.equal(three.hands[0].length, 7);
+  const floorCount3 = three.floor.reduce((n, s) => n + s.cards.length, 0);
+  assert.equal(floorCount3, 6);
+  assert.equal(three.deck.length, 48 - 21 - 6);
+});
+
+test('deal is reproducible for a given seed', () => {
+  const a = createGostopState(seats(2), 'local_ai', { seed: 'repro' });
+  const b = createGostopState(seats(2), 'local_ai', { seed: 'repro' });
+  assert.deepEqual(a.hands.map((h) => h.map((c) => c.id)), b.hands.map((h) => h.map((c) => c.id)));
+  assert.deepEqual(
+    a.floor.map((s) => s.cards.map((c) => c.id)),
+    b.floor.map((s) => s.cards.map((c) => c.id)),
+  );
+});
+
+test('no dealt floor has 4-of-a-month (재딜 rule)', () => {
+  for (let i = 0; i < 200; i += 1) {
+    const s = createGostopState(seats(2), 'local_ai', { seed: `floor4-${i}` });
+    const byMonth = new Map();
+    for (const stack of s.floor) {
+      for (const card of stack.cards) {
+        byMonth.set(card.month, (byMonth.get(card.month) ?? 0) + 1);
+      }
+    }
+    for (const [, count] of byMonth) {
+      assert.ok(count < 4, `floor had 4-of-a-month at seed floor4-${i}`);
+    }
+  }
+});
+
+test('총통: a hand with 4-of-a-month wins the round immediately (10 points, no multiplier)', () => {
+  // 손패에 동월 4장이 들어오는 시드를 탐색.
+  let found = null;
+  for (let i = 0; i < 4000 && !found; i += 1) {
+    const s = createGostopState(seats(2), 'local_ai', { seed: `ct-${i}` });
+    if (s.lastRoundResult?.chongtong) {
+      found = s;
+    }
+  }
+  assert.ok(found, 'expected to find a 총통 deal within the search budget');
+  assert.equal(found.lastRoundResult.basePoints, 10);
+  assert.equal(found.lastRoundResult.winnerSeat >= 0, true);
+  const winner = found.lastRoundResult.winnerSeat;
+  const loser = winner === 0 ? 1 : 0;
+  // 승자 +1000, 패자 -1000 (pointValue 100 × 10점).
+  assert.equal(found.balances[winner], GOSTOP_DEFAULT_STARTING_BALANCE + 1000);
+  assert.equal(found.balances[loser], GOSTOP_DEFAULT_STARTING_BALANCE - 1000);
+  assert.equal(found.phase, 'settled');
+});
+
+test('applyGoBonus: 1고 +1, 2고 +2, 3고 x2, 4고 x4', () => {
+  assert.equal(applyGoBonus(5, 0), 5);
+  assert.equal(applyGoBonus(5, 1), 6);
+  assert.equal(applyGoBonus(5, 2), 7);
+  assert.equal(applyGoBonus(5, 3), 10);
+  assert.equal(applyGoBonus(5, 4), 20);
+});
+
+test('threshold is 7 for 2인, 3 for 3인', () => {
+  assert.equal(gostopThreshold(2), 7);
+  assert.equal(gostopThreshold(3), 3);
+});
+
+test('settlement: winner collects score x pointValue from loser', () => {
+  const s = createGostopState(seats(2), 'local_ai', { seed: 'settle' });
+  // 승자 좌석 0 에 피 16장(=7점) 세팅.
+  const piIds = [];
+  for (let m = 1; m <= 8; m += 1) {
+    piIds.push(`hwatu_${m}_3`, `hwatu_${m}_4`);
+  }
+  s.captures[0] = cards(...piIds); // 16 피 → piCount 16 → 7점
+  s.captures[1] = [];
+  recomputeGostopScores(s);
+  assert.equal(s.scores[0], 7);
+  const before = s.balances[1];
+  settleGostopRound(s, 0);
+  // 7점 × 100 = 700. 단, 패자 피 0장이라 피박 아님, 광 0이라 광박 아님.
+  assert.equal(s.lastRoundResult.amountPerLoser.seat1, 700);
+  assert.equal(s.balances[1], before - 700);
+});
+
+test('gwangbak doubles a loser with zero gwang when winner has gwang points', () => {
+  const s = createGostopState(seats(2), 'local_ai', { seed: 'gwangbak' });
+  // 승자: 3광(3점) + 피 10장(1점) = 4점, 광점수>=1, 피점수>=1.
+  const piIds = [];
+  for (let m = 1; m <= 5; m += 1) piIds.push(`hwatu_${m}_3`, `hwatu_${m}_4`); // 10 피
+  s.captures[0] = cards('hwatu_1_1', 'hwatu_3_1', 'hwatu_8_1', ...piIds);
+  s.captures[1] = []; // 광 0, 피 0
+  recomputeGostopScores(s);
+  const base = s.scores[0];
+  settleGostopRound(s, 0);
+  // 광박(x2) 적용: 패자 광 0. 피박은 패자 피 0장이라 미적용.
+  assert.equal(s.lastRoundResult.multiplierDetail.gwangbak.seat1, 2);
+  assert.equal(s.lastRoundResult.multiplierDetail.pibak.seat1, undefined);
+  assert.equal(s.lastRoundResult.amountPerLoser.seat1, base * 2 * 100);
+});
+
+test('go then stop: go increments count and stop settles with bonus', () => {
+  const s = createGostopState(seats(2), 'local_ai', { seed: 'gostop' });
+  const piIds = [];
+  for (let m = 1; m <= 8; m += 1) piIds.push(`hwatu_${m}_3`, `hwatu_${m}_4`); // 16 피 = 7점
+  s.captures[0] = cards(...piIds);
+  s.captures[1] = [];
+  recomputeGostopScores(s);
+  s.phase = 'go_stop';
+  s.goStopSeat = 0;
+  applyGostopGo(s, 0);
+  assert.equal(s.goCount[0], 1);
+  assert.equal(s.phase, 'playing');
+  // 다시 go_stop 으로 두고 stop.
+  s.phase = 'go_stop';
+  s.goStopSeat = 0;
+  applyGostopStop(s, 0);
+  // 7점 + 1고(+1) = 8점 × 100 = 800.
+  assert.equal(s.lastRoundResult.amountPerLoser.seat1, 800);
+});
+
+test('gobak: a loser who declared go pays the whole amount (3인)', () => {
+  const s = createGostopState(seats(3), 'local_ai', { seed: 'gobak' });
+  const piIds = [];
+  for (let m = 1; m <= 5; m += 1) piIds.push(`hwatu_${m}_3`, `hwatu_${m}_4`); // 10 피 = 1점? threshold 3인=3.
+  // 승자(0): 홍단(3점).
+  s.captures[0] = cards('hwatu_1_2', 'hwatu_2_2', 'hwatu_3_2');
+  s.captures[1] = []; // go 선언자(패자)
+  s.captures[2] = [];
+  recomputeGostopScores(s);
+  s.goCount[1] = 1; // seat1 이 이전에 go 선언
+  settleGostopRound(s, 0);
+  // gobak = seat1, seat2 면제.
+  assert.equal(s.lastRoundResult.multiplierDetail.gobak, 1);
+  assert.equal(s.lastRoundResult.amountPerLoser.seat2, 0);
+  assert.ok(s.lastRoundResult.amountPerLoser.seat1 > 0);
+});
+
+test('nagari: no payment, dealer preserved, phase settled', () => {
+  const s = createGostopState(seats(2), 'local_ai', { seed: 'nagari' });
+  const balancesBefore = [...s.balances];
+  settleGostopNagari(s);
+  assert.equal(s.lastRoundResult.nagari, true);
+  assert.deepEqual(s.balances, balancesBefore);
+  assert.equal(s.phase, 'settled');
+});
+
+test('bankruptcy ends the session; richest wins', () => {
+  const s = createGostopState(seats(2), 'local_ai', { seed: 'bankrupt' });
+  s.balances = [GOSTOP_DEFAULT_STARTING_BALANCE, 100];
+  const piIds = [];
+  for (let m = 1; m <= 8; m += 1) piIds.push(`hwatu_${m}_3`, `hwatu_${m}_4`); // 7점
+  s.captures[0] = cards(...piIds);
+  s.captures[1] = [];
+  recomputeGostopScores(s);
+  settleGostopRound(s, 0); // 700 > 100 → 패자 파산
+  assert.equal(s.status, 'finished');
+  assert.equal(s.finishReason, 'bankrupt');
+  assert.equal(s.gameWinner.seat, 0);
+});
+
+test('next_round from settled starts a fresh round with winner as dealer', () => {
+  const s = createGostopState(seats(2), 'local_ai', { seed: 'next' });
+  s.captures[0] = cards('hwatu_1_2', 'hwatu_2_2', 'hwatu_3_2'); // 3점 홍단
+  s.captures[1] = [];
+  recomputeGostopScores(s);
+  // 잔액이 충분하도록 큰 시작 잔액에서 settle.
+  settleGostopRound(s, 0);
+  if (s.status === 'finished') return; // 파산이면 skip
+  assert.equal(s.phase, 'settled');
+  assert.equal(s.dealer, 0);
+  const round = s.roundNumber;
+  applyGostopNextRound(s);
+  assert.equal(s.roundNumber, round + 1);
+  assert.equal(s.phase === 'playing' || s.phase === 'settled', true); // 총통이면 settled 가능
+});
+
+test('forfeit ends the session (opponent_left), leaver excluded from winner', () => {
+  const s = createGostopState(seats(2), 'local_ai', { seed: 'forfeit' });
+  applyGostopForfeit(s, 1);
+  assert.equal(s.status, 'finished');
+  assert.equal(s.finishReason, 'opponent_left');
+  assert.equal(s.gameWinner.seat, 0);
+});
+
+test('viewFor hides other seats hands and the deck', () => {
+  const s = createGostopState(seats(3), 'local_ai', { seed: 'hidden-seed-xyz' });
+  s.id = 'sess-view';
+  const view = gostopViewFor(s, 0);
+  assert.equal(view.mySeat, 0);
+  assert.equal(view.myHand.length, 7);
+  assert.equal(view.handCounts.seat1, 7);
+  assert.equal(view.myHand.every((id) => typeof id === 'string'), true);
+  // 더미 카드 자체는 노출되지 않고 개수만.
+  assert.equal(typeof view.deckCount, 'number');
+  assert.equal(view.rngSeed, undefined);
+  assert.equal(JSON.stringify(view).includes(s.rngSeed), false);
+  // 상대 손패 카드 id 가 뷰에 없어야 함.
+  const otherHandIds = s.hands[1].map((c) => c.id);
+  const serialized = JSON.stringify(view);
+  // seat1 의 손패 중 내 손패/바닥과 겹치지 않는 카드는 노출되면 안 됨.
+  const mine = new Set([...s.hands[0].map((c) => c.id), ...s.floor.flatMap((st) => st.cards.map((c) => c.id))]);
+  for (const id of otherHandIds) {
+    if (!mine.has(id)) {
+      assert.equal(serialized.includes(id), false, `leaked opponent card ${id}`);
+    }
+  }
+});
+
+test('gostop is registered and descriptor is correct', () => {
+  const descriptor = REGISTRY.get('gostop');
+  assert.ok(descriptor);
+  assert.equal(descriptor.minPlayers, 2);
+  assert.equal(descriptor.maxPlayers, 3);
+  assert.equal(descriptor.hiddenInfo, true);
+  assert.equal(descriptor.supportsAi, true);
+  assert.equal(descriptor.supportsMatchSave, true);
+  assert.equal(descriptor.turnTimerSeconds, 40);
+  assert.equal(descriptor.status, 'playable');
+  assert.deepEqual([...descriptor.modes].sort(), ['friend_match', 'local_ai']);
+  assert.ok(REGISTRY.engine('gostop'), 'gostop engine must be registered');
+  assert.equal(GOSTOP_ENGINE.descriptor.key, 'gostop');
+});
