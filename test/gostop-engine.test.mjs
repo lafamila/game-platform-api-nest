@@ -792,3 +792,99 @@ test('viewFor exposes pendingChoice while awaiting a flip choice', () => {
   assert.ok(view.pendingChoice);
   assert.equal(view.pendingChoice.type, 'flip_pick');
 });
+
+// ---------------------------------------------------------------------------
+// C5: AI (easy/medium/hard) — legality + completion
+// ---------------------------------------------------------------------------
+
+function aiDrive(state, difficulty, maxSteps = 200000) {
+  let steps = 0;
+  while (state.status === 'playing' && steps < maxSteps) {
+    steps += 1;
+    const seat =
+      state.phase === 'go_stop'
+        ? state.goStopSeat
+        : state.phase === 'flip_choice'
+          ? state.pending.seat
+          : state.currentSeat;
+    const action = GOSTOP_ENGINE.aiAction(state, seat, difficulty);
+    if (action.type === 'play_card' && action.payload.bomb !== true) {
+      assert.ok(
+        state.hands[seat].some((c) => c.id === action.payload.cardId),
+        `AI played a card not in hand: ${action.payload.cardId}`,
+      );
+    }
+    GOSTOP_ENGINE.applyAction(state, seat, action);
+    const total = state.balances.reduce((a, b) => a + b, 0);
+    assert.equal(total, state.seatCount * state.config.startingBalance, 'balance must be zero-sum');
+  }
+  return steps;
+}
+
+for (const difficulty of ['easy', 'medium', 'hard']) {
+  test(`AI (${difficulty}) plays legal moves and finishes 2인 sessions`, () => {
+    let finished = 0;
+    for (let i = 0; i < 8; i += 1) {
+      const s = createGostopState(seats(2), 'local_ai', { seed: `ai2-${difficulty}-${i}`, aiDifficulty: difficulty });
+      aiDrive(s, difficulty);
+      assert.ok(['playing', 'finished'].includes(s.status));
+      if (s.status === 'finished') {
+        finished += 1;
+        assert.ok(['bankrupt', 'opponent_left'].includes(s.finishReason));
+      }
+    }
+    assert.ok(finished > 0, `${difficulty} 2인 must finish some sessions`);
+  });
+
+  test(`AI (${difficulty}) plays legal moves and finishes 3인 sessions`, () => {
+    let finished = 0;
+    for (let i = 0; i < 8; i += 1) {
+      const s = createGostopState(seats(3), 'local_ai', { seed: `ai3-${difficulty}-${i}`, aiDifficulty: difficulty });
+      aiDrive(s, difficulty);
+      assert.ok(['playing', 'finished'].includes(s.status));
+      if (s.status === 'finished') finished += 1;
+    }
+    assert.ok(finished > 0, `${difficulty} 3인 must finish some sessions`);
+  });
+}
+
+test('AI takes a bomb when available (medium/hard)', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_6_1', 'hwatu_6_2', 'hwatu_6_3', 'hwatu_2_3'], ['hwatu_10_1']],
+    floor: [['hwatu_6_4']],
+    deck: ['hwatu_9_4', 'hwatu_5_3'],
+  });
+  const action = GOSTOP_ENGINE.aiAction(s, 0, 'medium');
+  assert.equal(action.type, 'play_card');
+  assert.equal(action.payload.bomb, true);
+  assert.equal(parseGostopCardId(action.payload.cardId).month, 6);
+});
+
+test('AI flip choice picks the higher-value floor card', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_1_1'], ['hwatu_10_1']],
+    floor: [['hwatu_9_2', 'hwatu_9_1']], // month9: tti(9) vs yeol(8) → prefer tti(9_2)
+    deck: ['hwatu_7_4', 'hwatu_9_3'],
+  });
+  s.firstTurnPlayed = true;
+  applyGostopPlayCard(s, 0, { cardId: 'hwatu_1_1' }); // placed; flip 9_3 matches size2 → flip_pick
+  assert.equal(s.phase, 'flip_choice');
+  const action = GOSTOP_ENGINE.aiAction(s, 0, 'hard');
+  assert.equal(action.type, 'flip_choice');
+  assert.equal(action.payload.cardId, 'hwatu_9_2'); // tti(9) > yeol(8)
+});
+
+test('AI go/stop returns only legal declarations', () => {
+  const s = makeState(2, {
+    hands: [['hwatu_1_1', 'hwatu_2_3'], ['hwatu_10_1', 'hwatu_5_1']],
+    floor: [['hwatu_8_1']],
+    deck: ['hwatu_9_4', 'hwatu_7_3'],
+  });
+  s.phase = 'go_stop';
+  s.goStopSeat = 0;
+  s.scores[0] = 7;
+  for (const difficulty of ['easy', 'medium', 'hard']) {
+    const action = GOSTOP_ENGINE.aiAction(s, 0, difficulty);
+    assert.ok(['go', 'stop'].includes(action.type));
+  }
+});

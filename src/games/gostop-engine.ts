@@ -776,18 +776,26 @@ export function applyGostopStop(state: GostopSession, seat: number): void {
   settleGostopRound(state, seat);
 }
 
-/** 다음 활성 좌석으로 턴 이동(좌석 순). */
-export function passGostopTurn(state: GostopSession, fromSeat: number): void {
+/** 손패가 남은 다음 활성 좌석(자신 포함, 좌석 순). 없으면 -1. */
+export function nextPlayableSeat(state: GostopSession, fromSeat: number): number {
   for (let step = 1; step <= state.seatCount; step += 1) {
     const candidate = (fromSeat + step) % state.seatCount;
-    if (state.seatStatus[sideForSeat(candidate)] === 'active') {
-      state.currentSeat = candidate;
-      state.currentTurn = sideForSeat(candidate);
-      return;
+    if (state.seatStatus[sideForSeat(candidate)] === 'active' && state.hands[candidate].length > 0) {
+      return candidate;
     }
   }
-  state.currentSeat = fromSeat;
-  state.currentTurn = sideForSeat(fromSeat);
+  return -1;
+}
+
+/** 다음 플레이 가능한 좌석으로 턴 이동. 없으면 판을 나가리로 종료. */
+export function passGostopTurn(state: GostopSession, fromSeat: number): void {
+  const next = nextPlayableSeat(state, fromSeat);
+  if (next < 0) {
+    settleGostopNagari(state);
+    return;
+  }
+  state.currentSeat = next;
+  state.currentTurn = sideForSeat(next);
 }
 
 /** 다음 판 진행(phase settled 에서만). */
@@ -969,6 +977,9 @@ export const GOSTOP_ENGINE: GameEngine<GostopSession> = {
       winnerSeat: state.gameWinner?.seat,
       reason: state.finishReason,
     };
+  },
+  aiAction(state: GostopSession, seat: number, difficulty: Difficulty): GameAction {
+    return chooseGostopAiMove(state, seat, difficulty);
   },
   migrate(oldState: unknown): GostopSession {
     return oldState as GostopSession;
@@ -1313,9 +1324,9 @@ function finalizeGostopTurn(
   if (captured.length > 0) {
     state.captures[seat].push(...captured);
   }
-  const roundOver = state.deck.length === 0 && state.hands.every((hand) => hand.length === 0);
-  if (state.floor.length === 0 && !roundOver) {
-    // 싹쓸이: 내 획득으로 바닥이 빔(마지막 턴 제외).
+  const allHandsEmpty = state.hands.every((hand) => hand.length === 0);
+  if (state.floor.length === 0 && !allHandsEmpty) {
+    // 싹쓸이: 내 획득으로 바닥이 빔(전원 손패 소진 = 마지막 턴 제외).
     events.push('sseulssak');
     stealPi(state, seat, 1);
   }
@@ -1334,10 +1345,7 @@ function finalizeGostopTurn(
   if (maybeGostopGoStop(state, seat)) {
     return;
   }
-  if (state.deck.length === 0 && state.hands.every((hand) => hand.length === 0)) {
-    settleGostopNagari(state);
-    return;
-  }
+  // passGostopTurn 이 플레이 가능한 좌석이 없으면 나가리로 종료한다.
   passGostopTurn(state, seat);
   touch(state);
 }
@@ -1348,4 +1356,177 @@ export function gostopLegalPlays(state: GostopSession, seat: number): string[] {
     return [];
   }
   return state.hands[seat].map((card) => card.id);
+}
+
+// ---------------------------------------------------------------------------
+// AI (룰베이스, 합법 액션 보장 우선)
+// ---------------------------------------------------------------------------
+
+function gostopCardValue(card: GostopCard): number {
+  switch (card.kind) {
+    case 'gwang':
+      return 20;
+    case 'ssangpi':
+      return 7;
+    case 'yeol':
+      return card.godori ? 12 : 8;
+    case 'tti':
+      return card.ttiGroup ? 9 : 6;
+    default:
+      return 3; // pi
+  }
+}
+
+/** 결정 노이즈(공정성 무관) — 시드 기반 해시. */
+function gostopAiNoise(state: GostopSession, seat: number, salt: string): number {
+  const source = [state.rngSeed ?? state.id, seat, salt, state.roundNumber, state.phase, state.currentSeat].join('|');
+  let hash = 2166136261;
+  for (let i = 0; i < source.length; i += 1) {
+    hash ^= source.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) / 0xffffffff;
+}
+
+interface GostopPlayChoice {
+  cardId: string;
+  matchChoice?: string;
+  value: number;
+}
+
+/** 손패 각 장의 즉시 매칭 가치를 평가해 최선의 제출 카드를 고른다. */
+function evaluateGostopPlays(state: GostopSession, seat: number): GostopPlayChoice[] {
+  const hand = state.hands[seat];
+  const choices: GostopPlayChoice[] = [];
+  for (const card of hand) {
+    const idx = floorIndexForMonth(state, card.month);
+    if (idx < 0) {
+      // 매칭 없음: 카드를 바닥에 버리는 셈 → 손실로 평가.
+      choices.push({ cardId: card.id, value: -gostopCardValue(card) });
+      continue;
+    }
+    const stack = state.floor[idx];
+    if (stack.cards.length === 1) {
+      choices.push({ cardId: card.id, value: gostopCardValue(card) + gostopCardValue(stack.cards[0]) });
+    } else if (stack.cards.length === 2) {
+      // 더 값진 바닥 카드를 선택.
+      const sorted = [...stack.cards].sort((a, b) => gostopCardValue(b) - gostopCardValue(a));
+      choices.push({
+        cardId: card.id,
+        matchChoice: sorted[0].id,
+        value: gostopCardValue(card) + gostopCardValue(sorted[0]),
+      });
+    } else {
+      const floorValue = stack.cards.reduce((sum, c) => sum + gostopCardValue(c), 0);
+      choices.push({ cardId: card.id, value: gostopCardValue(card) + floorValue });
+    }
+  }
+  return choices;
+}
+
+function chooseGostopPlay(state: GostopSession, seat: number, difficulty: Difficulty): GameAction {
+  const hand = state.hands[seat];
+  if (hand.length === 0) {
+    throw new BadRequestException('gostop has no card to play');
+  }
+
+  // 폭탄 기회(medium/hard): 손 동월 3장 + 바닥 동월 1장 이상.
+  if (difficulty !== 'easy') {
+    const byMonth = new Map<number, GostopCard[]>();
+    for (const card of hand) {
+      const list = byMonth.get(card.month) ?? [];
+      list.push(card);
+      byMonth.set(card.month, list);
+    }
+    for (const [month, list] of byMonth) {
+      if (list.length >= 3 && floorIndexForMonth(state, month) >= 0) {
+        return { type: 'play_card', payload: { cardId: list[0].id, bomb: true } };
+      }
+    }
+  }
+
+  const choices = evaluateGostopPlays(state, seat);
+  let best = choices[0];
+  for (const choice of choices.slice(1)) {
+    if (choice.value > best.value) {
+      best = choice;
+    }
+  }
+  const payload: Record<string, unknown> = { cardId: best.cardId };
+  if (best.matchChoice) {
+    payload.matchChoice = best.matchChoice;
+  }
+  // 흔들기(hard): 낼 카드의 월을 손에 3장 이상 들고 있고, 실제 매칭 이득이 있을 때 가끔.
+  if (
+    difficulty === 'hard' &&
+    best.value > 0 &&
+    hand.filter((card) => card.month === parseGostopCardId(best.cardId).month).length >= 3 &&
+    gostopAiNoise(state, seat, 'shake') < 0.5
+  ) {
+    payload.shake = true;
+  }
+  return { type: 'play_card', payload };
+}
+
+function chooseGostopFlipChoice(state: GostopSession, seat: number): GameAction {
+  const options = state.pendingChoice?.options ?? [];
+  if (options.length === 0) {
+    throw new BadRequestException('gostop has no flip choice');
+  }
+  // 더 값진 바닥 카드를 가져간다.
+  let bestId = options[0];
+  let bestValue = gostopCardValue(parseGostopCardId(bestId));
+  for (const id of options.slice(1)) {
+    const value = gostopCardValue(parseGostopCardId(id));
+    if (value > bestValue) {
+      bestValue = value;
+      bestId = id;
+    }
+  }
+  void seat;
+  return { type: 'flip_choice', payload: { cardId: bestId } };
+}
+
+function chooseGostopGoStop(state: GostopSession, seat: number, difficulty: Difficulty): GameAction {
+  const score = state.scores[seat];
+  const handLeft = state.hands[seat].length;
+  const goSoFar = state.goCount[seat];
+  const threshold = gostopThreshold(state.seatCount);
+  let opponentMax = 0;
+  for (let other = 0; other < state.seatCount; other += 1) {
+    if (other !== seat && state.seatStatus[sideForSeat(other)] === 'active') {
+      opponentMax = Math.max(opponentMax, state.scores[other]);
+    }
+  }
+  const canGrow = handLeft >= 2;
+
+  if (difficulty === 'easy') {
+    return { type: 'stop' }; // 보수적: 첫 도달에 정산.
+  }
+  if (difficulty === 'medium') {
+    if (score <= threshold && goSoFar < 1 && canGrow && opponentMax < threshold) {
+      return { type: 'go' };
+    }
+    return { type: 'stop' };
+  }
+  // hard: 점수차·남은 패를 고려.
+  if (score <= threshold + 1 && goSoFar < 2 && canGrow && opponentMax + 2 < score + handLeft) {
+    return { type: 'go' };
+  }
+  return { type: 'stop' };
+}
+
+export function chooseGostopAiMove(state: GostopSession, seat: number, difficulty: Difficulty): GameAction {
+  switch (state.phase) {
+    case 'settled':
+      return { type: 'next_round' };
+    case 'go_stop':
+      return chooseGostopGoStop(state, seat, difficulty);
+    case 'flip_choice':
+      return chooseGostopFlipChoice(state, seat);
+    case 'playing':
+      return chooseGostopPlay(state, seat, difficulty);
+    default:
+      throw new BadRequestException(`gostop has no AI move for phase ${state.phase}`);
+  }
 }
