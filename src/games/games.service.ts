@@ -126,6 +126,7 @@ import {
 } from './othello-engine';
 import { MIGHTY_ENGINE, MightySession } from './mighty-engine';
 import { SEOTDA_ENGINE, SeotdaSession, seotdaLegalMoves } from './seotda-engine';
+import { CHASER_ENGINE, ChaserSession } from './chaser-engine';
 
 const MATCH_READY_DELAY_MS = 4_000;
 const GOMOKU_TURN_LIMIT_MS = 15_000;
@@ -136,6 +137,8 @@ const LOCAL_AI_RESPONSE_DELAY_MS = 180;
 const MIGHTY_AI_RESPONSE_DELAY_MS = 1_500;
 const SEOTDA_AI_RESPONSE_DELAY_MS = 1_200;
 const SEOTDA_TURN_LIMIT_MS = 30_000;
+const CHASER_AI_RESPONSE_DELAY_MS = 900;
+const CHASER_TURN_LIMIT_MS = 60_000;
 const FORTRESS_AI_RESPONSE_DELAY_MS = 1_000;
 const ROOM_AI_RESPONSE_DELAY_MS = 850;
 const ROOM_RACE_AI_DELAY_MS: Record<Difficulty, number> = {
@@ -356,6 +359,12 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       }
       return this.createSeotdaSession(user, difficulty, isRecord(input.config) ? input.config : undefined);
     }
+    if (gameKey === 'chaser') {
+      if (opponentAccountId) {
+        throw new BadRequestException('chaser friend matches require a room');
+      }
+      return this.createChaserSession(user, difficulty, isRecord(input.config) ? input.config : undefined);
+    }
     throw new BadRequestException(`unsupported gameKey: ${gameKey}`);
   }
 
@@ -373,6 +382,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'crazy_arcade') return this.getCrazyArcadeSession(id, user);
     if (gameKey === 'mighty') return this.getMightySession(id, user);
     if (gameKey === 'seotda') return this.getSeotdaSession(id, user);
+    if (gameKey === 'chaser') return this.getChaserSession(id, user);
     throw new BadRequestException(`unsupported gameKey: ${gameKey}`);
   }
 
@@ -465,6 +475,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     }
     if (row.game_key === 'seotda') {
       await this.applySeotdaForfeit(row.id, user);
+      return;
+    }
+    if (row.game_key === 'chaser') {
+      await this.applyChaserForfeit(row.id, user);
       return;
     }
     await this.finishActiveSessionRow(row, 'forfeit');
@@ -619,6 +633,22 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       }
       if (type === 'forfeit') {
         return this.applySeotdaForfeit(id, user);
+      }
+    }
+
+    if (gameKey === 'chaser') {
+      if (type === 'roll') {
+        return this.applyChaserEngineAction(id, user, 'roll', {
+          keep: Array.isArray(payload.keep) ? payload.keep : undefined,
+        }, clientMoveId);
+      }
+      if (type === 'score') {
+        return this.applyChaserEngineAction(id, user, 'score', {
+          category: typeof payload.category === 'string' ? payload.category : undefined,
+        }, clientMoveId);
+      }
+      if (type === 'forfeit') {
+        return this.applyChaserForfeit(id, user);
       }
     }
 
@@ -1190,6 +1220,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'crazy_arcade') return this.sendCrazyArcadeEmote(id, user, slot);
     if (gameKey === 'mighty') return this.sendMightyEmote(id, user, slot);
     if (gameKey === 'seotda') return this.sendSeotdaEmote(id, user, slot);
+    if (gameKey === 'chaser') return this.sendChaserEmote(id, user, slot);
     throw new BadRequestException('unsupported gameKey');
   }
 
@@ -2350,6 +2381,94 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return this.sendSessionEmote('seotda', session, user, slot);
   }
 
+  async createChaserSession(
+    user: AuthAccount,
+    difficulty: Difficulty = 'medium',
+    config?: Record<string, unknown>,
+  ): Promise<unknown> {
+    this.assertDifficulty(difficulty);
+    const aiOpponents = Math.max(1, Math.min(4, Math.trunc(Number(config?.aiOpponents ?? 1)) || 1));
+    const players = [
+      { seat: 0, accountId: user.accountId, kind: 'account' as const },
+      ...Array.from({ length: aiOpponents }, (_, index) => index + 1).map((seat) => ({
+        seat,
+        accountId: `${LOCAL_AI_ACCOUNT_ID}#${seat}`,
+        kind: 'ai' as const,
+        aiDifficulty: difficulty,
+      })),
+    ];
+    const state = CHASER_ENGINE.createState(players, {
+      id: '',
+      mode: 'local_ai',
+      aiDifficulty: difficulty,
+    });
+    const row = await this.insertGame(
+      'chaser',
+      'local_ai',
+      user.accountId,
+      null,
+      state.status,
+      state.currentTurn,
+      state.winnerSide ?? null,
+      state,
+    );
+    const saved = this.chaserFromRow(row);
+    this.emitChaserEvent(saved, 'game.session.created');
+    this.scheduleChaserAi(saved);
+    return this.chaserView(saved, user);
+  }
+
+  async getChaserSession(id: string, user: AuthAccount): Promise<unknown> {
+    const session = this.chaserFromRow(await this.requireGameRow(id, 'chaser'));
+    this.assertChaserParticipant(user, session);
+    this.scheduleChaserAi(session);
+    this.scheduleChaserTurnTimer(session);
+    return this.chaserView(session, user);
+  }
+
+  private async applyChaserEngineAction(
+    id: string,
+    user: AuthAccount,
+    type: 'roll' | 'score',
+    payload: Record<string, unknown>,
+    clientMoveId?: string,
+  ): Promise<unknown> {
+    const session = this.chaserFromRow(await this.requireGameRow(id, 'chaser'));
+    this.assertChaserParticipant(user, session);
+    this.assertNotPaused(session);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return this.chaserView(session, user);
+    }
+    const seat = this.chaserSeatForUser(session, user);
+    const result = CHASER_ENGINE.applyAction(session, seat, { type, payload, clientMoveId });
+    this.stampChaserTurn(result.state);
+    const saved = await this.saveChaserSession(result.state);
+    this.emitChaserEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'chaser.action.played');
+    this.scheduleChaserAi(saved);
+    this.scheduleChaserTurnTimer(saved);
+    return this.chaserView(saved, user);
+  }
+
+  private async applyChaserForfeit(id: string, user: AuthAccount): Promise<unknown> {
+    const session = this.chaserFromRow(await this.requireGameRow(id, 'chaser'));
+    this.assertChaserParticipant(user, session);
+    const seat = this.chaserSeatForUser(session, user);
+    CHASER_ENGINE.applyAction(session, seat, { type: 'forfeit' });
+    const saved = await this.saveChaserSession(session);
+    this.clearTurnTimer(saved.id);
+    this.clearRoomAiTimer(saved.id);
+    this.emitChaserEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'chaser.action.played');
+    this.scheduleChaserAi(saved);
+    this.scheduleChaserTurnTimer(saved);
+    return this.chaserView(saved, user);
+  }
+
+  async sendChaserEmote(id: string, user: AuthAccount, slot: number): Promise<unknown> {
+    const session = this.chaserFromRow(await this.requireGameRow(id, 'chaser'));
+    this.assertChaserParticipant(user, session);
+    return this.sendSessionEmote('chaser', session, user, slot);
+  }
+
   async createCrazyArcadeSession(
     user: AuthAccount,
     opponentAccountId?: string,
@@ -3060,7 +3179,17 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitSeotdaEvent(saved, 'game.session.paused');
       return this.seotdaView(saved, user);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, or seotda');
+    if (gameKey === 'chaser') {
+      const session = this.chaserFromRow(await this.requireGameRow(id, 'chaser'));
+      this.assertChaserParticipant(user, session);
+      this.applyPause(session, user);
+      this.clearRoomAiTimer(id);
+      this.clearTurnTimer(id);
+      const saved = await this.saveChaserSession(session);
+      this.emitChaserEvent(saved, 'game.session.paused');
+      return this.chaserView(saved, user);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, seotda, or chaser');
   }
 
   async resumeMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
@@ -3155,7 +3284,17 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.scheduleSeotdaTurnTimer(saved);
       return this.seotdaView(saved, user);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, or seotda');
+    if (gameKey === 'chaser') {
+      const session = this.chaserFromRow(await this.requireGameRow(id, 'chaser'));
+      this.assertChaserParticipant(user, session);
+      this.applyResume(session);
+      const saved = await this.saveChaserSession(session);
+      this.emitChaserEvent(saved, 'game.session.resumed');
+      this.scheduleChaserAi(saved);
+      this.scheduleChaserTurnTimer(saved);
+      return this.chaserView(saved, user);
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, seotda, or chaser');
   }
 
   async createSessionFromMatch(gameKey: string, requesterAccountId: string, opponentAccountId: string): Promise<string> {
@@ -3224,8 +3363,46 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (!descriptor || descriptor.maxPlayers < members.length) {
       throw new BadRequestException('unsupported room size');
     }
-    if (!['splendor', 'sudoku', 'sokoban', 'crazy_arcade', 'mighty', 'seotda'].includes(room.game_key)) {
+    if (!['splendor', 'sudoku', 'sokoban', 'crazy_arcade', 'mighty', 'seotda', 'chaser'].includes(room.game_key)) {
       throw new BadRequestException('multi-player room start is not available for this game');
+    }
+    if (room.game_key === 'chaser') {
+      const state = CHASER_ENGINE.createState(
+        orderedMembers.map(seatInfoFromRoomMember),
+        {
+          id: '',
+          mode: 'friend_match',
+          aiDifficulty: difficultyFromSnapshot(
+            isRecord(room.config_json) ? room.config_json.difficulty : undefined,
+            'medium',
+          ),
+        },
+      );
+      state.roomId = room.id;
+      state.roomCode = room.room_code;
+      state.roomMode = 'multi_player';
+      state.pause = {
+        active: false,
+        counts: Object.fromEntries(orderedMembers.map((member) => [member.account_id, 0])),
+      };
+      state.seatStatus = Object.fromEntries(orderedMembers.map((member) => [`seat${member.seat}`, 'active']));
+      this.stampChaserTurn(state);
+      const row = await this.insertGame(
+        room.game_key,
+        'friend_match',
+        orderedMembers[0].account_id,
+        null,
+        'playing',
+        state.currentTurn,
+        null,
+        {
+          ...state,
+          roomPlayers: orderedMembers.map(roomPlayerSnapshot),
+        },
+      );
+      this.scheduleRoomAiFromRow(room.game_key, row);
+      this.scheduleChaserTurnTimer(this.chaserFromRow(row));
+      return row.id;
     }
     if (room.game_key === 'seotda') {
       const state = SEOTDA_ENGINE.createState(
@@ -3877,6 +4054,50 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return SEOTDA_ENGINE.viewFor(session, this.seotdaSeatForUser(session, user));
   }
 
+  private chaserFromRow(row: GameRow): ChaserSession {
+    return withRowDates(row.state_json as ChaserSession, row);
+  }
+
+  private async saveChaserSession(session: ChaserSession): Promise<ChaserSession> {
+    return this.chaserFromRow(await this.updateGame(
+      session.id,
+      session.status,
+      session.status === 'playing' && session.currentTurn ? session.currentTurn : null,
+      session.winnerSide ?? null,
+      session,
+    ));
+  }
+
+  private assertChaserParticipant(user: AuthAccount, session: ChaserSession): void {
+    if (!Object.values(session.players).some((accountId) => this.canActAs(user, accountId))) {
+      throw new ForbiddenException('not a participant');
+    }
+  }
+
+  private chaserSeatForUser(session: ChaserSession, user: AuthAccount): number {
+    for (const [side, accountId] of Object.entries(session.players)) {
+      if (accountId === user.accountId) {
+        const match = /^seat(\d+)$/.exec(side);
+        if (match) {
+          return Number(match[1]);
+        }
+      }
+    }
+    for (const [side, accountId] of Object.entries(session.players)) {
+      if (this.canActAs(user, accountId)) {
+        const match = /^seat(\d+)$/.exec(side);
+        if (match) {
+          return Number(match[1]);
+        }
+      }
+    }
+    throw new ForbiddenException('not a participant');
+  }
+
+  private chaserView(session: ChaserSession, user: AuthAccount): unknown {
+    return CHASER_ENGINE.viewFor(session, this.chaserSeatForUser(session, user));
+  }
+
   private async sessionSeatRows(row: GameRow): Promise<GameSessionPlayerRow[]> {
     const result = await this.db.query<GameSessionPlayerRow>(
       `SELECT *
@@ -3940,6 +4161,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (row.game_key === 'crazy_arcade') return sessionForCrazyArcadeUser(this.crazyArcadeFromRow(row), user);
     if (row.game_key === 'mighty') return this.mightyView(this.mightyFromRow(row), user);
     if (row.game_key === 'seotda') return this.seotdaView(this.seotdaFromRow(row), user);
+    if (row.game_key === 'chaser') return this.chaserView(this.chaserFromRow(row), user);
     throw new BadRequestException('unsupported gameKey');
   }
 
@@ -3967,6 +4189,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.scheduleMightyAi(this.mightyFromRow(row));
     } else if (gameKey === 'seotda') {
       this.scheduleSeotdaAi(this.seotdaFromRow(row));
+    } else if (gameKey === 'chaser') {
+      this.scheduleChaserAi(this.chaserFromRow(row));
     }
   }
 
@@ -4172,13 +4396,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return undefined;
   }
 
-  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession): void {
+  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession): void {
     if (session.pause?.active) {
       throw new BadRequestException('game is paused');
     }
   }
 
-  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession, user: AuthAccount): void {
+  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession, user: AuthAccount): void {
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('pause is only available during matched games');
     }
@@ -4202,7 +4426,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     session.updatedAt = new Date(now).toISOString();
   }
 
-  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession): void {
+  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession): void {
     const pause = session.pause;
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('resume is only available during matched games');
@@ -4339,8 +4563,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async sendSessionEmote(
-    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress' | 'crazy_arcade' | 'mighty' | 'seotda',
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession,
+    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress' | 'crazy_arcade' | 'mighty' | 'seotda' | 'chaser',
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession,
     user: AuthAccount,
     slot: number,
   ): Promise<unknown> {
@@ -4432,6 +4656,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     }
     if (gameKey === 'seotda') {
       this.scheduleSeotdaAi(this.seotdaFromRow(row));
+      return;
+    }
+    if (gameKey === 'chaser') {
+      this.scheduleChaserAi(this.chaserFromRow(row));
       return;
     }
     if (gameKey === 'crazy_arcade') {
@@ -4948,6 +5176,166 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.emitSeotdaEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'seotda.action.played');
     this.scheduleSeotdaAi(saved);
     this.scheduleSeotdaTurnTimer(saved);
+  }
+
+  private scheduleChaserAi(session: ChaserSession): void {
+    if (session.status !== 'playing' || session.pause?.active) {
+      return;
+    }
+    const roomAi = this.roomAiPlayers(session).find((player) => player.side === session.currentTurn);
+    const localAiTurn = session.mode === 'local_ai' && isLocalAiAccount(session.players[session.currentTurn]);
+    if (session.phase !== 'rolling' || (!roomAi && !localAiTurn)) {
+      return;
+    }
+    const run = async () => {
+      try {
+        const current = this.chaserFromRow(await this.requireGameRow(session.id, 'chaser'));
+        if (current.status !== 'playing' || current.pause?.active) {
+          return;
+        }
+        const nextRoomAi = this.roomAiPlayers(current).find((player) => player.side === current.currentTurn);
+        const nextLocalAi = current.mode === 'local_ai' && isLocalAiAccount(current.players[current.currentTurn]);
+        if (current.phase !== 'rolling' || (!nextRoomAi && !nextLocalAi)) {
+          return;
+        }
+        const action = CHASER_ENGINE.aiAction?.(
+          current,
+          current.currentSeat,
+          nextRoomAi?.difficulty ?? difficultyFromSnapshot(current.aiDifficulty, 'medium'),
+        );
+        if (!action) {
+          return;
+        }
+        CHASER_ENGINE.applyAction(current, current.currentSeat, action);
+        this.stampChaserTurn(current);
+        const saved = await this.saveChaserSession(current);
+        this.emitChaserEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'chaser.action.played');
+        this.scheduleChaserAi(saved);
+        this.scheduleChaserTurnTimer(saved);
+      } catch (error) {
+        console.warn('[chaser-ai]', error);
+      }
+    };
+    if (roomAi) {
+      this.scheduleRoomAiTimer(session.id, CHASER_AI_RESPONSE_DELAY_MS, run);
+    } else {
+      const timer = setTimeout(run, CHASER_AI_RESPONSE_DELAY_MS);
+      timer.unref?.();
+    }
+  }
+
+  /**
+   * friend_match 인간 턴에 60초 턴 타이머 기준 시각을 각인한다. 60초는 리롤+칸 선택을 모두 포함하므로
+   * 같은 턴 안의 리롤에서는 데드라인을 리셋하지 않고, 새 턴 시작(rollsUsed 0, dice null)에서만 새로 찍는다.
+   */
+  private stampChaserTurn(session: ChaserSession): void {
+    const account = session.players[session.currentTurn];
+    const humanTurn =
+      session.mode === 'friend_match' &&
+      session.status === 'playing' &&
+      session.phase === 'rolling' &&
+      !!account &&
+      !isLocalAiAccount(account);
+    if (!humanTurn) {
+      session.turnStartedAt = undefined;
+      session.turnDeadlineAt = undefined;
+      session.networkGraceStartedAt = undefined;
+      session.networkGraceDeadlineAt = undefined;
+      session.networkGraceAccountId = undefined;
+      session.opponentLeftAt = undefined;
+      return;
+    }
+    const freshTurn = session.rollsUsed === 0 && session.dice === null;
+    if (freshTurn || !session.turnDeadlineAt) {
+      const now = Date.now();
+      session.turnStartedAt = new Date(now).toISOString();
+      session.turnDeadlineAt = new Date(now + CHASER_TURN_LIMIT_MS).toISOString();
+      session.networkGraceStartedAt = undefined;
+      session.networkGraceDeadlineAt = undefined;
+      session.networkGraceAccountId = undefined;
+      session.opponentLeftAt = undefined;
+    }
+    // 같은 턴의 리롤 중에는 기존 데드라인을 그대로 유지한다.
+  }
+
+  private scheduleChaserTurnTimer(session: ChaserSession): void {
+    this.clearTurnTimer(session.id);
+    if (session.mode !== 'friend_match' || session.status !== 'playing' || session.pause?.active) {
+      return;
+    }
+    const deadline = session.networkGraceDeadlineAt ?? session.turnDeadlineAt;
+    if (!deadline) {
+      return;
+    }
+    const delay = Math.max(100, Date.parse(deadline) - Date.now());
+    const timer = setTimeout(() => {
+      void this.handleChaserTimer(session.id).catch((error) => {
+        console.error(error);
+      });
+    }, delay);
+    timer.unref?.();
+    this.turnTimers.set(session.id, timer);
+  }
+
+  private async handleChaserTimer(id: string): Promise<void> {
+    const row = await this.requireGameRow(id, 'chaser');
+    if (row.mode !== 'friend_match' || row.status !== 'playing') {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const session = this.chaserFromRow(row);
+    if (session.pause?.active || session.phase !== 'rolling') {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const account = session.players[session.currentTurn];
+    if (!account || isLocalAiAccount(account)) {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const deadline = session.networkGraceDeadlineAt ?? session.turnDeadlineAt;
+    if (deadline && Date.parse(deadline) > Date.now() + 50) {
+      this.scheduleChaserTurnTimer(session);
+      return;
+    }
+    const seat = session.currentSeat;
+    if (session.networkGraceDeadlineAt) {
+      // grace 만료: 복귀했으면 턴 재개, 아니면 이탈 처리(잔여 0점, 1인 잔류면 즉시 승리).
+      if (await this.realtime.isAccountOnline(account)) {
+        this.stampChaserTurn(session);
+        const resumed = await this.saveChaserSession(session);
+        this.emitChaserEvent(resumed, 'game.opponent_returned');
+        this.scheduleChaserTurnTimer(resumed);
+        return;
+      }
+      CHASER_ENGINE.applyAction(session, seat, { type: 'forfeit' });
+      this.stampChaserTurn(session);
+      const settled = await this.saveChaserSession(session);
+      this.clearTurnTimer(id);
+      this.emitChaserEvent(settled, settled.status === 'finished' ? 'game.session.finished' : 'chaser.action.played');
+      this.scheduleChaserAi(settled);
+      this.scheduleChaserTurnTimer(settled);
+      return;
+    }
+    if (!(await this.realtime.isAccountOnline(account))) {
+      // 오프라인 감지 → grace 진입.
+      const now = Date.now();
+      session.networkGraceStartedAt = new Date(now).toISOString();
+      session.networkGraceDeadlineAt = new Date(now + DISCONNECT_GRACE_MS).toISOString();
+      session.networkGraceAccountId = account;
+      session.opponentLeftAt = new Date(now).toISOString();
+      const saved = await this.saveChaserSession(session);
+      this.emitChaserEvent(saved, 'game.opponent_left');
+      this.scheduleChaserTurnTimer(saved);
+      return;
+    }
+    // 온라인이지만 시간 초과 → 자동 처리(필요 시 1굴림 + 현재 주사위 최고 점수 칸 기록).
+    CHASER_ENGINE.applyAction(session, seat, { type: 'timeout' });
+    this.stampChaserTurn(session);
+    const saved = await this.saveChaserSession(session);
+    this.emitChaserEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'chaser.action.played');
+    this.scheduleChaserAi(saved);
+    this.scheduleChaserTurnTimer(saved);
   }
 
   private startFortressTimedTurn(session: FortressSession, delayMs = 0): void {
@@ -5605,7 +5993,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private emitSessionEvent(
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession,
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession,
     event: string,
     payload: unknown,
   ): void {
@@ -5635,6 +6023,20 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       currentTurn: session.currentTurn,
       currentSeat: session.currentSeat,
       handNumber: session.handNumber,
+      updatedAt: session.updatedAt,
+    });
+  }
+
+  private emitChaserEvent(session: ChaserSession, event: string): void {
+    this.emitSessionEvent(session, event, {
+      id: session.id,
+      gameKey: 'chaser',
+      status: session.status,
+      phase: session.phase,
+      rev: session.rev,
+      currentTurn: session.currentTurn,
+      currentSeat: session.currentSeat,
+      turnNumber: session.turnNumber,
       updatedAt: session.updatedAt,
     });
   }
@@ -6473,7 +6875,7 @@ function hideSudokuSolution(session: SudokuSession, user?: AuthAccount): Omit<Su
   return hideSudokuSolutionForAccount(session, user?.accountId);
 }
 
-function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession): string[] {
+function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession): string[] {
   if ('players' in session && session.players) {
     return [...new Set(Object.values(session.players).filter((accountId) => !isLocalAiAccount(accountId)))];
   }
@@ -6857,7 +7259,7 @@ function localAiResultKey(gameKey: string, sessionId: string): string {
 }
 
 function shiftDeadline(
-  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession,
+  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession,
   key: 'turnStartedAt' | 'turnDeadlineAt' | 'networkGraceStartedAt' | 'networkGraceDeadlineAt',
   deltaMs: number,
 ): void {
