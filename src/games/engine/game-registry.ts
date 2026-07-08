@@ -3,6 +3,7 @@ import { ALKKAGI_ENGINE } from '../alkkagi-engine';
 import { CHASER_ENGINE } from '../chaser-engine';
 import { CRAZY_ARCADE_ENGINE } from '../crazy-arcade-engine';
 import { FORTRESS_ENGINE } from '../fortress-engine';
+import { FOUR_BALL_ENGINE } from '../four-ball-engine';
 import { GOMOKU_ENGINE } from '../gomoku-engine';
 import { GOSTOP_ENGINE } from '../gostop-engine';
 import { MIGHTY_ENGINE } from '../mighty-engine';
@@ -25,6 +26,7 @@ export const GAME_ENGINES = [
   SEOTDA_ENGINE,
   CHASER_ENGINE,
   GOSTOP_ENGINE,
+  FOUR_BALL_ENGINE,
 ];
 
 export const GAME_DESCRIPTORS: GameDescriptor[] = [
@@ -40,6 +42,7 @@ export const GAME_DESCRIPTORS: GameDescriptor[] = [
   SEOTDA_ENGINE.descriptor,
   CHASER_ENGINE.descriptor,
   GOSTOP_ENGINE.descriptor,
+  FOUR_BALL_ENGINE.descriptor,
 ];
 
 export class GameRegistry {
