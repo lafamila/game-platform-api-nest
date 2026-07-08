@@ -25,7 +25,7 @@ This repo follows `../CLAUDE.md`, especially central auth, env handling, local-f
 - Storage: PostgreSQL via `DATABASE_URL`.
 - Game model: server-authoritative rules and result validation.
 - Game registry: public game metadata is centralized in `GameRegistry`/`GAME_DESCRIPTORS`; new server-backed games should register a `GameEngine` and then wire only the remaining service orchestration gaps.
-- Current games: `sudoku`, `gomoku`, `alkkagi`, `othello`, `sokoban`, `splendor`, `fortress`, `crazy_arcade`, `mighty`, `seotda`, `chaser`, `gostop`.
+- Current games: `sudoku`, `gomoku`, `alkkagi`, `othello`, `sokoban`, `splendor`, `fortress`, `crazy_arcade`, `mighty`, `seotda`, `chaser`, `gostop`, `four_ball`.
 - Start UX contract: every newly started game session, including Crazy Arcade and room-started sessions, must support the client countdown flow. Resuming an already-active session is not a new start.
 
 ## Auth Onboarding Request Shape
@@ -120,7 +120,7 @@ Every action POST accepts an optional `clientMoveId` (uuid). The server keeps th
 - `POST /api/games/:gameKey/sessions` and `GET /api/games/:gameKey/sessions/:id` are the preferred common create/get routes. Legacy game-specific create/get routes remain for compatibility.
 - `POST /api/games/:gameKey/sessions/:id/actions` is the preferred common action route. Game-specific action routes should delegate to the same engine/service path.
 - `POST /api/games/:gameKey/sessions/:id/pause|resume|save|emotes|claim-win|wait` are common session adjunct routes where the game supports the concept.
-- Room APIs create N-player sessions from room membership. Sudoku/Sokoban race rooms support up to 6 seats; Splendor supports 2–4; Crazy Arcade supports 2–4; Mighty is exactly 5 seats; Gostop supports 2–3 seats.
+- Room APIs create N-player sessions from room membership. Sudoku/Sokoban race rooms support up to 6 seats; Splendor supports 2–4; Crazy Arcade supports 2–4; Mighty is exactly 5 seats; Gostop supports 2–3 seats; Four Ball is exactly 2 seats.
 - Server save/continue stores an account-owned long-term snapshot. Continuing a finished friend match forks according to game type: solo-capable puzzle games resume solo, while competitive games use `local_ai` continuation. Crazy Arcade server save is included and forks the server-authoritative snapshot to `local_ai`.
 - Mighty (`mighty`) is a hidden-information 5-player trick game. Its engine must hide non-viewer hands/kitty/deck data, expose only viewer-legal actions, and support local AI seats plus 5-player room start.
 - Seotda (`seotda`) is a hidden-information 2-5 player hwatu betting game. One session runs continuous hands with a shared, evenly-distributed balance (default 10,000, configurable via create `config.startingBalance`). The session ends the moment a player leaves (`opponent_left`) or a settlement leaves someone at 0 balance (`bankrupt`); the richest player then wins (ties break to the last hand's winner) and `gameWinner` records `reason` + `finalBalances`. Actions on the common route: `bet` (`payload.move` = `die|check|call|bbing|ddadang|half|allin`), `next_hand`, `forfeit`. Betting rounds cap raises at the minimum active balance (no side pots). `viewFor` exposes only the viewer's hand and reveals survivor hands (`revealedHands`) at settlement; deck/seed stay hidden. Local AI create accepts `config.aiOpponents` (1-4, default 1), `config.ante`, `config.baseUnit`, `config.startingBalance`. Room start supports 2-5 seats with mixed AI seats. Adopted standard rules with variants (멍구사 등 미구현) documented in the seotda engine header.
@@ -136,6 +136,16 @@ Every action POST accepts an optional `clientMoveId` (uuid). The server keeps th
   - **AI** (easy/medium/hard): rule-based — evaluates immediate capture value per hand card (광/열끗/단 weighted), medium/hard take bombs when available and hard occasionally shakes; go/stop is a risk heuristic (easy always stops; hard weighs score gap + remaining cards). Legality is always guaranteed. Local AI create accepts `config.aiOpponents` (1–2, default 1), `config.startingBalance`, `config.pointValue`; room start supports 2–3 mixed AI seats. friend_match human turns have a 40s timer; on timeout the server auto-plays the first hand card (no shake/bomb), auto-resolves any pending choice with the first option, and auto-`stop`s a `go_stop`.
   - **Events**: `gostop.action.played` (metadata; clients re-fetch the per-seat view), `game.session.finished`, plus the common session events.
   - **Not implemented (documented options)**: regional variants (지방룰), 국진(9월 열끗) ssangpi toggle, 멍박/멍텅구리, 광팔기(3인), 나가리 배수 2배 이월, 흔들기/폭탄 turn-count compensation. The `applyGoBonus` reading (≥3고 multiplies base without the +1/+2 additive) is an adopted interpretation.
+- Four Ball (`four_ball`) is a 2-player, full-information carom (사구) game on a server-authoritative deterministic physics engine. Single game (no continuous rounds, no stakes). Modes: `local_ai` (1 AI) and `friend_match` (2-seat match/room). Turn timer 60s.
+  - **Physics** (`src/games/billiards-physics.ts`, reusable by future 삼구): fixed 8ms timestep 2D sim on a `1000×500` table, ball radius `15`, 4-wall cushions. Constants are exported: `MAX_SPEED=1400 u/s` (`speed = power × MAX_SPEED`), `CUSHION_RESTITUTION=0.85` (normal), `CUSHION_TANGENT_KEEP=0.85` + `CUSHION_SIDE_TRANSFER=0.55` (tangential + english transfer, `CUSHION_SIDE_CONSUME=0.5`), two-phase deceleration `SLIDING_DECEL=900`→`ROLLING_DECEL=180` after `SLIDE_TIME=0.15s`, `FOLLOW_TRANSFER=520` (follow/draw applied on the cue's first ball contact along its travel dir), `SPIN_DECAY_PER_SEC=1.1`, `MAX_SIM_TIME=12s`. `shoot(angle, power 0..1, tipX -1..1, tipY -1..1)`: `tipY>0`=follow, `tipY<0`=draw, `tipX`=side (english) that alters cushion reflection and is consumed. Miscue: `d=hypot(tipX,tipY)` clamped 0..1; probability 0 for `d≤0.3`, linear to `0.25` at `d=1` (seeded RNG, reproducible); on miscue `power×0.25`, angle jitter `±12°`. Output = frame array (`frameMs:16`, all 4 ball coords) + time-ordered contact events `[{t,type:'cushion'|'ball',ball,other?,cushion?}]`.
+  - **Rules** (`src/games/carom-rules.ts`, reusable by 삼구): reduce the cue's contact events to `{ballsHit, redsHit, cushionsBeforeSecondObject, hitOpponentCue, threeCushion}`. Four-ball success = both reds hit & opponent cue not touched; foul = opponent cue touched; three-cushion = ≥3 cushions before the 2nd red.
+  - **Flow**: `phase 'selecting'` — each seat picks a target score from `[3,5,8,10,15,20]` (client ×10). Once both selected → `playing`, first seat seeded-random. Success = remaining −1 **+ continued turn**; miss (0–1 reds) = pass; foul (opponent cue) = remaining +1 + pass. On reaching remaining 0 the next shot must be a **three-cushion finish** (`needsThreeCushionFinish`) to win — a failed finish costs nothing but passes the turn. Turn cap 200 shots (fewer-remaining wins, tie→first seat) prevents infinite AI games. Forfeit/leave = other seat wins (`opponent_left`).
+  - **Actions** (common route + `four-ball/*` wrappers): `select_target {target}`, `shoot {angle(rad),power,tipX,tipY}` (+`clientMoveId`; idempotent, duplicate → empty animation), `aim {angle,power?,tipX?,tipY?}` (relay only, not persisted), `forfeit {}`.
+  - **viewFor** (all public, `rngSeed` never exposed): `phase`, absolute ball keys `balls:{cue0,cue1,red1,red2}` + `cueBallOf:{seat0:'cue0',seat1:'cue1'}`, `table:{width:1000,height:500,ballRadius:15}`, `targetOptions`, `targets/remaining/needsThreeCushionFinish` (per `seatN`), `currentSeat`/`currentTurn`(=`cue{seat}`)/`mySeat`/`firstSeat`, `lastShot:{seat,params,miscue,outcome:{scored,foul,threeCushion,cushions,ballsHit,continueTurn},events,animation:{frameMs:16,frames:[{cue0,cue1,red1,red2}]}}`, `lastAim`, `turnDeadlineAt`, `gameWinner:{seat,accountId,reason:'completed'|'opponent_left',finalRemaining}`, `rev`.
+  - **AI** (easy/medium/hard): candidate shots (angle×power×tip aimed at each red) simulated server-side and scored by carom success, second-red proximity and foul avoidance (three-cushion when finishing); hard uses more candidates + english/follow tips and picks greedily, easy/medium add noise. Always legal; time-budgeted (`FOUR_BALL_AI_BUDGET_MS`).
+  - **Events**: `four_ball.action.played` (shoot payload `{session, shot}`), `four_ball.aim.updated`, `game.session.finished`, plus common session events. Shoot response = `{session, animation}` (alkkagi pattern).
+  - **삼구 reuse**: the physics engine and `carom-rules` (`threeCushion`, `cushionsBeforeSecondObject`) are game-agnostic; a future 삼구 engine reuses both, changing only the success condition (both reds + `threeCushion`) and scoring. Initial layout, target options and physics tuning constants are exported for that reuse.
+  - **Not implemented (documented options)**: 삼구/four-ball variants beyond standard (e.g. 큐 miscue depth model, cushion 세리 nuances, pocket/scratch rules — carom has none), balance/stake integration, spectator-hidden data (game is full-information by design).
 
 ## Local Dev
 
@@ -183,6 +193,13 @@ Normal local development uses `auth-api-nest` on `http://localhost:3032`, Postgr
 - `GET /api/alkkagi/sessions/:id`
 - `POST /api/alkkagi/sessions/:id/shots`
 - `POST /api/alkkagi/sessions/:id/emotes`
+- `POST /api/four-ball/sessions`
+- `GET /api/four-ball/sessions/:id`
+- `POST /api/four-ball/sessions/:id/select-target`
+- `POST /api/four-ball/sessions/:id/aim`
+- `POST /api/four-ball/sessions/:id/shots`
+- `POST /api/four-ball/sessions/:id/emotes`
+- `POST /api/four-ball/sessions/:id/forfeit`
 - `GET /api/emotes`
 - `PUT /api/emotes/:slot`
 - `GET /api/session/oidc/readiness`
