@@ -10,6 +10,7 @@ import {
   applyFourBallShot,
   applyFourBallForfeit,
   fourBallViewFor,
+  chooseFourBallAiShot,
 } from '../dist/games/four-ball-engine.js';
 import { GAME_REGISTRY } from '../dist/games/engine/game-registry.js';
 
@@ -153,6 +154,61 @@ test('the game always terminates within the turn cap', () => {
   assert.equal(state.status, 'finished');
   assert.ok(state.turnCount <= FOUR_BALL_MAX_TURNS);
   assert.ok(state.winnerSeat === 0 || state.winnerSeat === 1);
+});
+
+// ---------------------------------------------------------------------------
+// AI (S5): 후보 평가, 합법성, 전 난이도 완주
+// ---------------------------------------------------------------------------
+
+test('the AI returns a legal, in-range shot for its own turn', () => {
+  for (const difficulty of ['easy', 'medium', 'hard']) {
+    const state = startedState(`ai-${difficulty}`);
+    const seat = state.currentSeat;
+    const shot = chooseFourBallAiShot(state, seat, difficulty);
+    assert.ok(shot, `${difficulty}: a shot is returned`);
+    assert.ok(Number.isFinite(shot.angle));
+    assert.ok(shot.power >= 0 && shot.power <= 1);
+    assert.ok(shot.tipX >= -1 && shot.tipX <= 1);
+    assert.ok(shot.tipY >= -1 && shot.tipY <= 1);
+    // 반환된 샷은 엔진에서 예외 없이 적용되어야 한다(합법 보장).
+    assert.doesNotThrow(() => applyFourBallShot(state, seat, shot, 'ai'));
+  }
+});
+
+test('AI-vs-AI games always terminate for every difficulty', () => {
+  for (const difficulty of ['easy', 'medium', 'hard']) {
+    const state = createFourBallState('a', 'b', 'friend_match', difficulty, `aiai-${difficulty}`);
+    selectFourBallTarget(state, 0, 3);
+    selectFourBallTarget(state, 1, 3);
+    let guard = 0;
+    while (state.status === 'playing' && guard < FOUR_BALL_MAX_TURNS + 5) {
+      const seat = state.currentSeat;
+      const shot = chooseFourBallAiShot(state, seat, difficulty);
+      applyFourBallShot(state, seat, shot, 'ai');
+      guard += 1;
+    }
+    assert.equal(state.status, 'finished', `${difficulty} terminated`);
+    assert.ok(state.winnerSeat === 0 || state.winnerSeat === 1);
+  }
+});
+
+test('the AI can actually score carom points over a game', () => {
+  // hard AI 가 한 판을 통해 최소 몇 번은 성공해 잔여를 줄일 수 있어야 한다.
+  const state = createFourBallState('a', 'b', 'friend_match', 'hard', 'ai-score-seed');
+  selectFourBallTarget(state, 0, 5);
+  selectFourBallTarget(state, 1, 5);
+  let scoredShots = 0;
+  let guard = 0;
+  while (state.status === 'playing' && guard < FOUR_BALL_MAX_TURNS + 5) {
+    const seat = state.currentSeat;
+    const shot = chooseFourBallAiShot(state, seat, 'hard');
+    const record = applyFourBallShot(state, seat, shot, 'ai');
+    if (record.outcome.scored) {
+      scoredShots += 1;
+    }
+    guard += 1;
+  }
+  assert.ok(scoredShots > 0, 'hard AI should score at least once');
 });
 
 // ---------------------------------------------------------------------------

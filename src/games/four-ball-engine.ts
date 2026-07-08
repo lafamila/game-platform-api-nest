@@ -4,6 +4,7 @@ import { createSeededRng, cryptoSeed } from './engine/rng';
 import {
   BilliardsBallInput,
   ContactEvent,
+  DeterministicRng,
   simulateBilliards,
   BALL_RADIUS,
   TABLE_HEIGHT,
@@ -21,6 +22,11 @@ export const FOUR_BALL_STATE_VERSION = 1;
 export const FOUR_BALL_TARGET_OPTIONS = [3, 5, 8, 10, 15, 20] as const;
 /** 무한 게임 방지용 최대 샷 수. 도달 시 잔여가 적은 쪽 승. */
 export const FOUR_BALL_MAX_TURNS = 200;
+/** AI 후보 샷 평가 시간 예산(ms). */
+export const FOUR_BALL_AI_BUDGET_MS = 1_200;
+
+/** 미스큐 없는 평가용 RNG(후보 시뮬은 재현/공정성 무관). */
+const NO_MISCUE_RNG: DeterministicRng = { next: () => 0.999999 };
 
 export type FourBallBallKey = 'cue0' | 'cue1' | 'red1' | 'red2';
 const FOUR_BALL_BALL_KEYS: FourBallBallKey[] = ['cue0', 'cue1', 'red1', 'red2'];
@@ -459,13 +465,103 @@ export function randomFourBallShot(session: FourBallSession, seat: number): Four
   };
 }
 
+/**
+ * 후보 샷(각도 × 파워 × 당점)을 서버 물리로 시뮬레이션해 판정 결과로 점수화한 뒤 고른다(alkkagi/fortress 패턴).
+ * 항상 합법 샷을 반환하며, 난이도가 높을수록 후보 수와 당점 활용이 늘고 최적 후보를 고른다.
+ */
 export function chooseFourBallAiShot(
-  _session: FourBallSession,
-  _seat: number,
-  _difficulty: Difficulty,
+  session: FourBallSession,
+  seat: number,
+  difficulty: Difficulty,
+  deadlineMs = Date.now() + FOUR_BALL_AI_BUDGET_MS,
 ): FourBallShotParams | undefined {
-  // S5 에서 후보 샷 서버 시뮬 평가로 대체된다.
-  return undefined;
+  if (session.status !== 'playing' || session.currentSeat !== seat) {
+    return undefined;
+  }
+  const cueKey = cueKeyFor(seat);
+  const opponentCueKey = cueKeyFor(1 - seat);
+  const finishing = session.needsThreeCushionFinish[seatKeyFor(seat)] === true;
+
+  const candidates = generateFourBallCandidates(session, seat, difficulty);
+  const baseBalls: BilliardsBallInput[] = FOUR_BALL_BALL_KEYS.map((key) => ({
+    id: key,
+    x: session.balls[key].x,
+    y: session.balls[key].y,
+  }));
+
+  const scored: Array<{ shot: FourBallShotParams; score: number }> = [];
+  for (const shot of candidates) {
+    if (Date.now() >= deadlineMs && scored.length > 0) {
+      break;
+    }
+    const sim = simulateBilliards(baseBalls, { ballId: cueKey, ...shot }, NO_MISCUE_RNG);
+    const outcome = evaluateFourBall(sim.events, {
+      cueBallId: cueKey,
+      opponentCueId: opponentCueKey,
+      redBallIds: FOUR_BALL_RED_KEYS,
+    });
+    const cueFinal = sim.finalPositions[cueKey];
+    const redsHit = new Set(outcome.ballsHit.filter((id) => id === 'red1' || id === 'red2')).size;
+    let score: number;
+    if (finishing) {
+      if (outcome.scored && outcome.threeCushion) {
+        score = 100_000;
+      } else {
+        score = redsHit * 600 + outcome.cushions * 250 - (outcome.foul ? 200 : 0);
+      }
+    } else if (outcome.foul) {
+      score = -5_000 + redsHit * 100;
+    } else if (outcome.scored) {
+      score = 100_000;
+    } else if (redsHit === 1) {
+      // 첫 빨강은 맞혔으니 수구가 두 번째 빨강에 얼마나 가까운지로 평가.
+      const otherRed = outcome.ballsHit.includes('red1') ? session.balls.red2 : session.balls.red1;
+      score = 5_000 - distance(cueFinal, otherRed);
+    } else {
+      // 아무 빨강도 못 맞힘 → 가장 가까운 빨강에 근접할수록 좋음.
+      score = -Math.min(distance(cueFinal, session.balls.red1), distance(cueFinal, session.balls.red2));
+    }
+    const noise = difficulty === 'easy' ? 3_000 : difficulty === 'medium' ? 600 : 40;
+    scored.push({ shot, score: score + (Math.random() - 0.5) * noise });
+  }
+  if (scored.length === 0) {
+    return undefined;
+  }
+  scored.sort((a, b) => b.score - a.score);
+  if (difficulty === 'easy') {
+    const pool = scored.slice(0, Math.max(1, Math.ceil(scored.length * 0.5)));
+    return pool[Math.floor(Math.random() * pool.length)].shot;
+  }
+  if (difficulty === 'medium') {
+    const pool = scored.slice(0, Math.min(4, scored.length));
+    return pool[Math.floor(Math.random() * pool.length)].shot;
+  }
+  return scored[0].shot;
+}
+
+function generateFourBallCandidates(session: FourBallSession, seat: number, difficulty: Difficulty): FourBallShotParams[] {
+  const cue = session.balls[cueKeyFor(seat)];
+  const offsets = difficulty === 'easy'
+    ? [-0.2, 0, 0.2]
+    : difficulty === 'medium'
+      ? [-0.35, -0.18, 0, 0.18, 0.35]
+      : [-0.45, -0.3, -0.15, 0, 0.15, 0.3, 0.45];
+  const powers = difficulty === 'easy' ? [0.5] : difficulty === 'medium' ? [0.4, 0.65] : [0.35, 0.55, 0.8];
+  const tips: Array<{ tipX: number; tipY: number }> = difficulty === 'hard'
+    ? [{ tipX: 0, tipY: 0 }, { tipX: 0, tipY: 0.28 }, { tipX: 0, tipY: -0.28 }, { tipX: 0.28, tipY: 0 }, { tipX: -0.28, tipY: 0 }]
+    : [{ tipX: 0, tipY: 0 }];
+  const candidates: FourBallShotParams[] = [];
+  for (const red of [session.balls.red1, session.balls.red2]) {
+    const base = Math.atan2(red.y - cue.y, red.x - cue.x);
+    for (const offset of offsets) {
+      for (const power of powers) {
+        for (const tip of tips) {
+          candidates.push({ angle: base + offset, power, tipX: tip.tipX, tipY: tip.tipY });
+        }
+      }
+    }
+  }
+  return candidates;
 }
 
 function nearestRed(session: FourBallSession, from: FourBallVec): FourBallVec {
