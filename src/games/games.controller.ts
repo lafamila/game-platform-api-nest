@@ -446,6 +446,41 @@ export class GamesController {
     return this.games.forfeitFortress(id, user);
   }
 
+  @Post('four-ball/sessions')
+  createFourBall(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
+    return this.games.createFourBallSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium');
+  }
+
+  @Get('four-ball/sessions/:id')
+  getFourBall(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.getFourBallSession(id, user);
+  }
+
+  @Post('four-ball/sessions/:id/select-target')
+  selectFourBallTarget(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { target: number; clientMoveId?: string }) {
+    return this.games.applyGameAction('four_ball', id, user, { type: 'select_target', payload: { target: Number(body.target) }, clientMoveId: body.clientMoveId });
+  }
+
+  @Post('four-ball/sessions/:id/aim')
+  aimFourBall(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { angle: number; power?: number; tipX?: number; tipY?: number }) {
+    return this.games.applyGameAction('four_ball', id, user, { type: 'aim', payload: { angle: body.angle, power: body.power, tipX: body.tipX, tipY: body.tipY } });
+  }
+
+  @Post('four-ball/sessions/:id/shots')
+  shootFourBall(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { angle: number; power: number; tipX: number; tipY: number; clientMoveId?: string }) {
+    return this.games.applyGameAction('four_ball', id, user, { type: 'shoot', payload: { angle: body.angle, power: body.power, tipX: body.tipX, tipY: body.tipY }, clientMoveId: body.clientMoveId });
+  }
+
+  @Post('four-ball/sessions/:id/emotes')
+  sendFourBallEmote(@Param('id') id: string, @CurrentUser() user: AuthAccount, @Body() body: { slot: number }) {
+    return this.games.sendFourBallEmote(id, user, Number(body.slot));
+  }
+
+  @Post('four-ball/sessions/:id/forfeit')
+  forfeitFourBall(@Param('id') id: string, @CurrentUser() user: AuthAccount) {
+    return this.games.forfeitFourBall(id, user);
+  }
+
   @Post('crazy-arcade/sessions')
   createCrazyArcade(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
     return this.games.createCrazyArcadeSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium');

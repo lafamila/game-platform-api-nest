@@ -42,6 +42,17 @@ import {
   fortressSideForAccount,
 } from './fortress-engine';
 import {
+  FOUR_BALL_ENGINE,
+  FourBallSession,
+  FourBallShotRecord,
+  applyFourBallForfeit,
+  applyFourBallShot,
+  createFourBallState,
+  fourBallSeatForAccount,
+  fourBallViewFor,
+  randomFourBallShot,
+} from './four-ball-engine';
+import {
   AlkkagiPiece,
   AlkkagiShotResult,
   AlkkagiSession,
@@ -143,6 +154,9 @@ const CHASER_TURN_LIMIT_MS = 60_000;
 const GOSTOP_AI_RESPONSE_DELAY_MS = 1_100;
 const GOSTOP_TURN_LIMIT_MS = 40_000;
 const FORTRESS_AI_RESPONSE_DELAY_MS = 1_000;
+const FOUR_BALL_TURN_LIMIT_MS = 60_000;
+const FOUR_BALL_AI_RESPONSE_DELAY_MS = 1_000;
+const FOUR_BALL_SHOT_ANIMATION_MS = 2_600;
 const ROOM_AI_RESPONSE_DELAY_MS = 850;
 const ROOM_RACE_AI_DELAY_MS: Record<Difficulty, number> = {
   easy: 1_900,
@@ -374,6 +388,9 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       }
       return this.createGostopSession(user, difficulty, isRecord(input.config) ? input.config : undefined);
     }
+    if (gameKey === 'four_ball') {
+      return this.createFourBallSession(user, opponentAccountId, undefined, difficulty);
+    }
     throw new BadRequestException(`unsupported gameKey: ${gameKey}`);
   }
 
@@ -393,6 +410,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'seotda') return this.getSeotdaSession(id, user);
     if (gameKey === 'chaser') return this.getChaserSession(id, user);
     if (gameKey === 'gostop') return this.getGostopSession(id, user);
+    if (gameKey === 'four_ball') return this.getFourBallSession(id, user);
     throw new BadRequestException(`unsupported gameKey: ${gameKey}`);
   }
 
@@ -493,6 +511,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     }
     if (row.game_key === 'gostop') {
       await this.applyGostopForfeit(row.id, user);
+      return;
+    }
+    if (row.game_key === 'four_ball') {
+      await this.forfeitFourBall(row.id, user);
       return;
     }
     await this.finishActiveSessionRow(row, 'forfeit');
@@ -691,6 +713,33 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       }
       if (type === 'forfeit') {
         return this.applyGostopForfeit(id, user);
+      }
+    }
+
+    if (gameKey === 'four_ball') {
+      if (type === 'select_target') {
+        return this.applyFourBallEngineAction(id, user, 'select_target', {
+          target: Number(payload.target),
+        }, clientMoveId);
+      }
+      if (type === 'aim') {
+        return this.applyFourBallEngineAction(id, user, 'aim', {
+          angle: Number(payload.angle),
+          power: payload.power === undefined ? undefined : Number(payload.power),
+          tipX: payload.tipX === undefined ? undefined : Number(payload.tipX),
+          tipY: payload.tipY === undefined ? undefined : Number(payload.tipY),
+        });
+      }
+      if (type === 'shoot') {
+        return this.applyFourBallEngineAction(id, user, 'shoot', {
+          angle: Number(payload.angle),
+          power: Number(payload.power),
+          tipX: Number(payload.tipX),
+          tipY: Number(payload.tipY),
+        }, clientMoveId);
+      }
+      if (type === 'forfeit') {
+        return this.forfeitFourBall(id, user);
       }
     }
 
@@ -1068,6 +1117,12 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         const resumed = this.othelloFromRow(await this.updateGame(othello.id, othello.status, othello.currentTurn, othello.winner ?? null, othello));
         this.scheduleTurnTimer(resumed, 'othello');
         this.emitSessionEvent(resumed, 'game.opponent_returned', resumed);
+      } else if (key === 'four_ball') {
+        const fourBall = session as FourBallSession;
+        this.startFourBallTimedTurn(fourBall);
+        const resumed = await this.saveFourBallSession(fourBall);
+        this.scheduleFourBallTurnTimer(resumed);
+        this.emitSessionEvent(resumed, 'game.opponent_returned', fourBallViewFor(resumed));
       } else {
         const timedSession = session as GomokuSession | AlkkagiSession;
         this.startTimedTurn(timedSession, key);
@@ -1150,6 +1205,20 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitSessionEvent(saved, 'game.session.finished', saved);
       return sessionForCrazyArcadeUser(saved, user);
     }
+    if (key === 'four_ball') {
+      const fourBall = session as FourBallSession;
+      const absentSeat = fourBallSeatForAccount(fourBall, absentAccountId);
+      if (absentSeat === undefined) {
+        throw new BadRequestException('Opponent has not left the match');
+      }
+      applyFourBallForfeit(fourBall, absentSeat);
+      fourBall.finishReason = 'disconnect';
+      this.clearNetworkGrace(fourBall);
+      this.clearTurnTimer(fourBall.id);
+      const saved = await this.saveFourBallSession(fourBall);
+      this.emitSessionEvent(saved, 'game.session.finished', fourBallViewFor(saved));
+      return fourBallViewFor(saved, this.fourBallSeatForUser(saved, user));
+    }
     const alkkagi = session as AlkkagiSession;
     const mySide = this.participantSide(alkkagi.players, user.accountId, alkkagi.currentTurn);
     alkkagi.status = 'finished';
@@ -1172,6 +1241,9 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (key === 'crazy_arcade') {
       return sessionForCrazyArcadeUser(session as CrazyArcadeSession, user);
     }
+    if (key === 'four_ball') {
+      return fourBallViewFor(session as FourBallSession, this.fourBallSeatForUser(session as FourBallSession, user));
+    }
     return session;
   }
 
@@ -1180,10 +1252,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     id: string,
     user: AuthAccount,
   ): Promise<{
-    key: 'gomoku' | 'alkkagi' | 'othello' | 'fortress' | 'crazy_arcade';
-    session: GomokuSession | AlkkagiSession | OthelloSession | FortressSession | CrazyArcadeSession;
+    key: 'gomoku' | 'alkkagi' | 'othello' | 'fortress' | 'crazy_arcade' | 'four_ball';
+    session: GomokuSession | AlkkagiSession | OthelloSession | FortressSession | CrazyArcadeSession | FourBallSession;
   }> {
-    if (gameKey !== 'gomoku' && gameKey !== 'alkkagi' && gameKey !== 'othello' && gameKey !== 'fortress' && gameKey !== 'crazy_arcade') {
+    if (gameKey !== 'gomoku' && gameKey !== 'alkkagi' && gameKey !== 'othello' && gameKey !== 'fortress' && gameKey !== 'crazy_arcade' && gameKey !== 'four_ball') {
       throw new BadRequestException('claim is not supported for this game yet');
     }
     const row = await this.requireGameRow(id, gameKey);
@@ -1195,7 +1267,9 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
           ? this.othelloFromRow(row)
           : gameKey === 'fortress'
             ? this.fortressFromRow(row)
-            : this.crazyArcadeFromRow(row);
+            : gameKey === 'four_ball'
+              ? this.fourBallFromRow(row)
+              : this.crazyArcadeFromRow(row);
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('Session is not an active match');
     }
@@ -1264,6 +1338,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'seotda') return this.sendSeotdaEmote(id, user, slot);
     if (gameKey === 'chaser') return this.sendChaserEmote(id, user, slot);
     if (gameKey === 'gostop') return this.sendGostopEmote(id, user, slot);
+    if (gameKey === 'four_ball') return this.sendFourBallEmote(id, user, slot);
     throw new BadRequestException('unsupported gameKey');
   }
 
@@ -2245,6 +2320,300 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.clearTurnTimer(saved.id);
     this.emitSessionEvent(saved, 'game.session.finished', fortressClientSession(saved));
     return fortressClientSession(saved, user.accountId);
+  }
+
+  // ---- four_ball (사구) --------------------------------------------------
+
+  async createFourBallSession(
+    user: AuthAccount,
+    opponentAccountId?: string,
+    forcedMode?: GameMode,
+    difficulty: Difficulty = 'medium',
+  ): Promise<ReturnType<typeof fourBallViewFor>> {
+    this.assertDifficulty(difficulty);
+    const resolvedMode = forcedMode ?? (opponentAccountId ? 'friend_match' : 'local_ai');
+    const opponent = opponentAccountId ?? LOCAL_AI_ACCOUNT_ID;
+    const state = createFourBallState(user.accountId, opponent, resolvedMode, difficulty);
+    if (resolvedMode === 'local_ai') {
+      // AI 좌석(seat1)의 목표 점수를 즉시 자동 선택한다. 인간(seat0)이 선택하면 대국이 시작된다.
+      const aiSelect = FOUR_BALL_ENGINE.aiAction!(state, 1, difficulty);
+      FOUR_BALL_ENGINE.applyAction(state, 1, aiSelect);
+    }
+    const row = await this.insertGame(
+      'four_ball',
+      resolvedMode,
+      user.accountId,
+      opponentAccountId ?? null,
+      state.status,
+      `cue${state.currentSeat}`,
+      null,
+      state,
+    );
+    const session = this.fourBallFromRow(row);
+    this.emitSessionEvent(session, 'game.session.created', fourBallViewFor(session));
+    this.scheduleFourBallTurnTimer(session);
+    this.scheduleFourBallAi(session);
+    return fourBallViewFor(session, this.fourBallSeatForUser(session, user));
+  }
+
+  async getFourBallSession(id: string, user: AuthAccount): Promise<ReturnType<typeof fourBallViewFor>> {
+    const session = this.fourBallFromRow(await this.requireGameRow(id, 'four_ball'));
+    this.assertFourBallParticipant(user, session);
+    this.scheduleFourBallAi(session);
+    return fourBallViewFor(session, this.fourBallSeatForUser(session, user));
+  }
+
+  async sendFourBallEmote(id: string, user: AuthAccount, slot: number): Promise<unknown> {
+    const session = this.fourBallFromRow(await this.requireGameRow(id, 'four_ball'));
+    this.assertFourBallParticipant(user, session);
+    return this.sendSessionEmote('four_ball', session, user, slot);
+  }
+
+  async forfeitFourBall(id: string, user: AuthAccount): Promise<ReturnType<typeof fourBallViewFor>> {
+    const session = this.fourBallFromRow(await this.requireGameRow(id, 'four_ball'));
+    this.assertFourBallParticipant(user, session);
+    const seat = this.fourBallSeatForUser(session, user);
+    if (session.status === 'finished') {
+      return fourBallViewFor(session, seat);
+    }
+    applyFourBallForfeit(session, seat);
+    const saved = await this.saveFourBallSession(session);
+    this.clearTurnTimer(saved.id);
+    this.emitSessionEvent(saved, 'game.session.finished', fourBallViewFor(saved));
+    return fourBallViewFor(saved, seat);
+  }
+
+  private async applyFourBallEngineAction(
+    id: string,
+    user: AuthAccount,
+    type: 'select_target' | 'aim' | 'shoot',
+    payload: Record<string, unknown>,
+    clientMoveId?: string,
+  ): Promise<unknown> {
+    const session = this.fourBallFromRow(await this.requireGameRow(id, 'four_ball'));
+    this.assertFourBallParticipant(user, session);
+    if (type !== 'select_target') {
+      this.assertNotPaused(session);
+    }
+    const seat = this.fourBallSeatForUser(session, user);
+    if (type === 'shoot' && !this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return { session: fourBallViewFor(session, seat), animation: { frameMs: 16, frames: [] } };
+    }
+    const engine = this.gameRegistry.engine('four_ball');
+    if (!engine) {
+      throw new BadRequestException('unsupported gameKey');
+    }
+
+    if (type === 'aim') {
+      // 조준 중계: 상대 표시용으로만 emit 하고 상태는 저장하지 않는다(alkkagi drag 패턴).
+      engine.applyAction(session, seat, { type, payload });
+      this.emitSessionEvent(session, 'four_ball.aim.updated', session.lastAim);
+      return fourBallViewFor(session, seat);
+    }
+
+    const result = engine.applyAction(session, seat, { type, payload, clientMoveId });
+    const next = result.state as FourBallSession;
+
+    if (type === 'select_target') {
+      if (next.status === 'playing') {
+        this.startFourBallTimedTurn(next, next.mode === 'friend_match' ? MATCH_READY_DELAY_MS : 0);
+      }
+      const saved = await this.saveFourBallSession(next);
+      this.scheduleFourBallTurnTimer(saved);
+      this.emitSessionEvent(saved, 'four_ball.action.played', { session: fourBallViewFor(saved) });
+      this.scheduleFourBallAi(saved);
+      return fourBallViewFor(saved, seat);
+    }
+
+    // shoot
+    const record = fourBallShotRecordFromResult(result);
+    if (next.status === 'playing') {
+      this.startFourBallTimedTurn(next, FOUR_BALL_SHOT_ANIMATION_MS);
+    }
+    const saved = await this.saveFourBallSession(next);
+    this.scheduleFourBallTurnTimer(saved);
+    const animation = record?.animation ?? { frameMs: 16, frames: [] };
+    this.emitSessionEvent(saved, 'four_ball.action.played', { session: fourBallViewFor(saved), shot: record });
+    if (saved.status === 'finished') {
+      this.emitSessionEvent(saved, 'game.session.finished', fourBallViewFor(saved));
+    }
+    this.scheduleFourBallAi(saved);
+    return { session: fourBallViewFor(saved, seat), animation };
+  }
+
+  private fourBallFromRow(row: GameRow): FourBallSession {
+    return withRowDates(row.state_json as FourBallSession, row);
+  }
+
+  private async saveFourBallSession(session: FourBallSession): Promise<FourBallSession> {
+    return this.fourBallFromRow(await this.updateGame(
+      session.id,
+      session.status,
+      session.status === 'playing' ? `cue${session.currentSeat}` : null,
+      session.winnerSeat !== undefined ? `cue${session.winnerSeat}` : null,
+      session,
+    ));
+  }
+
+  private assertFourBallParticipant(user: AuthAccount, session: FourBallSession): void {
+    this.assertGameParticipant(user, session.players.cue0, session.players.cue1);
+  }
+
+  private fourBallSeatForUser(session: FourBallSession, user: AuthAccount): number {
+    if (session.players.cue0 === user.accountId) {
+      return 0;
+    }
+    if (session.players.cue1 === user.accountId) {
+      return 1;
+    }
+    if (this.canActAs(user, session.players.cue0)) {
+      return 0;
+    }
+    if (this.canActAs(user, session.players.cue1)) {
+      return 1;
+    }
+    throw new ForbiddenException('not a participant');
+  }
+
+  private startFourBallTimedTurn(session: FourBallSession, delayMs = 0): void {
+    if (session.mode !== 'friend_match' || session.status !== 'playing' || session.pause?.active) {
+      return;
+    }
+    const now = Date.now();
+    session.turnStartedAt = new Date(now + delayMs).toISOString();
+    session.turnDeadlineAt = new Date(now + delayMs + FOUR_BALL_TURN_LIMIT_MS).toISOString();
+    this.clearNetworkGrace(session);
+  }
+
+  private scheduleFourBallTurnTimer(session: FourBallSession): void {
+    this.clearTurnTimer(session.id);
+    if (session.mode !== 'friend_match' || session.status !== 'playing' || session.pause?.active) {
+      return;
+    }
+    if (!session.turnDeadlineAt) {
+      this.startFourBallTimedTurn(session);
+    }
+    const deadline = session.networkGraceDeadlineAt ?? session.turnDeadlineAt;
+    if (!deadline) {
+      return;
+    }
+    const delay = Math.max(100, Date.parse(deadline) - Date.now());
+    const timer = setTimeout(() => {
+      void this.handleFourBallTimer(session.id).catch((error) => console.error(error));
+    }, delay);
+    timer.unref?.();
+    this.turnTimers.set(session.id, timer);
+  }
+
+  private async handleFourBallTimer(id: string): Promise<void> {
+    const row = await this.requireGameRow(id, 'four_ball');
+    if (row.mode !== 'friend_match' || row.status !== 'playing') {
+      this.clearTurnTimer(id);
+      return;
+    }
+    const session = this.fourBallFromRow(row);
+    if (session.pause?.active) {
+      this.clearTurnTimer(id);
+      return;
+    }
+    if (session.turnDeadlineAt && Date.parse(session.turnDeadlineAt) > Date.now() + 50) {
+      this.scheduleFourBallTurnTimer(session);
+      return;
+    }
+    if (await this.resolveFourBallDisconnectGrace(session)) {
+      return;
+    }
+    const seat = session.currentSeat;
+    const accountId = session.players[seat === 1 ? 'cue1' : 'cue0'];
+    if (!(await this.realtime.isAccountOnline(accountId))) {
+      await this.startFourBallDisconnectGrace(session, accountId);
+      return;
+    }
+    // 타임아웃: 약한 랜덤 샷 자동 실행.
+    const params = randomFourBallShot(session, seat);
+    params.power = 0.2 + Math.random() * 0.2;
+    const record = applyFourBallShot(session, seat, params, 'timeout');
+    if (session.status === 'playing') {
+      this.startFourBallTimedTurn(session, FOUR_BALL_SHOT_ANIMATION_MS);
+    }
+    const saved = await this.saveFourBallSession(session);
+    this.scheduleFourBallTurnTimer(saved);
+    this.emitSessionEvent(saved, 'four_ball.action.played', { session: fourBallViewFor(saved), shot: record });
+    if (saved.status === 'finished') {
+      this.emitSessionEvent(saved, 'game.session.finished', fourBallViewFor(saved));
+    }
+    this.scheduleFourBallAi(saved);
+  }
+
+  private async resolveFourBallDisconnectGrace(session: FourBallSession): Promise<boolean> {
+    if (!session.networkGraceDeadlineAt || !session.networkGraceAccountId) {
+      return false;
+    }
+    if (Date.parse(session.networkGraceDeadlineAt) > Date.now() + 50) {
+      this.scheduleFourBallTurnTimer(session);
+      return true;
+    }
+    if (await this.realtime.isAccountOnline(session.networkGraceAccountId)) {
+      this.clearNetworkGrace(session);
+      return false;
+    }
+    if (session.opponentLeftAt) {
+      this.clearTurnTimer(session.id);
+      return true;
+    }
+    session.opponentLeftAt = new Date().toISOString();
+    session.updatedAt = session.opponentLeftAt;
+    this.clearTurnTimer(session.id);
+    const saved = await this.saveFourBallSession(session);
+    this.emitSessionEvent(saved, 'game.opponent_left', fourBallViewFor(saved));
+    return true;
+  }
+
+  private async startFourBallDisconnectGrace(session: FourBallSession, accountId: string): Promise<void> {
+    const now = Date.now();
+    session.networkGraceStartedAt = new Date(now).toISOString();
+    session.networkGraceDeadlineAt = new Date(now + DISCONNECT_GRACE_MS).toISOString();
+    session.networkGraceAccountId = accountId;
+    session.updatedAt = new Date(now).toISOString();
+    const saved = await this.saveFourBallSession(session);
+    this.scheduleFourBallTurnTimer(saved);
+    this.emitSessionEvent(saved, 'game.turn.network_waiting', fourBallViewFor(saved));
+  }
+
+  private scheduleFourBallAi(session: FourBallSession): void {
+    if (session.mode !== 'local_ai' || session.status !== 'playing') {
+      return;
+    }
+    if (!isLocalAiAccount(session.players[session.currentSeat === 1 ? 'cue1' : 'cue0'])) {
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        const current = this.fourBallFromRow(await this.requireGameRow(session.id, 'four_ball'));
+        if (
+          current.mode !== 'local_ai' ||
+          current.status !== 'playing' ||
+          !isLocalAiAccount(current.players[current.currentSeat === 1 ? 'cue1' : 'cue0'])
+        ) {
+          return;
+        }
+        const seat = current.currentSeat;
+        const action = FOUR_BALL_ENGINE.aiAction!(current, seat, current.aiDifficulty ?? 'medium');
+        const result = FOUR_BALL_ENGINE.applyAction(current, seat, action);
+        const next = result.state as FourBallSession;
+        const record = fourBallShotRecordFromResult(result);
+        const saved = await this.saveFourBallSession(next);
+        this.emitSessionEvent(saved, 'four_ball.action.played', { session: fourBallViewFor(saved), shot: record });
+        if (saved.status === 'finished') {
+          this.emitSessionEvent(saved, 'game.session.finished', fourBallViewFor(saved));
+        }
+        // 성공하여 연속 턴이면 다시 AI 를 예약(무한 방지는 엔진의 turn cap).
+        this.scheduleFourBallAi(saved);
+      } catch (error) {
+        console.warn('[four_ball-ai]', error);
+      }
+    }, FOUR_BALL_AI_RESPONSE_DELAY_MS);
+    timer.unref?.();
   }
 
   async createMightySession(
@@ -3331,7 +3700,16 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitGostopEvent(saved, 'game.session.paused');
       return this.gostopView(saved, user);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, seotda, chaser, or gostop');
+    if (gameKey === 'four_ball') {
+      const session = this.fourBallFromRow(await this.requireGameRow(id, 'four_ball'));
+      this.assertFourBallParticipant(user, session);
+      this.applyPause(session, user);
+      const saved = await this.saveFourBallSession(session);
+      this.clearTurnTimer(saved.id);
+      this.emitSessionEvent(saved, 'game.session.paused', fourBallViewFor(saved));
+      return fourBallViewFor(saved, this.fourBallSeatForUser(saved, user));
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, seotda, chaser, gostop, or four_ball');
   }
 
   async resumeMatchedGame(gameKey: string, id: string, user: AuthAccount): Promise<unknown> {
@@ -3446,7 +3824,16 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.scheduleGostopTurnTimer(saved);
       return this.gostopView(saved, user);
     }
-    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, seotda, chaser, or gostop');
+    if (gameKey === 'four_ball') {
+      const session = this.fourBallFromRow(await this.requireGameRow(id, 'four_ball'));
+      this.assertFourBallParticipant(user, session);
+      this.applyResume(session);
+      const saved = await this.saveFourBallSession(session);
+      this.scheduleFourBallTurnTimer(saved);
+      this.emitSessionEvent(saved, 'game.session.resumed', fourBallViewFor(saved));
+      return fourBallViewFor(saved, this.fourBallSeatForUser(saved, user));
+    }
+    throw new BadRequestException('gameKey must be sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, mighty, seotda, chaser, gostop, or four_ball');
   }
 
   async createSessionFromMatch(gameKey: string, requesterAccountId: string, opponentAccountId: string): Promise<string> {
@@ -3481,7 +3868,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'crazy_arcade') {
       return (await this.createCrazyArcadeSession(fakeUser, opponentAccountId, 'friend_match')).id;
     }
-    throw new BadRequestException('match requests support sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, or crazy_arcade');
+    if (gameKey === 'four_ball') {
+      return String((await this.createFourBallSession(fakeUser, opponentAccountId, 'friend_match')).id);
+    }
+    throw new BadRequestException('match requests support sudoku, gomoku, alkkagi, othello, sokoban, splendor, fortress, crazy_arcade, or four_ball');
   }
 
   private async createSessionFromRoom(room: GameRoomRow, members: GameRoomMemberRow[]): Promise<string> {
@@ -3509,6 +3899,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         if (room.game_key === 'othello') return (await this.createOthelloSession(fakeUser, undefined, 'local_ai', difficulty)).id;
         if (room.game_key === 'splendor') return (await this.createSplendorSession(fakeUser, undefined, 'local_ai', difficulty)).id;
         if (room.game_key === 'fortress') return (await this.createFortressSession(fakeUser, undefined, 'local_ai', difficulty)).id;
+        if (room.game_key === 'four_ball') return String((await this.createFourBallSession(fakeUser, undefined, 'local_ai', difficulty)).id);
       }
     }
     const descriptor = this.gameRegistry.get(room.game_key);
@@ -4634,13 +5025,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return undefined;
   }
 
-  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession): void {
+  private assertNotPaused(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession | FourBallSession): void {
     if (session.pause?.active) {
       throw new BadRequestException('game is paused');
     }
   }
 
-  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession, user: AuthAccount): void {
+  private applyPause(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession | FourBallSession, user: AuthAccount): void {
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('pause is only available during matched games');
     }
@@ -4664,7 +5055,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     session.updatedAt = new Date(now).toISOString();
   }
 
-  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession): void {
+  private applyResume(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession | FourBallSession): void {
     const pause = session.pause;
     if (session.mode !== 'friend_match' || session.status !== 'playing') {
       throw new BadRequestException('resume is only available during matched games');
@@ -4801,8 +5192,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async sendSessionEmote(
-    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress' | 'crazy_arcade' | 'mighty' | 'seotda' | 'chaser' | 'gostop',
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession,
+    gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress' | 'crazy_arcade' | 'mighty' | 'seotda' | 'chaser' | 'gostop' | 'four_ball',
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession | FourBallSession,
     user: AuthAccount,
     slot: number,
   ): Promise<unknown> {
@@ -6009,7 +6400,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.clearNetworkGrace(session);
   }
 
-  private clearNetworkGrace(session: GomokuSession | AlkkagiSession | OthelloSession | FortressSession | CrazyArcadeSession): void {
+  private clearNetworkGrace(session: GomokuSession | AlkkagiSession | OthelloSession | FortressSession | CrazyArcadeSession | FourBallSession): void {
     delete session.networkGraceStartedAt;
     delete session.networkGraceDeadlineAt;
     delete session.networkGraceAccountId;
@@ -6069,7 +6460,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       `SELECT * FROM game_sessions
        WHERE mode = 'friend_match'
          AND status = 'playing'
-         AND game_key IN ('gomoku', 'alkkagi', 'othello', 'fortress', 'seotda', 'gostop')`,
+         AND game_key IN ('gomoku', 'alkkagi', 'othello', 'fortress', 'seotda', 'gostop', 'four_ball')`,
     );
     for (const row of result.rows) {
       if (row.game_key === 'gomoku') {
@@ -6084,6 +6475,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         this.scheduleSeotdaTurnTimer(this.seotdaFromRow(row));
       } else if (row.game_key === 'gostop') {
         this.scheduleGostopTurnTimer(this.gostopFromRow(row));
+      } else if (row.game_key === 'four_ball') {
+        this.scheduleFourBallTurnTimer(this.fourBallFromRow(row));
       }
     }
   }
@@ -6427,7 +6820,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private emitSessionEvent(
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession,
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession | FourBallSession,
     event: string,
     payload: unknown,
   ): void {
@@ -6703,6 +7096,16 @@ function fortressShotResultFromEngineResult(
       tanksAfter: session.tanks,
     },
   };
+}
+
+function fourBallShotRecordFromResult(
+  result: { events?: Array<{ type: string; payload?: unknown }> },
+): FourBallShotRecord | undefined {
+  const event = result.events?.find((item) => item.type === 'four_ball.action.played');
+  if (isRecord(event?.payload) && isRecord(event.payload.shot)) {
+    return event.payload.shot as unknown as FourBallShotRecord;
+  }
+  return undefined;
 }
 
 function playerColorFromSnapshot(value: unknown, fallback: PlayerColor): PlayerColor {
@@ -7323,7 +7726,7 @@ function hideSudokuSolution(session: SudokuSession, user?: AuthAccount): Omit<Su
   return hideSudokuSolutionForAccount(session, user?.accountId);
 }
 
-function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession): string[] {
+function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession | FourBallSession): string[] {
   if ('players' in session && session.players) {
     return [...new Set(Object.values(session.players).filter((accountId) => !isLocalAiAccount(accountId)))];
   }
@@ -7707,7 +8110,7 @@ function localAiResultKey(gameKey: string, sessionId: string): string {
 }
 
 function shiftDeadline(
-  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession,
+  session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession | FourBallSession,
   key: 'turnStartedAt' | 'turnDeadlineAt' | 'networkGraceStartedAt' | 'networkGraceDeadlineAt',
   deltaMs: number,
 ): void {
