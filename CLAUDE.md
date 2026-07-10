@@ -25,7 +25,7 @@ This repo follows `../CLAUDE.md`, especially central auth, env handling, local-f
 - Storage: PostgreSQL via `DATABASE_URL`.
 - Game model: server-authoritative rules and result validation.
 - Game registry: public game metadata is centralized in `GameRegistry`/`GAME_DESCRIPTORS`; new server-backed games should register a `GameEngine` and then wire only the remaining service orchestration gaps.
-- Current games: `sudoku`, `gomoku`, `alkkagi`, `othello`, `sokoban`, `splendor`, `fortress`, `crazy_arcade`, `mighty`, `seotda`, `chaser`, `gostop`, `four_ball`.
+- Current games: `sudoku`, `gomoku`, `alkkagi`, `othello`, `sokoban`, `splendor`, `fortress`, `crazy_arcade`, `mighty`, `seotda`, `chaser`, `gostop`, `four_ball`, `fighting`.
 - Start UX contract: every newly started game session, including Crazy Arcade and room-started sessions, must support the client countdown flow. Resuming an already-active session is not a new start.
 
 ## Auth Onboarding Request Shape
@@ -146,6 +146,12 @@ Every action POST accepts an optional `clientMoveId` (uuid). The server keeps th
   - **Events**: `four_ball.action.played` (shoot payload `{session, shot}`), `four_ball.aim.updated`, `game.session.finished`, plus common session events. Shoot response = `{session, animation}` (alkkagi pattern).
   - **삼구 reuse**: the physics engine and `carom-rules` (`threeCushion`, `cushionsBeforeSecondObject`) are game-agnostic; a future 삼구 engine reuses both, changing only the success condition (both reds + `threeCushion`) and scoring. Initial layout, target options and physics tuning constants are exported for that reuse.
   - **Not implemented (documented options)**: 삼구/four-ball variants beyond standard (e.g. 큐 miscue depth model, cushion 세리 nuances, pocket/scratch rules — carom has none), balance/stake integration, spectator-hidden data (game is full-information by design).
+- Fighting (`fighting`) is a 1:1 real-time fighter (KOF/철권류), **local_ai only**. Execution model differs from every other game: the 60fps frame-precise simulation (framedata hurt/hitboxes, hitstop, knockback, best-of-3 rounds, 60s round timer) runs **client-side** — the server's coarse persistence tick cannot host fighting-grade judgement — and the server owns the session plus **authoritative round-result validation** (the same "local judgement + server result validation" shape adopted for the planned rhythm game).
+  - **Server validates**: sequential round numbers (1,2,3…) and rejection after match end; `reason`/hp consistency (`ko` → loser hp exactly 0 and winner hp > 0; `timeout` → winner hp ≥ loser hp and duration ≥ round timer); hp within `0..100`; `durationMs` within `1s .. 60s+30s slack`; best-of-3 finish with `gameWinner {winner: 'player'|'ai', reason: 'completed'|'forfeit', wins}`.
+  - **Actions** on the common route (clientMoveId-idempotent): `round_result {round, winner: 'player'|'ai', reason: 'ko'|'timeout', playerHp, aiHp, durationMs}`, `forfeit {}` (forfeit → AI wins the match).
+  - **Session shape**: single human seat (`players.seat0` only — the AI opponent is client-local, no AI seat row); `characters {player: martial_hero, ai: martial_hero_2}`; `rounds[]`, `wins {player, ai}`. `viewFor` hides only the idempotency store. Rooms, friend_match, and server saves are unsupported (`supportsMatchSave: false`); **online versus over the socket.io input channel is an explicit follow-up**, not implemented.
+  - **Limits (documented)**: the server cannot verify actual gameplay of a client-simulated fighter — validation is plausibility-level (bounds/sequence/consistency), which is acceptable for a local-vs-AI mode with no stakes or rankings. Revisit before any ranked/online mode.
+  - **Events**: `fighting.round.recorded`, `game.session.finished`, plus common session events.
 
 ## Local Dev
 

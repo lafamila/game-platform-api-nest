@@ -51,6 +51,7 @@ import {
   fourBallViewFor,
   randomFourBallShot,
 } from './four-ball-engine';
+import { FIGHTING_ENGINE, FightingSession } from './fighting-engine';
 import {
   AlkkagiPiece,
   AlkkagiShotResult,
@@ -390,6 +391,12 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'four_ball') {
       return this.createFourBallSession(user, opponentAccountId, undefined, difficulty);
     }
+    if (gameKey === 'fighting') {
+      if (opponentAccountId) {
+        throw new BadRequestException('fighting supports local_ai only (online play is a follow-up)');
+      }
+      return this.createFightingSession(user, difficulty);
+    }
     throw new BadRequestException(`unsupported gameKey: ${gameKey}`);
   }
 
@@ -410,6 +417,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'chaser') return this.getChaserSession(id, user);
     if (gameKey === 'gostop') return this.getGostopSession(id, user);
     if (gameKey === 'four_ball') return this.getFourBallSession(id, user);
+    if (gameKey === 'fighting') return this.getFightingSession(id, user);
     throw new BadRequestException(`unsupported gameKey: ${gameKey}`);
   }
 
@@ -514,6 +522,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     }
     if (row.game_key === 'four_ball') {
       await this.forfeitFourBall(row.id, user);
+      return;
+    }
+    if (row.game_key === 'fighting') {
+      await this.applyFightingForfeit(row.id, user);
       return;
     }
     await this.finishActiveSessionRow(row, 'forfeit');
@@ -739,6 +751,15 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       }
       if (type === 'forfeit') {
         return this.forfeitFourBall(id, user);
+      }
+    }
+
+    if (gameKey === 'fighting') {
+      if (type === 'round_result') {
+        return this.applyFightingEngineAction(id, user, 'round_result', payload, clientMoveId);
+      }
+      if (type === 'forfeit') {
+        return this.applyFightingForfeit(id, user);
       }
     }
 
@@ -2939,6 +2960,58 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return this.sendSessionEmote('chaser', session, user, slot);
   }
 
+  async createFightingSession(user: AuthAccount, difficulty: Difficulty = 'medium'): Promise<unknown> {
+    this.assertDifficulty(difficulty);
+    const players = [{ seat: 0, accountId: user.accountId, kind: 'account' as const }];
+    const state = FIGHTING_ENGINE.createState(players, { id: '', aiDifficulty: difficulty });
+    const row = await this.insertGame(
+      'fighting',
+      'local_ai',
+      user.accountId,
+      null,
+      state.status,
+      state.currentTurn,
+      state.winnerSide ?? null,
+      state,
+    );
+    const saved = this.fightingFromRow(row);
+    this.emitFightingEvent(saved, 'game.session.created');
+    return this.fightingView(saved, user);
+  }
+
+  async getFightingSession(id: string, user: AuthAccount): Promise<unknown> {
+    const session = this.fightingFromRow(await this.requireGameRow(id, 'fighting'));
+    this.assertFightingParticipant(user, session);
+    return this.fightingView(session, user);
+  }
+
+  private async applyFightingEngineAction(
+    id: string,
+    user: AuthAccount,
+    type: 'round_result',
+    payload: Record<string, unknown>,
+    clientMoveId?: string,
+  ): Promise<unknown> {
+    const session = this.fightingFromRow(await this.requireGameRow(id, 'fighting'));
+    this.assertFightingParticipant(user, session);
+    if (!this.consumeClientMoveId(session, user.accountId, clientMoveId)) {
+      return this.fightingView(session, user);
+    }
+    const result = FIGHTING_ENGINE.applyAction(session, 0, { type, payload, clientMoveId });
+    const saved = await this.saveFightingSession(result.state);
+    this.emitFightingEvent(saved, saved.status === 'finished' ? 'game.session.finished' : 'fighting.round.recorded');
+    return this.fightingView(saved, user);
+  }
+
+  private async applyFightingForfeit(id: string, user: AuthAccount): Promise<unknown> {
+    const session = this.fightingFromRow(await this.requireGameRow(id, 'fighting'));
+    this.assertFightingParticipant(user, session);
+    FIGHTING_ENGINE.applyAction(session, 0, { type: 'forfeit' });
+    const saved = await this.saveFightingSession(session);
+    this.emitFightingEvent(saved, 'game.session.finished');
+    return this.fightingView(saved, user);
+  }
+
   async createGostopSession(
     user: AuthAccount,
     difficulty: Difficulty = 'medium',
@@ -4739,6 +4812,31 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return CHASER_ENGINE.viewFor(session, this.chaserSeatForUser(session, user));
   }
 
+  private fightingFromRow(row: GameRow): FightingSession {
+    return withRowDates(row.state_json as FightingSession, row);
+  }
+
+  private async saveFightingSession(session: FightingSession): Promise<FightingSession> {
+    return this.fightingFromRow(await this.updateGame(
+      session.id,
+      session.status,
+      session.status === 'playing' ? session.currentTurn : null,
+      session.winnerSide ?? null,
+      session,
+    ));
+  }
+
+  private assertFightingParticipant(user: AuthAccount, session: FightingSession): void {
+    if (!Object.values(session.players).some((accountId) => this.canActAs(user, accountId))) {
+      throw new ForbiddenException('not a participant');
+    }
+  }
+
+  private fightingView(session: FightingSession, user: AuthAccount): unknown {
+    this.assertFightingParticipant(user, session);
+    return FIGHTING_ENGINE.viewFor(session, 0);
+  }
+
   private gostopFromRow(row: GameRow): GostopSession {
     return withRowDates(row.state_json as GostopSession, row);
   }
@@ -5251,7 +5349,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
 
   private async sendSessionEmote(
     gameKey: 'sudoku' | 'gomoku' | 'alkkagi' | 'othello' | 'sokoban' | 'splendor' | 'fortress' | 'crazy_arcade' | 'mighty' | 'seotda' | 'chaser' | 'gostop' | 'four_ball',
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession | FourBallSession,
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession | FourBallSession | FightingSession,
     user: AuthAccount,
     slot: number,
   ): Promise<unknown> {
@@ -6872,7 +6970,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private emitSessionEvent(
-    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession | FourBallSession,
+    session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession | FourBallSession | FightingSession,
     event: string,
     payload: unknown,
   ): void {
@@ -6916,6 +7014,19 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       currentTurn: session.currentTurn,
       currentSeat: session.currentSeat,
       turnNumber: session.turnNumber,
+      updatedAt: session.updatedAt,
+    });
+  }
+
+  private emitFightingEvent(session: FightingSession, event: string): void {
+    this.emitSessionEvent(session, event, {
+      id: session.id,
+      gameKey: 'fighting',
+      status: session.status,
+      phase: session.phase,
+      rev: session.rev,
+      rounds: session.rounds.length,
+      wins: session.wins,
       updatedAt: session.updatedAt,
     });
   }
@@ -7778,7 +7889,7 @@ function hideSudokuSolution(session: SudokuSession, user?: AuthAccount): Omit<Su
   return hideSudokuSolutionForAccount(session, user?.accountId);
 }
 
-function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession | FourBallSession): string[] {
+function sessionAccountIds(session: SudokuSession | GomokuSession | AlkkagiSession | OthelloSession | SokobanSession | SplendorSession | FortressSession | CrazyArcadeSession | MightySession | SeotdaSession | ChaserSession | GostopSession | FourBallSession | FightingSession): string[] {
   if ('players' in session && session.players) {
     return [...new Set(Object.values(session.players).filter((accountId) => !isLocalAiAccount(accountId)))];
   }
