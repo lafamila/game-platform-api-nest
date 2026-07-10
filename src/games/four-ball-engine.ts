@@ -37,13 +37,13 @@ export interface FourBallVec {
   y: number;
 }
 
-/** 표준 사구 초구 배치(가로 중앙선상): 빨강 2개 상단/중앙, 수구 2개 하단 대칭. */
+/** 표준 사구 초구 배치(가로 당구대 기준): 빨강 2개는 장축 중앙선, 수구 2개는 반대편 상하 대칭. */
 export function initialFourBallBalls(): Record<FourBallBallKey, FourBallVec> {
   return {
-    red1: { x: 500, y: 130 },
+    red1: { x: 380, y: 250 },
     red2: { x: 500, y: 250 },
-    cue0: { x: 400, y: 370 },
-    cue1: { x: 600, y: 370 },
+    cue0: { x: 700, y: 190 },
+    cue1: { x: 700, y: 310 },
   };
 }
 

@@ -12,6 +12,8 @@ test('four_ball local_ai create is in selecting phase with the AI target chosen'
   const view = await service.createFourBallSession(user, undefined, undefined, 'medium');
   assert.equal(view.status, 'selecting');
   assert.equal(view.mode, 'local_ai');
+  assert.equal(view.balls.red1.y, view.balls.red2.y);
+  assert.equal(view.balls.cue0.x, view.balls.cue1.x);
   // AI(seat1)의 목표는 이미 선택되어 있고 사람(seat0)은 아직이다.
   assert.ok(view.targets.seat1 !== undefined);
   assert.equal(view.targets.seat0, undefined);

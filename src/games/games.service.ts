@@ -11,7 +11,6 @@ import { createSokobanMap, createVerifiedSokobanMap, GeneratedSokobanMap } from 
 import {
   applySplendorAiTurn,
   applySplendorAiTurnForSide,
-  applySplendorForfeit,
   createSplendorDecks,
   createSplendorState,
   createSplendorStateForPlayers,
@@ -2149,10 +2148,69 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     const session = this.splendorFromRow(await this.requireGameRow(id, 'splendor'));
     this.assertSplendorParticipant(user, session);
     const side = this.splendorSideForUser(session, user);
-    applySplendorForfeit(session, side, user.accountId);
+    this.replaceSplendorSeatWithAiOrFinish(session, side, user.accountId);
     const saved = await this.saveSplendorSession(session);
-    this.emitSessionEvent(saved, 'game.session.finished', splendorClientSession(saved));
+    this.emitSessionEvent(
+      saved,
+      saved.status === 'finished' ? 'game.session.finished' : 'splendor.action.played',
+      splendorClientSession(saved),
+    );
+    this.scheduleSplendorAi(saved);
     return splendorClientSession(saved, user.accountId);
+  }
+
+  private replaceSplendorSeatWithAiOrFinish(
+    session: SplendorSession,
+    side: string,
+    accountId: string,
+  ): void {
+    if (session.status !== 'playing') {
+      return;
+    }
+    const remainingHumanSides = Object.entries(session.players)
+      .filter(([candidateSide, candidateAccountId]) =>
+        candidateSide !== side && !isLocalAiAccount(candidateAccountId),
+      )
+      .map(([candidateSide]) => candidateSide);
+    const now = new Date().toISOString();
+    session.moves.push({
+      action: 'forfeit',
+      side,
+      accountId,
+      detail: { replacedBy: remainingHumanSides.length > 0 ? 'medium_ai' : 'finish' },
+      createdAt: now,
+    });
+    if (remainingHumanSides.length === 0) {
+      session.status = 'finished';
+      session.winnerSide = undefined;
+      session.winnerAccountId = undefined;
+      session.finishReason = 'forfeit';
+      session.updatedAt = now;
+      return;
+    }
+    const seat = seatIndexFromSide(side) ?? session.turnOrder?.indexOf(side) ?? 0;
+    const aiAccountId = `${LOCAL_AI_ACCOUNT_ID}#splendor-forfeit-${session.id}-${seat}-medium`;
+    session.players[side] = aiAccountId;
+    session.seatStatus ??= {};
+    session.seatStatus[side] = 'active';
+    if (Array.isArray(session.roomPlayers)) {
+      const roomSeat = session.roomPlayers.find((player) => player.seat === seat);
+      if (roomSeat) {
+        roomSeat.accountId = aiAccountId;
+        roomSeat.kind = 'ai';
+        roomSeat.status = 'active';
+        roomSeat.aiDifficulty = 'medium';
+      } else {
+        session.roomPlayers.push({
+          seat,
+          accountId: aiAccountId,
+          kind: 'ai',
+          status: 'active',
+          aiDifficulty: 'medium',
+        });
+      }
+    }
+    session.updatedAt = now;
   }
 
   async createFortressSession(
@@ -5513,29 +5571,23 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
 
   private scheduleSplendorAi(session: SplendorSession): void {
     const currentAccountId = session.players[session.currentTurn];
-    const isLocalAiTurn = session.mode === 'local_ai' &&
-      session.currentTurn === 'opponent' &&
-      isLocalAiAccount(currentAccountId);
+    const aiTurn = isLocalAiAccount(currentAccountId);
     const roomAi = this.roomAiPlayers(session).find((player) => player.side === session.currentTurn);
-    if (session.status !== 'playing' || session.pause?.active || (!isLocalAiTurn && !roomAi)) {
+    if (session.status !== 'playing' || session.pause?.active || !aiTurn) {
       return;
     }
     const run = async () => {
       try {
         const current = this.splendorFromRow(await this.requireGameRow(session.id, 'splendor'));
         const nextAccountId = current.players[current.currentTurn];
-        const nextLocalAiTurn = current.mode === 'local_ai' &&
-          current.currentTurn === 'opponent' &&
-          isLocalAiAccount(nextAccountId);
+        const nextAiTurn = isLocalAiAccount(nextAccountId);
         const nextRoomAi = this.roomAiPlayers(current).find((player) => player.side === current.currentTurn);
-        if (current.status !== 'playing' || current.pause?.active || (!nextLocalAiTurn && !nextRoomAi)) {
+        if (current.status !== 'playing' || current.pause?.active || !nextAiTurn) {
           return;
         }
-        if (nextRoomAi) {
-          applySplendorAiTurnForSide(current, current.currentTurn, nextRoomAi.difficulty);
-        } else {
-          applySplendorAiTurn(current);
-        }
+        const difficulty = nextRoomAi?.difficulty ??
+          difficultyFromSnapshot(current.aiDifficulty, roomAiDifficultyFromAccountId(nextAccountId));
+        applySplendorAiTurnForSide(current, current.currentTurn, difficulty);
         const saved = await this.saveSplendorSession(current);
         this.emitSessionEvent(
           saved,
@@ -5547,7 +5599,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         console.warn('[splendor-ai]', error);
       }
     };
-    if (roomAi) {
+    if (roomAi || session.mode === 'friend_match') {
       this.scheduleRoomAiTimer(session.id, ROOM_AI_RESPONSE_DELAY_MS, run);
     } else {
       const timer = setTimeout(run, LOCAL_AI_RESPONSE_DELAY_MS);

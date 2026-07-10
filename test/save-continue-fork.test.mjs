@@ -30,10 +30,12 @@ test('N-player save -> continue forks each non-saver seat to a distinct AI id (M
     // Continue is blocked while the source match is still playing.
     await assert.rejects(() => service.continueGameSave(saveId, host, {}), /after the original match finishes/);
 
-    // Finish the source: the three non-host seats forfeit, leaving the host as the last active seat.
+    // Finish the source: non-host seats are replaced by AI, then the final human leaves.
     for (const member of members) {
       await service.forfeitSplendor(sourceId, member);
     }
+    assert.equal(db.rows.get(sourceId).status, 'playing');
+    await service.forfeitSplendor(sourceId, host);
     assert.equal(db.rows.get(sourceId).status, 'finished');
 
     // Now continue -> a fresh local_ai session forked from the saved snapshot.

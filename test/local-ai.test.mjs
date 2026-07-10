@@ -863,6 +863,28 @@ test('splendor local sessions follow token turns and answer with AI', async () =
   assert.equal(answered.moves[1].source, 'ai');
 });
 
+test('splendor friend match forfeit replaces the leaver with a medium AI until the last human leaves', async () => {
+  const db = new FakeDb();
+  const service = new GamesService(db, new FakeRealtime());
+  const session = await service.createSplendorSession(user, opponent.accountId, 'friend_match', 'medium');
+
+  await service.forfeitSplendor(session.id, opponent);
+  const afterOpponentLeaves = db.rows.get(session.id).state_json;
+  assert.equal(afterOpponentLeaves.status, 'playing');
+  assert.ok(afterOpponentLeaves.players.opponent.startsWith('__game_platform_local_ai__#splendor-forfeit-'));
+  const aiSeat = db.sessionPlayers.find((row) => row.session_id === session.id && row.seat === 1);
+  assert.equal(aiSeat.kind, 'ai');
+  assert.equal(aiSeat.ai_difficulty, 'medium');
+  assert.equal((await service.listActiveSessions(opponent)).sessions.length, 0);
+  assert.equal((await service.listActiveSessions(user)).sessions.length, 1);
+
+  await service.forfeitSplendor(session.id, user);
+  const afterLastHumanLeaves = db.rows.get(session.id).state_json;
+  assert.equal(afterLastHumanLeaves.status, 'finished');
+  assert.equal(afterLastHumanLeaves.finishReason, 'forfeit');
+  assert.equal((await service.listActiveSessions(user)).sessions.length, 0);
+});
+
 test('fortress local sessions use a long world and answer player shots', async () => {
   const service = new GamesService(new FakeDb(), new FakeRealtime());
 
@@ -2112,13 +2134,25 @@ test('rooms can start multi-player sessions and persist every participant seat',
     await service.forfeitSplendor(startedSplendor.sessionId, opponent);
     const afterOpponentForfeit = db.rows.get(startedSplendor.sessionId).state_json;
     assert.equal(afterOpponentForfeit.status, 'playing');
-    assert.equal(afterOpponentForfeit.seatStatus.seat1, 'forfeited');
-    const forfeitedSeat = db.sessionPlayers.find(
-      (row) => row.session_id === startedSplendor.sessionId && row.account_id === opponent.accountId,
+    assert.ok(afterOpponentForfeit.players.seat1.startsWith('__game_platform_local_ai__#splendor-forfeit-'));
+    assert.equal(afterOpponentForfeit.seatStatus.seat1, 'active');
+    const aiReplacementSeat = db.sessionPlayers.find(
+      (row) => row.session_id === startedSplendor.sessionId && row.seat === 1,
     );
-    assert.equal(forfeitedSeat.status, 'forfeited');
+    assert.equal(aiReplacementSeat.kind, 'ai');
+    assert.equal(aiReplacementSeat.account_id, null);
+    assert.equal(aiReplacementSeat.ai_difficulty, 'medium');
+    assert.equal(aiReplacementSeat.status, 'active');
     assert.equal((await service.listActiveSessions(opponent)).sessions.length, 0);
     assert.equal((await service.listActiveSessions(user)).sessions.some((session) => session.sessionId === startedSplendor.sessionId), true);
+    await service.forfeitSplendor(startedSplendor.sessionId, extraPlayers[0]);
+    await service.forfeitSplendor(startedSplendor.sessionId, extraPlayers[1]);
+    assert.equal(db.rows.get(startedSplendor.sessionId).state_json.status, 'playing');
+    await service.forfeitSplendor(startedSplendor.sessionId, user);
+    const afterLastHumanLeaves = db.rows.get(startedSplendor.sessionId).state_json;
+    assert.equal(afterLastHumanLeaves.status, 'finished');
+    assert.equal(afterLastHumanLeaves.finishReason, 'forfeit');
+    assert.equal((await service.listActiveSessions(user)).sessions.length, 0);
 
     const sudokuRoom = await service.createRoom(user, { gameKey: 'sudoku', maxPlayers: 6 });
     const sudokuPlayers = [opponent, ...extraPlayers];

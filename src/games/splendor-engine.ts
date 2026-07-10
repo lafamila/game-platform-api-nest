@@ -66,6 +66,10 @@ export interface SplendorSession {
   }>;
   finalRoundStartedBy?: SplendorSide;
   pause?: { active: boolean; requestedByAccountId?: string; startedAt?: string; resumableAt?: string; counts?: Record<string, number> };
+  roomId?: string;
+  roomCode?: string;
+  roomMode?: string;
+  roomPlayers?: Array<{ seat: number; accountId: string; kind: 'account' | 'ai'; status: string; aiDifficulty?: Difficulty }>;
   finishReason?: string;
   createdAt: string;
   updatedAt: string;

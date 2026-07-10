@@ -1,5 +1,6 @@
 ---
-status: IN_PROGRESS
+status: COMPLETED
+completed_at: 2026-07-08
 summary: "게임 플랫폼 서버 Phase 1–6 — 세션 sliding/refresh 3분류/에러 code 계약, rev·멱등·socket.io·grace 공통화, GameEngine 레지스트리, participants/rooms N인, 세이브 이어하기(대전→AI/솔로 복원), 신규 게임 엔진(뱀사다리→고스톱→마이티→리듬→격투)과 기존 게임 보강"
 ---
 
