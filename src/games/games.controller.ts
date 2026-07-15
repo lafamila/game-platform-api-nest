@@ -2,7 +2,7 @@ import { Body, Controller, Delete, Get, Param, Patch, Post, Put, Query, UseGuard
 import { AuthAccount } from '../auth/auth.types';
 import { GamePlatformSessionGuard } from '../auth/session.guard';
 import { CurrentUser } from '../auth/current-user';
-import { Difficulty } from './games.types';
+import { Difficulty, PlayerColor } from './games.types';
 import { GamesService } from './games.service';
 
 @UseGuards(GamePlatformSessionGuard)
@@ -224,8 +224,11 @@ export class GamesController {
   }
 
   @Post('gomoku/sessions')
-  createGomoku(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
-    return this.games.createGomokuSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium');
+  createGomoku(
+    @CurrentUser() user: AuthAccount,
+    @Body() body: { opponentAccountId?: string; difficulty?: Difficulty; color?: PlayerColor },
+  ) {
+    return this.games.createGomokuSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium', body.color);
   }
 
   @Get('gomoku/sessions/:id')
@@ -294,8 +297,11 @@ export class GamesController {
   }
 
   @Post('othello/sessions')
-  createOthello(@CurrentUser() user: AuthAccount, @Body() body: { opponentAccountId?: string; difficulty?: Difficulty }) {
-    return this.games.createOthelloSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium');
+  createOthello(
+    @CurrentUser() user: AuthAccount,
+    @Body() body: { opponentAccountId?: string; difficulty?: Difficulty; color?: PlayerColor },
+  ) {
+    return this.games.createOthelloSession(user, body.opponentAccountId, undefined, body.difficulty ?? 'medium', body.color);
   }
 
   @Get('othello/sessions/:id')

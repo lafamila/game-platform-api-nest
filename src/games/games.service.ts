@@ -87,6 +87,7 @@ import {
   randomGomokuMove,
   validateGomokuIndex,
 } from './gomoku-engine';
+import { getForbiddenReason } from './gomoku-rules';
 import {
   ALKKAGI_AI_BUDGET_MS,
   ALKKAGI_BOARD_SIZE,
@@ -1528,9 +1529,11 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     opponentAccountId?: string,
     mode?: 'local_ai' | 'friend_match',
     difficulty: Difficulty = 'medium',
+    color: PlayerColor = 'black',
   ): Promise<GomokuSession> {
     this.assertDifficulty(difficulty);
     const resolvedMode = opponentAccountId ? 'friend_match' : mode ?? 'local_ai';
+    const humanIsWhite = resolvedMode === 'local_ai' && color === 'white';
     const state: GomokuSession = {
       id: '',
       mode: resolvedMode,
@@ -1539,8 +1542,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       currentTurn: 'black',
       status: 'playing',
       players: {
-        black: user.accountId,
-        white: opponentAccountId || LOCAL_AI_ACCOUNT_ID,
+        black: humanIsWhite ? LOCAL_AI_ACCOUNT_ID : user.accountId,
+        white: humanIsWhite ? user.accountId : opponentAccountId || LOCAL_AI_ACCOUNT_ID,
       },
       moves: [],
       createdAt: '',
@@ -1553,6 +1556,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     const session = this.gomokuFromRow(row);
     this.scheduleTurnTimer(session, 'gomoku');
     this.emitSessionEvent(session, 'game.session.created', session);
+    // 인간이 백을 고르면 AI(흑)가 선공 — 생성 직후 AI 첫 수를 스케줄한다.
+    if (session.mode === 'local_ai' && session.status === 'playing' && isLocalAiAccount(session.players[session.currentTurn])) {
+      this.scheduleLocalGomokuAiTurn(session.id);
+    }
     return session;
   }
 
@@ -1827,9 +1834,11 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     opponentAccountId?: string,
     mode?: 'local_ai' | 'friend_match',
     difficulty: Difficulty = 'medium',
+    color: OthelloColor = 'black',
   ): Promise<OthelloSession> {
     this.assertDifficulty(difficulty);
     const resolvedMode = opponentAccountId ? 'friend_match' : mode ?? 'local_ai';
+    const humanIsWhite = resolvedMode === 'local_ai' && color === 'white';
     const state: OthelloSession = {
       id: '',
       mode: resolvedMode,
@@ -1838,8 +1847,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       currentTurn: 'black',
       status: 'playing',
       players: {
-        black: user.accountId,
-        white: opponentAccountId || LOCAL_AI_ACCOUNT_ID,
+        black: humanIsWhite ? LOCAL_AI_ACCOUNT_ID : user.accountId,
+        white: humanIsWhite ? user.accountId : opponentAccountId || LOCAL_AI_ACCOUNT_ID,
       },
       moves: [],
       createdAt: '',
@@ -1853,6 +1862,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     const session = this.othelloFromRow(row);
     this.scheduleTurnTimer(session, 'othello');
     this.emitSessionEvent(session, 'game.session.created', session);
+    // 인간이 백을 고르면 AI(흑)가 선공 — 생성 직후 AI 첫 수를 스케줄한다.
+    if (session.mode === 'local_ai' && session.status === 'playing' && isLocalAiAccount(session.players[session.currentTurn])) {
+      this.scheduleLocalOthelloAiTurn(session.id);
+    }
     return session;
   }
 
@@ -6792,7 +6805,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       this.emitSessionEvent(saved, 'gomoku.move.played', saved);
       return;
     }
-    const [rowIndex, colIndex] = empty[Math.floor(Math.random() * empty.length)];
+    // 흑 차례의 무작위 착수가 금수 칸을 골라 착수가 거부되지 않도록 금수가 아닌 칸을 우선한다.
+    const legal =
+      session.currentTurn === 'black'
+        ? empty.filter(([r, c]) => getForbiddenReason(session.board, r, c) === null)
+        : empty;
+    const pool = legal.length > 0 ? legal : empty;
+    const [rowIndex, colIndex] = pool[Math.floor(Math.random() * pool.length)];
     this.applyGomokuMove(session, currentAccountId, rowIndex, colIndex, 'timeout');
     const saved = this.gomokuFromRow(await this.updateGame(session.id, session.status, session.currentTurn, session.winner ?? null, session));
     this.scheduleTurnTimer(saved, 'gomoku');
