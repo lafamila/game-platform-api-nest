@@ -175,6 +175,19 @@ The `hard` difficulty for `othello` and `gomoku` uses dedicated search engines, 
 
 **Renju colour imbalance (measured):** because black is forbidden 3-3/4-4/overline while white is free (and white's overline is not a win), black is structurally disadvantaged — between equal engines white wins essentially every game (medium-vs-medium ≈ 30-0 for white). So a colour-alternating self-play win rate cannot reach 80% for any engine as black; the `test/gomoku-ai.test.mjs` self-play test instead asserts hard is clearly stronger than medium (wins well above the ~50% equal-strength baseline and strictly more than medium). Othello is colour-symmetric, so its self-play test keeps the ≥80% bar.
 
+## Replay (Gomoku & Othello — superadmin only)
+
+Server-authoritative replay of **finished** gomoku/othello games for superadmins. This is the repo's **first web surface**.
+
+- **Move logging (`state_json.moveHistory[]`).** A new **optional** array on gomoku/othello sessions accumulates every ply: `{ n, type: 'move'|'pass', seat (0=black,1=white), color, x (col), y (row), at (ISO UTC) }`. `x`/`y` are omitted for a pass. It is recorded inside the engine's exported `applyGomokuMove`/`applyOthelloMove` (see `src/games/move-history.ts`), so **all** sources — human, local-AI, and timer auto-moves — are captured at one choke point. Othello's forced pass (the opponent has no legal move, so the turn stays with the mover) is recorded as `type: 'pass'`. `stateVersion` is unchanged and **no migration** is needed. `moveHistory` rides in `state_json` alongside the existing `moves` array (full-information games; not stripped from `viewFor`).
+- **No retroactive replay.** Games finished before logging shipped have no `moveHistory` and are **not** replayable: excluded from the list and `404` on detail.
+- **Auth (D1) — superadmin only.** All replay APIs use `GamePlatformSessionGuard` + `SuperadminGuard` (`src/auth/superadmin.guard.ts`, permission `superadmin` via `hasSuperadminAccess`). Not logged in → `401` (`code: AUTH_REQUIRED`, existing session contract); logged in but not superadmin → `403` (`code: FORBIDDEN`). Browser auth reuses the existing OIDC **cookie** session (`game_platform_session`, set by `GET /api/session/oidc/callback`; the guard reads it via `extractSessionId`) — no new auth scheme.
+- **APIs** (under `/api`, all superadmin-guarded):
+  - `GET /api/replays?game=gomoku|othello&accountId=&page=&pageSize=` — finished gomoku/othello with a non-empty `moveHistory`, `created_at DESC`, paginated (`pageSize` default 20, max 100). Row: `{ sessionId, gameKey, mode, players:[{seat,color,accountId,displayName,isAi}], aiDifficulty?, startedAt, winner (accountId|'ai'|'draw'|null), finishReason, moveCount }`. Includes all finish reasons (D6). Display name = name → loginId → accountId (D2, from the `social_accounts` cache).
+  - `GET /api/replays/:sessionId` — the row plus `boardSize`, `moves:[{…, delayMs}]` (`delayMs` = gap to the previous ply, **clamped to 30000ms**, first ply 0 — D4), and `snapshots:[board,…]` reconstructed server-side (othello flips recomputed with the engine's `othelloFlips`; a pass repeats the previous board), aligned 1:1 with `moves`.
+  - `GET /api/replays/accounts/search?q=` — reuses `SocialService.searchAccounts` (the `account.search` service credential) for the user filter.
+- **`/replay` web view.** Single self-contained vanilla HTML+JS+CSS page (no framework/build pipeline), stored as a TS template string in `src/replay/replay-view.page.ts` and served **outside** the global `/api` prefix (`main.ts` `setGlobalPrefix('api', { exclude: [{ path: 'replay', method: GET }] })`). The page is served without a guard; its JS routes `401`→login-start (`POST /api/session/oidc/start`, `returnUri` back to `/replay`) and `403`→"권한 없음", and on success renders the list + a canvas player that plays snapshots at the `delayMs` tempo with **pause/resume only** (resume continues from the remaining interval — D7). Times shown in Asia/Seoul.
+
 ## Local Dev
 
 ```bash
@@ -249,6 +262,10 @@ Normal local development uses `auth-api-nest` on `http://localhost:3032`, Postgr
 - `POST /api/permission-upgrade-requests`
 - `GET /api/realtime/events` (SSE, kept during the socket.io transition)
 - socket.io `/api/socket.io` (event push channel; auth via `x-game-platform-session` header or handshake `auth.sessionId`)
+- `GET /api/replays` (superadmin — finished gomoku/othello list)
+- `GET /api/replays/accounts/search` (superadmin — user filter search)
+- `GET /api/replays/:sessionId` (superadmin — moves + delays + snapshots)
+- `GET /replay` (superadmin replay web view; served **outside** the `/api` prefix)
 
 ## Review Criteria
 
