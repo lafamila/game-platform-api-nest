@@ -1,5 +1,7 @@
 ---
-status: IN_PROGRESS
+status: COMPLETED
+completed_at: 2026-07-15
+completion_reason: "R1+R2 구현·검증 완료 — 커밋 2716dce·0b5026f·8308bc2·1b7ad91·5c1e98a(+통합 후속 fix 6c05831 카운트다운 후 AI 첫수, 083eb76 돌 색 보존), 298/298 테스트, 25초 실측(오델로 깊이14/오목 깊이11), 워커 격리 증명. 특기: 렌주 룰의 구조적 색 불균형 발견 → 오목 셀프플레이 기준을 'hard ≥11/20 + medium 유의 우위'로 재정의(승인됨, CLAUDE.md 기록)"
 summary: "오델로·오목 hard AI 대폭 강화(워커 25초 반복 심화+TT+위협 평가) + 오목 렌주형 금수(흑 3-3/4-4/장목, 백 자유·장목 비승리, 승리=정확히 5) + 오목·오델로 흑/백 선택(AI 흑 선공) — root GAME_PLATFORM_OTHELLO_GOMOKU_AI_PLAN 의 API 실행 계획"
 ---
 
