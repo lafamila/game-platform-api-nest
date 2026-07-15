@@ -153,6 +153,28 @@ Every action POST accepts an optional `clientMoveId` (uuid). The server keeps th
   - **Limits (documented)**: the server cannot verify actual gameplay of a client-simulated fighter — validation is plausibility-level (bounds/sequence/consistency), which is acceptable for a local-vs-AI mode with no stakes or rankings. Revisit before any ranked/online mode.
   - **Events**: `fighting.round.recorded`, `game.session.finished`, plus common session events.
 
+## Hard AI — Othello & Gomoku (engine/AI split + worker)
+
+The `hard` difficulty for `othello` and `gomoku` uses dedicated search engines, separate from the game engines so the engine files stay lean and the search can run inside a worker thread. `easy`/`medium` are unchanged — they keep using the old greedy/`gomokuMinimax`/`chooseOthelloAiMove` paths at their original (short) budgets.
+
+- **Search engines** (pure modules, no NestJS deps so a worker can load them cheaply): `src/games/othello-ai.ts` (`searchOthelloMove`) — iterative-deepening negamax + alpha-beta + Zobrist TT, 3-phase eval (mobility/frontier/stability + corner and X/C-square terms), exact endgame solve at ≤14 empties. `src/games/gomoku-ai.ts` (`searchGomokuMove`) — threat-ordered candidates (≤16/node), iterative deepening, Zobrist TT, VCF (continuous-four) forced-win search, a 5-window pattern eval with a double-threat (4-4/4-3/3-3) bonus, plus guaranteed immediate-win / single-five-block shortcuts. Both take `(board, turn, budgetMs, onDepth?)` and return the best move from the last **completed** depth; they never exceed the budget.
+- **Shared util**: `src/games/engine/zobrist.ts` (splitmix64 64-bit keys + `TTEntry`). Protocol/types in `src/games/engine/ai-worker-protocol.ts`.
+- **Worker model** (repo's first `worker_threads` use): `src/games/engine/ai-worker.ts` builds to `dist/games/engine/ai-worker.js` and runs the search off the main event loop (a 25s think must not stall other sessions' HTTP/timers/socket.io). `src/games/engine/ai-worker-pool.ts` caps concurrency (`GAME_AI_WORKER_POOL_SIZE`, default 2) with a FIFO queue, terminates at `budget+2s` and uses the last interim best, and **rejects on spawn/serialization failure so the service falls back to the old sync engine** (availability first). The service routes `hard` to the worker only when the budget ≥ 400ms; below that (tests/tiny budgets) it runs the new engine synchronously. Budgets are read from env **at call time** (`OTHELLO_AI_BUDGET_MS`/`GOMOKU_AI_BUDGET_MS`, default 25000) so tests can override with tiny values. Measured: 25s reaches ~depth 14 (othello, opening) / ~depth 11 (gomoku, midgame).
+
+## Gomoku renju rules & error-string contract (do NOT change)
+
+`src/games/gomoku-rules.ts` implements renju-style rules used by both the move validator and the AI. Black forbidden moves (착수 거부): double-three, double-four (incl. two fours on one line), overline (6+). Five-precedence: a move completing an exact five is never forbidden. White has no forbidden moves and may play an overline, which is **not** a win. Win detection for both colours is **exact five** (`isExactFive`), not `>=5`. `applyGomokuMove` rejects a black forbidden move with a `BadRequestException` whose message is a **client contract** (the Flutter app substring-matches `forbidden move for black`) — never change these strings:
+
+- `forbidden move for black: double-three (삼삼)`
+- `forbidden move for black: double-four (사사)`
+- `forbidden move for black: overline (장목)`
+
+## Black/white colour selection (local_ai)
+
+`POST /api/gomoku/sessions` and `POST /api/othello/sessions` accept an optional `color: "black" | "white"` (default `"black"`, backward compatible). In `local_ai`, choosing `"white"` puts the AI on black and the AI's first move is scheduled immediately on creation. `friend_match` is unchanged (creator is black). No new persisted state — the colour rides the existing `players` map (`stateVersion` unchanged). The AI respects black's forbidden moves when it plays black, in both its own move generation and when simulating black replies.
+
+**Renju colour imbalance (measured):** because black is forbidden 3-3/4-4/overline while white is free (and white's overline is not a win), black is structurally disadvantaged — between equal engines white wins essentially every game (medium-vs-medium ≈ 30-0 for white). So a colour-alternating self-play win rate cannot reach 80% for any engine as black; the `test/gomoku-ai.test.mjs` self-play test instead asserts hard is clearly stronger than medium (wins well above the ~50% equal-strength baseline and strictly more than medium). Othello is colour-symmetric, so its self-play test keeps the ≥80% bar.
+
 ## Local Dev
 
 ```bash
