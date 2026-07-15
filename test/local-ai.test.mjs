@@ -129,6 +129,25 @@ test('generic session create and get dispatch through registered game keys', asy
   }
 });
 
+test('generic session create preserves the selected white stone color', async () => {
+  for (const gameKey of ['gomoku', 'othello']) {
+    const service = new GamesService(new FakeDb(), new FakeRealtime());
+    try {
+      const session = await service.createGameSession(gameKey, user, {
+        difficulty: 'medium',
+        color: 'white',
+      });
+
+      assert.notEqual(session.players.black, user.accountId);
+      assert.equal(session.players.white, user.accountId);
+      assert.equal(session.currentTurn, 'black');
+      assert.equal(session.moves.length, 0);
+    } finally {
+      service.onModuleDestroy();
+    }
+  }
+});
+
 test('alkkagi engine contract creates state and applies shots', () => {
   const session = ALKKAGI_ENGINE.createState([
     { seat: 0, kind: 'account', accountId: user.accountId },

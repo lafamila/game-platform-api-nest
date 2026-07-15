@@ -339,7 +339,12 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   async createGameSession(
     gameKey: string,
     user: AuthAccount,
-    input: { opponentAccountId?: string; difficulty?: Difficulty; config?: Record<string, unknown> },
+    input: {
+      opponentAccountId?: string;
+      difficulty?: Difficulty;
+      color?: PlayerColor;
+      config?: Record<string, unknown>;
+    },
   ): Promise<unknown> {
     if (!this.gameRegistry.has(gameKey)) {
       throw new BadRequestException('unsupported gameKey');
@@ -349,17 +354,18 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     const opponentAccountId = typeof input.opponentAccountId === 'string' && input.opponentAccountId.length > 0
       ? input.opponentAccountId
       : undefined;
+    const color = input.color === 'white' ? 'white' : 'black';
     if (gameKey === 'sudoku') {
       return this.createSudokuSession(user, difficulty, opponentAccountId);
     }
     if (gameKey === 'gomoku') {
-      return this.createGomokuSession(user, opponentAccountId, undefined, difficulty);
+      return this.createGomokuSession(user, opponentAccountId, undefined, difficulty, color);
     }
     if (gameKey === 'alkkagi') {
       return this.createAlkkagiSession(user, opponentAccountId, undefined, difficulty);
     }
     if (gameKey === 'othello') {
-      return this.createOthelloSession(user, opponentAccountId, undefined, difficulty);
+      return this.createOthelloSession(user, opponentAccountId, undefined, difficulty, color);
     }
     if (gameKey === 'sokoban') {
       return this.createSokobanSession(user, difficulty, opponentAccountId);
