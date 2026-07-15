@@ -150,6 +150,8 @@ const ALKKAGI_TURN_LIMIT_MS = 10_000;
 const OTHELLO_TURN_LIMIT_MS = 20_000;
 const FORTRESS_TURN_LIMIT_MS = 20_000;
 const LOCAL_AI_RESPONSE_DELAY_MS = 180;
+const LOCAL_AI_INITIAL_RESPONSE_DELAY_MS =
+  MATCH_READY_DELAY_MS + LOCAL_AI_RESPONSE_DELAY_MS;
 // hard AI 예산이 이 값 이상이면 워커 스레드에서 실행(이벤트 루프 비차단), 미만이면 동기 실행(테스트/소예산).
 const AI_WORKER_MIN_BUDGET_MS = 400;
 const MIGHTY_AI_RESPONSE_DELAY_MS = 1_500;
@@ -1564,7 +1566,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.emitSessionEvent(session, 'game.session.created', session);
     // 인간이 백을 고르면 AI(흑)가 선공 — 생성 직후 AI 첫 수를 스케줄한다.
     if (session.mode === 'local_ai' && session.status === 'playing' && isLocalAiAccount(session.players[session.currentTurn])) {
-      this.scheduleLocalGomokuAiTurn(session.id);
+      this.scheduleLocalGomokuAiTurn(
+        session.id,
+        LOCAL_AI_INITIAL_RESPONSE_DELAY_MS,
+      );
     }
     return session;
   }
@@ -1870,7 +1875,10 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.emitSessionEvent(session, 'game.session.created', session);
     // 인간이 백을 고르면 AI(흑)가 선공 — 생성 직후 AI 첫 수를 스케줄한다.
     if (session.mode === 'local_ai' && session.status === 'playing' && isLocalAiAccount(session.players[session.currentTurn])) {
-      this.scheduleLocalOthelloAiTurn(session.id);
+      this.scheduleLocalOthelloAiTurn(
+        session.id,
+        LOCAL_AI_INITIAL_RESPONSE_DELAY_MS,
+      );
     }
     return session;
   }
@@ -6491,13 +6499,16 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return result.move ?? chooseOthelloAiMove(session);
   }
 
-  private scheduleLocalGomokuAiTurn(id: string): void {
+  private scheduleLocalGomokuAiTurn(
+    id: string,
+    delayMs = LOCAL_AI_RESPONSE_DELAY_MS,
+  ): void {
     setTimeout(() => {
       void this.runLocalGomokuAiTurn(id).catch((error) => {
         // Local AI failures should not crash the API process.
         console.error(error);
       });
-    }, LOCAL_AI_RESPONSE_DELAY_MS);
+    }, delayMs);
   }
 
   private async runLocalGomokuAiTurn(id: string): Promise<void> {
@@ -6525,13 +6536,16 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private scheduleLocalOthelloAiTurn(id: string): void {
+  private scheduleLocalOthelloAiTurn(
+    id: string,
+    delayMs = LOCAL_AI_RESPONSE_DELAY_MS,
+  ): void {
     setTimeout(() => {
       void this.runLocalOthelloAiTurn(id).catch((error) => {
         // Local AI failures should not crash the API process.
         console.error(error);
       });
-    }, LOCAL_AI_RESPONSE_DELAY_MS);
+    }, delayMs);
   }
 
   private async runLocalOthelloAiTurn(id: string): Promise<void> {

@@ -133,6 +133,11 @@ test('othello white pick makes the AI take black and open the game', async () =>
   assert.equal(session.currentTurn, 'black');
 
   await wait(450);
+  const waiting = await service.getOthelloSession(session.id, user);
+  assert.equal(waiting.moves.length, 0);
+  assert.equal(waiting.currentTurn, 'black');
+
+  await wait(3900);
   const answered = await service.getOthelloSession(session.id, user);
   assert.equal(answered.moves.length, 1);
   assert.equal(answered.moves[0].source, 'ai');
