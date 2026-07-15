@@ -7,6 +7,22 @@ export type SokobanSide = string;
 export type CrazyArcadeSide = 'challenger' | 'opponent' | `seat${number}`;
 export type GameMode = 'solo' | 'local_ai' | 'friend_match';
 
+/**
+ * 리플레이용 수순 로그 엔트리 (superadmin 리플레이의 전제 데이터).
+ * `moves` 와 별개의 optional 필드 `moveHistory[]` 에 매 수를 축적한다 — 오델로의 강제 pass 도
+ * `type: 'pass'` 로 기록해 재생이 정확하게 재현된다. `x`=col, `y`=row (0-based), `at`=ISO UTC.
+ * 소급 불가(D3): 로깅 배포 이전 완료 게임은 `moveHistory` 가 없어 리플레이 대상이 아니다.
+ */
+export interface MoveHistoryEntry {
+  n: number;
+  type: 'move' | 'pass';
+  seat: number; // 0 = black, 1 = white
+  color: PlayerColor; // OthelloColor 와 동일한 'black' | 'white'
+  x?: number; // column (move only)
+  y?: number; // row (move only)
+  at: string;
+}
+
 export interface MatchPauseState {
   active: boolean;
   requestedByAccountId?: string;
@@ -79,6 +95,7 @@ export interface GomokuSession {
   status: 'playing' | 'finished';
   players: Record<PlayerColor, string>;
   moves: Array<{ row: number; col: number; color: PlayerColor; accountId: string; createdAt: string; source?: 'manual' | 'timeout' | 'ai' }>;
+  moveHistory?: MoveHistoryEntry[];
   turnStartedAt?: string;
   turnDeadlineAt?: string;
   networkGraceStartedAt?: string;
@@ -155,6 +172,7 @@ export interface OthelloSession {
   status: 'playing' | 'finished';
   players: Record<OthelloColor, string>;
   moves: Array<{ row: number; col: number; color: OthelloColor; accountId: string; flipped: number; createdAt: string; source?: 'manual' | 'timeout' | 'ai' }>;
+  moveHistory?: MoveHistoryEntry[];
   turnStartedAt?: string;
   turnDeadlineAt?: string;
   networkGraceStartedAt?: string;

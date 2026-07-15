@@ -2,6 +2,7 @@ import { BadRequestException } from '@nestjs/common';
 import { GameAction, GameEngine, SeatInfo } from './engine/game-engine';
 import { Difficulty, GameMode, GomokuSession, PlayerColor } from './games.types';
 import { ForbiddenReason, getForbiddenReason, isExactFive } from './gomoku-rules';
+import { recordMove } from './move-history';
 
 export const GOMOKU_SIZE = 15;
 export const GOMOKU_AI_BUDGET_MS = 900;
@@ -49,6 +50,7 @@ export const GOMOKU_ENGINE: GameEngine<GomokuSession> = {
         white: players[1]?.accountId ?? '',
       },
       moves: [],
+      moveHistory: [],
       createdAt: now,
       updatedAt: now,
     };
@@ -124,8 +126,10 @@ export function applyGomokuMove(
       throw new BadRequestException(GOMOKU_FORBIDDEN_MESSAGES[reason]);
     }
   }
+  const at = new Date().toISOString();
   session.board[row][col] = color;
-  session.moves.push({ row, col, color, accountId, createdAt: new Date().toISOString(), source });
+  session.moves.push({ row, col, color, accountId, createdAt: at, source });
+  recordMove(session, color, row, col, at);
   if (isExactFive(session.board, row, col, color)) {
     session.status = 'finished';
     session.winner = color;

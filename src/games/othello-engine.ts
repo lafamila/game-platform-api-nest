@@ -1,6 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
 import { GameAction, GameEngine, SeatInfo } from './engine/game-engine';
 import { Difficulty, GameMode, OthelloColor, OthelloSession } from './games.types';
+import { recordMove, recordPass } from './move-history';
 
 export const OTHELLO_SIZE = 8;
 export const OTHELLO_STATE_VERSION = 1;
@@ -35,6 +36,7 @@ export const OTHELLO_ENGINE: GameEngine<OthelloSession> = {
         white: players[1]?.accountId ?? '',
       },
       moves: [],
+      moveHistory: [],
       createdAt: now,
       updatedAt: now,
     };
@@ -162,6 +164,7 @@ export function applyOthelloMove(
   if (flips.length === 0) {
     throw new BadRequestException('not a legal othello move');
   }
+  const at = new Date().toISOString();
   session.board[row][col] = color;
   for (const [r, c] of flips) {
     session.board[r][c] = color;
@@ -172,14 +175,17 @@ export function applyOthelloMove(
     color,
     accountId,
     flipped: flips.length,
-    createdAt: new Date().toISOString(),
+    createdAt: at,
     source,
   });
+  recordMove(session, color, row, col, at);
   const next = oppositeOthello(color);
   if (othelloLegalMoves(session.board, next).length > 0) {
     session.currentTurn = next;
   } else if (othelloLegalMoves(session.board, color).length > 0) {
+    // 상대(next)가 둘 곳이 없어 턴이 넘어가지 않는다 = next 의 강제 pass. 재생 정확성을 위해 기록한다.
     session.currentTurn = color;
+    recordPass(session, next, at);
   } else {
     finishOthello(session);
   }
