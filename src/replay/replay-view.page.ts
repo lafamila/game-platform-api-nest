@@ -100,6 +100,7 @@ export const REPLAY_VIEW_HTML = `<!doctype html>
         <div class="controls">
           <button id="pause-btn" class="primary">일시정지</button>
           <button id="restart-btn">처음부터</button>
+          <button id="pdf-btn">기보 PDF</button>
         </div>
       </div>
     </section>
@@ -400,45 +401,246 @@ export const REPLAY_VIEW_HTML = `<!doctype html>
       drawBoard(snap, last);
     }
 
-    function drawBoard(board, last) {
-      var canvas = el('board');
-      var ctx = canvas.getContext('2d');
-      var size = pb.detail.boardSize;
-      var W = canvas.width;
-      var cell = W / size;
-      var isGomoku = pb.detail.gameKey === 'gomoku';
-      ctx.clearRect(0, 0, W, W);
-      ctx.fillStyle = isGomoku ? '#d8b98a' : '#2f7d55';
-      ctx.fillRect(0, 0, W, W);
-      // grid
-      ctx.strokeStyle = isGomoku ? 'rgba(80,50,20,0.55)' : 'rgba(0,0,0,0.35)';
-      ctx.lineWidth = 1;
-      for (var i = 0; i <= size; i++) {
-        var p = Math.round(i * cell) + 0.5;
-        ctx.beginPath(); ctx.moveTo(p, 0); ctx.lineTo(p, W); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(0, p); ctx.lineTo(W, p); ctx.stroke();
+    // App-faithful renderer — mirrors GomokuPainter (game-platform-app-flutter
+    // lib/main.dart:9412) and OthelloBoard (main.dart:15602); palette = GamePalette (main.dart:1157).
+    var PAL = { ink: '#2b1b10', leafDeep: '#356d1f', gold: '#ffd166' };
+    function rgba(hex, a) {
+      var n = parseInt(hex.replace('#', ''), 16);
+      return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+    }
+    function roundRectPath(ctx, x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
+    // golden ring = the app's gomoku last-move idiom; reused for othello (which has none) — documented.
+    function paintLastRing(ctx, cx, cy, radius) {
+      ctx.beginPath(); ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+      ctx.lineWidth = 2.5; ctx.strokeStyle = PAL.gold; ctx.stroke();
+    }
+
+    function paintGomoku(ctx, W, board, last) {
+      var cell = W / 15, inset = W * 0.012, r = W * 0.045;
+      roundRectPath(ctx, inset, inset + W * 0.018, W - 2 * inset, W - 2 * inset, r);
+      ctx.fillStyle = rgba(PAL.ink, 0.48); ctx.fill();
+      roundRectPath(ctx, inset, inset, W - 2 * inset, W - 2 * inset, r);
+      var g = ctx.createLinearGradient(0, 0, W, W);
+      g.addColorStop(0, '#ffe08a'); g.addColorStop(1, '#d89544');
+      ctx.fillStyle = g; ctx.fill();
+      ctx.lineWidth = Math.max(3, W * 0.0125); ctx.strokeStyle = PAL.ink; ctx.stroke();
+      ctx.strokeStyle = rgba(PAL.ink, 0.08); ctx.lineWidth = 1.5;
+      for (var wi = 0; wi < 9; wi++) {
+        var yy = W * (0.14 + wi * 0.09);
+        ctx.beginPath(); ctx.moveTo(W * 0.09, yy);
+        ctx.quadraticCurveTo(W * 0.34, yy + Math.sin(wi) * W * 0.012, W * 0.58, yy - Math.cos(wi) * W * 0.01);
+        ctx.quadraticCurveTo(W * 0.78, yy + Math.sin(wi * 1.7) * W * 0.012, W * 0.91, yy);
+        ctx.stroke();
       }
-      // stones / disks (centered in each cell)
-      for (var r = 0; r < size; r++) {
-        for (var c = 0; c < size; c++) {
-          var v = board[r] && board[r][c];
+      ctx.strokeStyle = rgba(PAL.ink, 0.58); ctx.lineWidth = 1.2;
+      var gi = cell * 0.5;
+      for (var i = 0; i < 15; i++) {
+        var o = gi + i * cell;
+        ctx.beginPath(); ctx.moveTo(gi, o); ctx.lineTo(W - gi, o); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(o, gi); ctx.lineTo(o, W - gi); ctx.stroke();
+      }
+      for (var row = 0; row < 15; row++) {
+        for (var col = 0; col < 15; col++) {
+          var v = board[row] && board[row][col];
           if (!v) continue;
-          var cx = c * cell + cell / 2;
-          var cy = r * cell + cell / 2;
-          var radius = cell * 0.42;
-          ctx.beginPath(); ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-          ctx.fillStyle = v === 'black' ? '#111' : '#fafafa';
-          ctx.fill();
-          ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(0,0,0,0.5)'; ctx.stroke();
+          var cx = col * cell + cell / 2, cy = row * cell + cell / 2;
+          ctx.beginPath(); ctx.arc(cx + cell * 0.05, cy + cell * 0.07, cell * 0.38, 0, Math.PI * 2);
+          ctx.fillStyle = rgba(PAL.ink, 0.26); ctx.fill();
+          var rg = ctx.createRadialGradient(cx - 0.28 * cell * 0.42, cy - 0.32 * cell * 0.42, 0, cx, cy, cell * 0.42);
+          if (v === 'black') { rg.addColorStop(0, '#5b4535'); rg.addColorStop(1, PAL.ink); }
+          else { rg.addColorStop(0, '#ffffff'); rg.addColorStop(1, '#ffe8a8'); }
+          ctx.beginPath(); ctx.arc(cx, cy, cell * 0.38, 0, Math.PI * 2); ctx.fillStyle = rg; ctx.fill();
+          ctx.beginPath(); ctx.arc(cx - cell * 0.12, cy - cell * 0.14, cell * 0.11, 0, Math.PI * 2);
+          ctx.fillStyle = rgba('#ffffff', 0.42); ctx.fill();
+          ctx.beginPath(); ctx.arc(cx, cy, cell * 0.38, 0, Math.PI * 2);
+          ctx.lineWidth = 2; ctx.strokeStyle = rgba(PAL.ink, 0.42); ctx.stroke();
         }
       }
-      // last-move marker
-      if (last) {
-        var mx = last.x * cell + cell / 2;
-        var my = last.y * cell + cell / 2;
-        ctx.beginPath(); ctx.arc(mx, my, cell * 0.12, 0, Math.PI * 2);
-        ctx.fillStyle = '#e23b3b'; ctx.fill();
+      if (last) { paintLastRing(ctx, last.x * cell + cell / 2, last.y * cell + cell / 2, cell * 0.45); }
+    }
+
+    function paintOthello(ctx, W, board, last) {
+      var cell = W / 8, m = Math.max(1, W * 0.004), cr = Math.max(2, W * 0.008);
+      ctx.fillStyle = PAL.leafDeep; ctx.fillRect(0, 0, W, W);
+      for (var row = 0; row < 8; row++) {
+        for (var col = 0; col < 8; col++) {
+          var x = col * cell, y = row * cell;
+          roundRectPath(ctx, x + m, y + m, cell - 2 * m, cell - 2 * m, cr);
+          ctx.fillStyle = ((row + col) % 2 === 0) ? '#2f8f4e' : '#267441'; ctx.fill();
+          ctx.lineWidth = 1.5; ctx.strokeStyle = PAL.ink; ctx.stroke();
+          var v = board[row] && board[row][col];
+          if (!v) continue;
+          var cx = x + cell / 2, cy = y + cell / 2, rad = cell * 0.36;
+          ctx.beginPath(); ctx.arc(cx, cy + 3, rad, 0, Math.PI * 2); ctx.fillStyle = rgba('#000000', 0.32); ctx.fill();
+          ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2);
+          ctx.fillStyle = v === 'black' ? '#16181d' : '#f6f0df'; ctx.fill();
+          ctx.lineWidth = 2; ctx.strokeStyle = PAL.ink; ctx.stroke();
+        }
       }
+      if (last) { paintLastRing(ctx, last.x * cell + cell / 2, last.y * cell + cell / 2, cell * 0.42); }
+    }
+
+    function paintBoard(ctx, W, gameKey, board, last) {
+      ctx.clearRect(0, 0, W, W);
+      if (gameKey === 'gomoku') { paintGomoku(ctx, W, board, last); }
+      else { paintOthello(ctx, W, board, last); }
+    }
+
+    function drawBoard(board, last) {
+      var canvas = el('board');
+      paintBoard(canvas.getContext('2d'), canvas.width, pb.detail.gameKey, board, last);
+    }
+
+    // ---- 기보 PDF export -------------------------------------------------
+    // NOTE: giboColorLabel / giboMoveCaption / giboGridPlan / giboPageCount / encodeJpegPdf below
+    // are a browser port of src/replay/gibo-pdf.ts (unit-tested there). The /replay page has no
+    // build pipeline, so this copy is deliberate — KEEP THE TWO IN SYNC.
+    function giboColorLabel(color) { return color === 'black' ? '흑' : '백'; }
+    function giboMoveCaption(index, move) {
+      var n = index + 1, who = giboColorLabel(move.color);
+      if (move.type === 'pass') { return n + '수 · ' + who + ' 패스'; }
+      return n + '수 · ' + who + ' (' + (move.x + 1) + ',' + (move.y + 1) + ')';
+    }
+    function giboPageCount(tileCount, cap1, capRest) {
+      if (tileCount <= 0) return 1;
+      if (tileCount <= cap1) return 1;
+      return 1 + Math.ceil((tileCount - cap1) / Math.max(1, capRest));
+    }
+    function giboGridPlan(tileCount, o) {
+      var contentW = o.pageW - 2 * o.margin;
+      var tileW = (contentW - (o.cols - 1) * o.colGap) / o.cols;
+      var tileH = tileW * o.tileAspect;
+      var gridTop1 = o.margin + (o.headerHpt > 0 ? o.headerHpt + o.rowGap : 0);
+      function rowsFor(top) { return Math.max(1, Math.floor((o.pageH - top - o.margin + o.rowGap) / (tileH + o.rowGap))); }
+      var cap1 = rowsFor(gridTop1) * o.cols, capRest = rowsFor(o.margin) * o.cols;
+      var slots = [], i = 0;
+      for (var page = 0; i < tileCount; page++) {
+        var cap = page === 0 ? cap1 : capRest, gridTop = page === 0 ? gridTop1 : o.margin;
+        for (var k = 0; k < cap && i < tileCount; k++, i++) {
+          slots.push({ page: page, xPt: o.margin + (k % o.cols) * (tileW + o.colGap), yTopPt: gridTop + Math.floor(k / o.cols) * (tileH + o.rowGap) });
+        }
+      }
+      return { tileW: tileW, tileH: tileH, cap1: cap1, capRest: capRest, pages: giboPageCount(tileCount, cap1, capRest), slots: slots };
+    }
+    function pdfEnc(s) { return new TextEncoder().encode(s); }
+    function pdfConcat(list) {
+      var total = 0, j; for (j = 0; j < list.length; j++) total += list[j].length;
+      var out = new Uint8Array(total), at = 0;
+      for (j = 0; j < list.length; j++) { out.set(list[j], at); at += list[j].length; }
+      return out;
+    }
+    function pdfNum(n) { return (n % 1 === 0) ? String(n) : n.toFixed(2); }
+    function pdfPad10(n) { var s = String(n); while (s.length < 10) s = '0' + s; return s; }
+    function encodeJpegPdf(pageWpt, pageHpt, pages) {
+      var objs = [], next = 3, pageRefs = [];
+      function put(n, body) { objs[n - 1] = body; }
+      for (var p = 0; p < pages.length; p++) {
+        var imgNums = [], content = '', pl;
+        for (var q = 0; q < pages[p].length; q++) {
+          pl = pages[p][q]; var inum = next++;
+          var dict = '<< /Type /XObject /Subtype /Image /Width ' + pl.wPx + ' /Height ' + pl.hPx +
+            ' /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ' + pl.jpeg.length + ' >>\\nstream\\n';
+          put(inum, pdfConcat([pdfEnc(dict), pl.jpeg, pdfEnc('\\nendstream')]));
+          imgNums.push(inum);
+          content += 'q ' + pdfNum(pl.wPt) + ' 0 0 ' + pdfNum(pl.hPt) + ' ' + pdfNum(pl.xPt) + ' ' + pdfNum(pl.yPtBottom) + ' cm /Im' + inum + ' Do Q\\n';
+        }
+        var cnum = next++, cbytes = pdfEnc(content);
+        put(cnum, pdfConcat([pdfEnc('<< /Length ' + cbytes.length + ' >>\\nstream\\n'), cbytes, pdfEnc('\\nendstream')]));
+        var pnum = next++, res = imgNums.map(function (n) { return '/Im' + n + ' ' + n + ' 0 R'; }).join(' ');
+        put(pnum, pdfEnc('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ' + pdfNum(pageWpt) + ' ' + pdfNum(pageHpt) +
+          '] /Resources << /XObject << ' + res + ' >> >> /Contents ' + cnum + ' 0 R >>'));
+        pageRefs.push(pnum);
+      }
+      put(2, pdfEnc('<< /Type /Pages /Kids [' + pageRefs.map(function (n) { return n + ' 0 R'; }).join(' ') + '] /Count ' + pageRefs.length + ' >>'));
+      put(1, pdfEnc('<< /Type /Catalog /Pages 2 0 R >>'));
+      var out = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34, 0x0a, 0x25, 0xff, 0xff, 0xff, 0xff, 0x0a]);
+      var offsets = [];
+      for (var oi = 0; oi < objs.length; oi++) {
+        var n = oi + 1; offsets[n] = out.length;
+        out = pdfConcat([out, pdfEnc(n + ' 0 obj\\n'), objs[oi] || pdfEnc('<< >>'), pdfEnc('\\nendobj\\n')]);
+      }
+      var xrefStart = out.length, xref = 'xref\\n0 ' + (objs.length + 1) + '\\n0000000000 65535 f \\n';
+      for (var xn = 1; xn <= objs.length; xn++) { xref += pdfPad10(offsets[xn] || 0) + ' 00000 n \\n'; }
+      return pdfConcat([out, pdfEnc(xref), pdfEnc('trailer\\n<< /Size ' + (objs.length + 1) + ' /Root 1 0 R >>\\nstartxref\\n' + xrefStart + '\\n%%EOF\\n')]);
+    }
+
+    function dataUrlToBytes(url) {
+      var bin = atob(url.slice(url.indexOf(',') + 1)), arr = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+      return arr;
+    }
+    function playersLine(d) {
+      function nm(p) { return !p ? '-' : (p.isAi ? 'AI(' + (d.aiDifficulty || 'medium') + ')' : p.displayName); }
+      return '흑 ' + nm(playerByColor(d.players, 'black')) + '   vs   백 ' + nm(playerByColor(d.players, 'white'));
+    }
+    function buildHeaderCanvas() {
+      var d = pb.detail, HW = 1500, HH = Math.round(HW * 80 / 523);
+      var hc = document.createElement('canvas'); hc.width = HW; hc.height = HH;
+      var ctx = hc.getContext('2d');
+      ctx.fillStyle = '#fff8e7'; ctx.fillRect(0, 0, HW, HH);
+      ctx.strokeStyle = PAL.ink; ctx.lineWidth = 6; ctx.strokeRect(3, 3, HW - 6, HH - 6);
+      ctx.fillStyle = PAL.ink; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+      ctx.font = 'bold ' + Math.round(HH * 0.34) + 'px sans-serif';
+      ctx.fillText((d.gameKey === 'gomoku' ? '오목' : '오델로') + ' 기보', 40, HH * 0.32);
+      ctx.font = Math.round(HH * 0.19) + 'px sans-serif';
+      ctx.fillText(playersLine(d), 40, HH * 0.66);
+      ctx.textAlign = 'right';
+      ctx.fillText(fmtTime(d.startedAt) + '  ·  승자 ' + winnerLabel(d) + '  ·  ' + finishLabel(d.finishReason), HW - 40, HH * 0.66);
+      return hc;
+    }
+    function buildTileCanvas(index) {
+      var B = 460, capH = 64, tc = document.createElement('canvas');
+      tc.width = B; tc.height = B + capH;
+      var ctx = tc.getContext('2d');
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, tc.width, tc.height);
+      var move = pb.detail.moves[index];
+      if (move.type === 'pass') {
+        ctx.fillStyle = '#efe6cf'; roundRectPath(ctx, 8, 8, B - 16, B - 16, 16); ctx.fill();
+        ctx.lineWidth = 3; ctx.strokeStyle = PAL.ink; ctx.stroke();
+        ctx.fillStyle = PAL.ink; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.font = 'bold ' + Math.round(B * 0.12) + 'px sans-serif'; ctx.fillText('PASS', B / 2, B * 0.44);
+        ctx.font = Math.round(B * 0.07) + 'px sans-serif'; ctx.fillText(giboColorLabel(move.color) + ' 패스', B / 2, B * 0.6);
+      } else {
+        paintBoard(ctx, B, pb.detail.gameKey, pb.detail.snapshots[index], { x: move.x, y: move.y });
+      }
+      ctx.fillStyle = rgba(PAL.ink, 0.86); roundRectPath(ctx, 10, 10, Math.max(42, B * 0.14), Math.round(B * 0.088), 8); ctx.fill();
+      ctx.fillStyle = PAL.gold; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.font = 'bold ' + Math.round(B * 0.055) + 'px sans-serif'; ctx.fillText(String(index + 1), 22, 10 + B * 0.046);
+      ctx.fillStyle = PAL.ink; ctx.fillRect(0, B, B, capH);
+      ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.font = Math.round(capH * 0.42) + 'px sans-serif'; ctx.fillText(giboMoveCaption(index, move), B / 2, B + capH / 2);
+      return tc;
+    }
+    function exportGiboPdf() {
+      var d = pb.detail; if (!d) return;
+      var btn = el('pdf-btn'), old = btn.textContent; btn.disabled = true; btn.textContent = '생성 중…';
+      setTimeout(function () {
+        try {
+          var pageW = 595, pageH = 842, margin = 36, headerHpt = 80, contentW = pageW - 2 * margin;
+          var plan = giboGridPlan(d.moves.length, { pageW: pageW, pageH: pageH, margin: margin, cols: 3, colGap: 14, rowGap: 16, headerHpt: headerHpt, tileAspect: 524 / 460 });
+          var pagesPlac = []; for (var pi = 0; pi < plan.pages; pi++) pagesPlac.push([]);
+          var hc = buildHeaderCanvas();
+          pagesPlac[0].push({ jpeg: dataUrlToBytes(hc.toDataURL('image/jpeg', 0.9)), wPx: hc.width, hPx: hc.height, xPt: margin, yPtBottom: pageH - margin - headerHpt, wPt: contentW, hPt: headerHpt });
+          for (var i = 0; i < d.moves.length; i++) {
+            var tc = buildTileCanvas(i), s = plan.slots[i];
+            pagesPlac[s.page].push({ jpeg: dataUrlToBytes(tc.toDataURL('image/jpeg', 0.85)), wPx: tc.width, hPx: tc.height, xPt: s.xPt, yPtBottom: pageH - s.yTopPt - plan.tileH, wPt: plan.tileW, hPt: plan.tileH });
+          }
+          var blob = new Blob([encodeJpegPdf(pageW, pageH, pagesPlac)], { type: 'application/pdf' });
+          var url = URL.createObjectURL(blob), a = document.createElement('a');
+          a.href = url; a.download = 'gibo-' + d.gameKey + '-' + d.sessionId + '.pdf';
+          document.body.appendChild(a); a.click(); document.body.removeChild(a);
+          setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+        } catch (e) { alert('PDF 생성 실패: ' + e); }
+        btn.disabled = false; btn.textContent = old;
+      }, 30);
     }
 
     // ---- wiring ----------------------------------------------------------
@@ -450,6 +652,7 @@ export const REPLAY_VIEW_HTML = `<!doctype html>
     el('back-btn').addEventListener('click', function () { clearTimeout(pb.timer); loadList(); });
     el('pause-btn').addEventListener('click', togglePause);
     el('restart-btn').addEventListener('click', startPlayback);
+    el('pdf-btn').addEventListener('click', exportGiboPdf);
 
     loadList();
   })();
