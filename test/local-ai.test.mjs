@@ -33,6 +33,11 @@ import {
 } from '../dist/games/sudoku-engine.js';
 import { ALKKAGI_ENGINE } from '../dist/games/alkkagi-engine.js';
 import { FORTRESS_ENGINE } from '../dist/games/fortress-engine.js';
+
+// hard AI 예산을 소예산으로 오버라이드(호출 시점 판독). 400ms 미만이라 워커 대신 동기 신 엔진 경로를 타
+// 기존 타이밍 테스트(예: hard 오목 350ms 대기)가 25초 기본 예산에 깨지지 않게 한다.
+process.env.GOMOKU_AI_BUDGET_MS = '80';
+process.env.OTHELLO_AI_BUDGET_MS = '80';
 import { MIGHTY_ENGINE } from '../dist/games/mighty-engine.js';
 
 const user = {

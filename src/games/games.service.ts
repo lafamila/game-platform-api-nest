@@ -88,6 +88,9 @@ import {
   validateGomokuIndex,
 } from './gomoku-engine';
 import { getForbiddenReason } from './gomoku-rules';
+import { searchGomokuMove } from './gomoku-ai';
+import { searchOthelloMove } from './othello-ai';
+import { AiWorkerPool } from './engine/ai-worker-pool';
 import {
   ALKKAGI_AI_BUDGET_MS,
   ALKKAGI_BOARD_SIZE,
@@ -147,6 +150,8 @@ const ALKKAGI_TURN_LIMIT_MS = 10_000;
 const OTHELLO_TURN_LIMIT_MS = 20_000;
 const FORTRESS_TURN_LIMIT_MS = 20_000;
 const LOCAL_AI_RESPONSE_DELAY_MS = 180;
+// hard AI 예산이 이 값 이상이면 워커 스레드에서 실행(이벤트 루프 비차단), 미만이면 동기 실행(테스트/소예산).
+const AI_WORKER_MIN_BUDGET_MS = 400;
 const MIGHTY_AI_RESPONSE_DELAY_MS = 1_500;
 const SEOTDA_AI_RESPONSE_DELAY_MS = 1_200;
 const SEOTDA_TURN_LIMIT_MS = 30_000;
@@ -289,6 +294,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   private readonly emoteCooldowns = new Map<string, number>();
   private readonly gameRegistry = GAME_REGISTRY;
   private gcTimer?: ReturnType<typeof setInterval>;
+  private aiWorkerPool?: AiWorkerPool;
 
   constructor(
     private readonly db: DatabaseService,
@@ -6434,6 +6440,57 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     this.emitSessionEvent(saved, 'game.turn.network_waiting', fortressClientSession(saved));
   }
 
+  // hard AI 워커 풀(지연 초기화). 풀 크기는 구조적 값이라 최초 사용 시 1회 판독한다.
+  private getAiWorkerPool(): AiWorkerPool {
+    if (!this.aiWorkerPool) {
+      this.aiWorkerPool = new AiWorkerPool(Math.max(1, intEnv('GAME_AI_WORKER_POOL_SIZE', 2)));
+    }
+    return this.aiWorkerPool;
+  }
+
+  // hard 탐색 예산(ms). 원칙 7 — 호출 시점에 env 를 읽어 테스트가 소예산으로 오버라이드할 수 있게 한다.
+  private aiBudgetMs(game: 'othello' | 'gomoku'): number {
+    const key = game === 'othello' ? 'OTHELLO_AI_BUDGET_MS' : 'GOMOKU_AI_BUDGET_MS';
+    return Math.max(1, intEnv(key, 25_000));
+  }
+
+  // 오목 hard 착수. 예산이 크면 워커에서(이벤트 루프 비차단), 작으면 동기로 신 엔진을 실행한다.
+  // 워커 스폰/직렬화 실패 시 동기 구 엔진으로 강등한다(가용성 우선).
+  private async computeHardGomokuMove(session: GomokuSession): Promise<{ row: number; col: number } | undefined> {
+    const budgetMs = this.aiBudgetMs('gomoku');
+    const board = session.board;
+    const turn = session.currentTurn;
+    if (budgetMs >= AI_WORKER_MIN_BUDGET_MS) {
+      try {
+        const result = await this.getAiWorkerPool().run({ game: 'gomoku', board, turn, aiColor: turn, budgetMs });
+        if (result.move) return result.move;
+      } catch (error) {
+        console.warn('gomoku hard AI worker failed; falling back to the sync engine', error);
+      }
+      return chooseGomokuAiMove(session, 'hard', Date.now() + GOMOKU_AI_BUDGET_MS);
+    }
+    const result = searchGomokuMove(board, turn, budgetMs);
+    return result.move ?? chooseGomokuAiMove(session, 'hard', Date.now() + GOMOKU_AI_BUDGET_MS);
+  }
+
+  // 오델로 hard 착수. 오목과 동일한 워커/동기/폴백 전략.
+  private async computeHardOthelloMove(session: OthelloSession): Promise<{ row: number; col: number } | undefined> {
+    const budgetMs = this.aiBudgetMs('othello');
+    const board = session.board;
+    const turn = session.currentTurn;
+    if (budgetMs >= AI_WORKER_MIN_BUDGET_MS) {
+      try {
+        const result = await this.getAiWorkerPool().run({ game: 'othello', board, turn, aiColor: turn, budgetMs });
+        if (result.move) return result.move;
+      } catch (error) {
+        console.warn('othello hard AI worker failed; falling back to the sync engine', error);
+      }
+      return chooseOthelloAiMove(session);
+    }
+    const result = searchOthelloMove(board, turn, budgetMs);
+    return result.move ?? chooseOthelloAiMove(session);
+  }
+
   private scheduleLocalGomokuAiTurn(id: string): void {
     setTimeout(() => {
       void this.runLocalGomokuAiTurn(id).catch((error) => {
@@ -6448,8 +6505,12 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (session.mode !== 'local_ai' || session.status !== 'playing' || !isLocalAiAccount(session.players[session.currentTurn])) {
       return;
     }
-    const deadline = Date.now() + GOMOKU_AI_BUDGET_MS;
-    const move = chooseGomokuAiMove(session, session.aiDifficulty ?? 'medium', deadline) ?? randomGomokuMove(session.board);
+    const difficulty = session.aiDifficulty ?? 'medium';
+    const chosen =
+      difficulty === 'hard'
+        ? await this.computeHardGomokuMove(session)
+        : chooseGomokuAiMove(session, difficulty, Date.now() + GOMOKU_AI_BUDGET_MS);
+    const move = chosen ?? randomGomokuMove(session.board);
     if (!move) {
       session.status = 'finished';
       session.finishReason = 'draw';
@@ -6478,7 +6539,8 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (session.mode !== 'local_ai' || session.status !== 'playing' || !isLocalAiAccount(session.players[session.currentTurn])) {
       return;
     }
-    const move = chooseOthelloAiMove(session);
+    const difficulty = session.aiDifficulty ?? 'medium';
+    const move = difficulty === 'hard' ? await this.computeHardOthelloMove(session) : chooseOthelloAiMove(session);
     if (!move) {
       const next = oppositeOthello(session.currentTurn);
       if (othelloLegalMoves(session.board, next).length === 0) {
