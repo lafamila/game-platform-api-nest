@@ -16,6 +16,10 @@ import { SocialService } from './social/social.service';
 import { DiagnosticsController } from './diagnostics/diagnostics.controller';
 import { DiagnosticsService } from './diagnostics/diagnostics.service';
 import { AppVersionController } from './app-version.controller';
+import { SuperadminGuard } from './auth/superadmin.guard';
+import { ReplayController } from './replay/replay.controller';
+import { ReplayViewController } from './replay/replay-view.controller';
+import { ReplayService } from './replay/replay.service';
 
 @Module({
   controllers: [
@@ -26,18 +30,22 @@ import { AppVersionController } from './app-version.controller';
     SocialController,
     DiagnosticsController,
     RealtimeController,
+    ReplayController,
+    ReplayViewController,
   ],
   providers: [
     DatabaseService,
     AuthService,
     GamePlatformSessionService,
     GamePlatformSessionGuard,
+    SuperadminGuard,
     GamesService,
     SocialService,
     DiagnosticsService,
     RealtimeService,
     RealtimeGateway,
     PresenceService,
+    ReplayService,
   ],
 })
 export class AppModule {}
