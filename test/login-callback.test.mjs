@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { buildReturnLinks } from '../dist/auth/session.controller.js';
 import { GamePlatformSessionService } from '../dist/auth/session.service.js';
 
 const account = {
@@ -26,6 +27,17 @@ test('reuses a completed login transaction when the auth callback is repeated', 
   assert.equal(result.loginTransactionId, 'login-1');
   assert.equal(result.redirectUri, 'gameplatform://auth/callback?loginTransactionId=login-1&status=success');
   assert.equal(result.session?.id, 'session-1');
+});
+
+test('android login callback targets the app application id', () => {
+  const links = buildReturnLinks(
+    'gameplatform://auth/callback?loginTransactionId=login-1&status=success',
+  );
+
+  assert.equal(
+    links.androidIntentUri,
+    'intent://auth/callback?loginTransactionId=login-1&status=success#Intent;scheme=gameplatform;package=xyz.lafamila.game;end',
+  );
 });
 
 class FakeAuth {}

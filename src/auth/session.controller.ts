@@ -213,12 +213,12 @@ function appRedirectHtml(
 </html>`;
 }
 
-function buildReturnLinks(redirectUri: string): { customUri: string; androidIntentUri: string } {
+export function buildReturnLinks(redirectUri: string): { customUri: string; androidIntentUri: string } {
   const parsed = new URL(redirectUri);
   const androidIntentPath = `${parsed.host}${parsed.pathname}${parsed.search}${parsed.hash}`;
   return {
     customUri: redirectUri,
-    androidIntentUri: `intent://${androidIntentPath}#Intent;scheme=${parsed.protocol.replace(':', '')};package=com.example.game_platform_app_flutter;end`,
+    androidIntentUri: `intent://${androidIntentPath}#Intent;scheme=${parsed.protocol.replace(':', '')};package=xyz.lafamila.game;end`,
   };
 }
 
