@@ -1,5 +1,7 @@
 ---
-status: PREPARED
+status: COMPLETED
+completed_at: 2026-07-15
+completion_reason: "Work Items 0–6 전부 구현·검증 완료 — 커밋 88efcdc(moveHistory 로깅)·e537447(superadmin 리플레이 API+/replay 뷰)·a4a4c0a(docs), 325/325 테스트, 라이브 SQL·가드 검증(합성 데이터, 정리됨). 조사 결과: 쿠키 세션(game_platform_session) 기존 경로 재사용 성공, 엔진의 기존 moves[]는 pass 미기록이라 별도 moveHistory 신설. 잔여 수동 게이트: 브라우저 OIDC 왕복 + 재생 UI 체감 (재현 절차 계획서 기록)"
 summary: "오목·오델로 리플레이 전체 구현 — moveHistory 로깅(pass 포함), superadmin 전용 리플레이 API(목록/수순+스냅샷/유저 검색), 브라우저 쿠키 세션 확인·보강, /replay vanilla 웹 뷰(원본 템포 재생+30초 클램프+일시정지/재개)"
 ---
 
