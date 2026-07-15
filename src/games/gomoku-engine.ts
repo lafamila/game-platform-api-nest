@@ -1,10 +1,18 @@
 import { BadRequestException } from '@nestjs/common';
 import { GameAction, GameEngine, SeatInfo } from './engine/game-engine';
 import { Difficulty, GameMode, GomokuSession, PlayerColor } from './games.types';
+import { ForbiddenReason, getForbiddenReason, isExactFive } from './gomoku-rules';
 
 export const GOMOKU_SIZE = 15;
 export const GOMOKU_AI_BUDGET_MS = 900;
 export const GOMOKU_STATE_VERSION = 1;
+
+// Flutter 가 부분매칭하는 계약 문구 — 절대 변경 금지.
+export const GOMOKU_FORBIDDEN_MESSAGES: Record<ForbiddenReason, string> = {
+  'double-three': 'forbidden move for black: double-three (삼삼)',
+  'double-four': 'forbidden move for black: double-four (사사)',
+  overline: 'forbidden move for black: overline (장목)',
+};
 
 export interface GomokuAiMove {
   row: number;
@@ -110,9 +118,15 @@ export function applyGomokuMove(
     throw new BadRequestException('cell is already occupied');
   }
   const color = session.currentTurn;
+  if (color === 'black') {
+    const reason = getForbiddenReason(session.board, row, col);
+    if (reason) {
+      throw new BadRequestException(GOMOKU_FORBIDDEN_MESSAGES[reason]);
+    }
+  }
   session.board[row][col] = color;
   session.moves.push({ row, col, color, accountId, createdAt: new Date().toISOString(), source });
-  if (hasFive(session.board, row, col, color)) {
+  if (isExactFive(session.board, row, col, color)) {
     session.status = 'finished';
     session.winner = color;
     session.finishReason = source === 'timeout' ? 'timeout_random_win' : undefined;
@@ -125,34 +139,6 @@ export function applyGomokuMove(
   session.updatedAt = new Date().toISOString();
 }
 
-export function hasFive(board: (PlayerColor | null)[][], row: number, col: number, color: PlayerColor): boolean {
-  const directions = [
-    [1, 0],
-    [0, 1],
-    [1, 1],
-    [1, -1],
-  ];
-  return directions.some(([dr, dc]) => 1 + count(board, row, col, dr, dc, color) + count(board, row, col, -dr, -dc, color) >= 5);
-}
-
-function count(board: (PlayerColor | null)[][], row: number, col: number, dr: number, dc: number, color: PlayerColor): number {
-  let total = 0;
-  let currentRow = row + dr;
-  let currentCol = col + dc;
-  while (
-    currentRow >= 0 &&
-    currentRow < GOMOKU_SIZE &&
-    currentCol >= 0 &&
-    currentCol < GOMOKU_SIZE &&
-    board[currentRow][currentCol] === color
-  ) {
-    total += 1;
-    currentRow += dr;
-    currentCol += dc;
-  }
-  return total;
-}
-
 export function chooseGomokuAiMove(
   session: GomokuSession,
   difficulty: Difficulty,
@@ -161,14 +147,16 @@ export function chooseGomokuAiMove(
   const ai = session.currentTurn;
   const opponent = oppositeGomokuColor(ai);
   const winNow = findImmediateGomokuMove(session.board, ai);
-  if (winNow) return winNow;
-  if (Date.now() >= deadlineMs) return randomGomokuMove(session.board);
+  if (winNow) return winNow; // an exact five is never a forbidden move
+  if (Date.now() >= deadlineMs) return safeGomokuFallback(session.board, ai);
   const blockNow = findImmediateGomokuMove(session.board, opponent);
-  if (blockNow && (difficulty !== 'easy' || Math.random() < 0.7)) return blockNow;
-  if (Date.now() >= deadlineMs) return randomGomokuMove(session.board);
+  if (blockNow && isPlayableGomokuMove(session.board, ai, blockNow) && (difficulty !== 'easy' || Math.random() < 0.7)) {
+    return blockNow;
+  }
+  if (Date.now() >= deadlineMs) return safeGomokuFallback(session.board, ai);
 
-  const ranked = rankedGomokuCandidates(session.board, ai, difficulty);
-  if (ranked.length === 0) return undefined;
+  const ranked = filterPlayableGomokuMoves(session.board, ai, rankedGomokuCandidates(session.board, ai, difficulty));
+  if (ranked.length === 0) return safeGomokuFallback(session.board, ai);
   if (difficulty === 'easy') {
     const loosePool = ranked.slice(0, Math.min(ranked.length, 10));
     return loosePool[Math.floor(Math.random() * loosePool.length)];
@@ -181,7 +169,7 @@ export function chooseGomokuAiMove(
   for (const move of ranked.slice(0, limit)) {
     if (Date.now() >= deadlineMs) break;
     session.board[move.row][move.col] = ai;
-    const score = hasFive(session.board, move.row, move.col, ai)
+    const score = isExactFive(session.board, move.row, move.col, ai)
       ? 10_000_000
       : gomokuMinimax(session.board, opponent, ai, depth - 1, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY, deadlineMs);
     session.board[move.row][move.col] = null;
@@ -194,10 +182,33 @@ export function chooseGomokuAiMove(
     }
   }
   if (best.length === 0) {
-    return ranked[0] ?? randomGomokuMove(session.board);
+    return ranked[0] ?? safeGomokuFallback(session.board, ai);
   }
   const pool = difficulty === 'medium' ? best.slice(0, 3) : best;
   return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// 흑은 금수(삼삼·사사·장목)를 둘 수 없으므로 후보에서 배제한다. 백은 제약이 없어 그대로 통과.
+function isPlayableGomokuMove(board: (PlayerColor | null)[][], color: PlayerColor, move: GomokuAiMove): boolean {
+  return color !== 'black' || getForbiddenReason(board, move.row, move.col) === null;
+}
+
+function filterPlayableGomokuMoves(
+  board: (PlayerColor | null)[][],
+  color: PlayerColor,
+  moves: GomokuAiMove[],
+): GomokuAiMove[] {
+  return color === 'black' ? moves.filter((move) => isPlayableGomokuMove(board, color, move)) : moves;
+}
+
+// 예산 소진/후보 소진 시의 폴백. 흑이면 금수가 아닌 빈칸을 우선한다(백은 무제한 랜덤 — 기존 동작 동일).
+function safeGomokuFallback(board: (PlayerColor | null)[][], color: PlayerColor): GomokuAiMove | undefined {
+  const empty = availableGomokuCells(board);
+  if (empty.length === 0) return undefined;
+  const legal = color === 'black' ? empty.filter(([row, col]) => getForbiddenReason(board, row, col) === null) : empty;
+  const pool = legal.length > 0 ? legal : empty;
+  const [row, col] = pool[Math.floor(Math.random() * pool.length)];
+  return { row, col };
 }
 
 function gomokuMinimax(
@@ -222,7 +233,7 @@ function gomokuMinimax(
   for (const move of candidates) {
     if (Date.now() >= deadlineMs) break;
     board[move.row][move.col] = current;
-    const score = hasFive(board, move.row, move.col, current)
+    const score = isExactFive(board, move.row, move.col, current)
       ? (maximizing ? 10_000_000 + depth : -10_000_000 - depth)
       : gomokuMinimax(board, next, ai, depth - 1, alpha, beta, deadlineMs);
     board[move.row][move.col] = null;
@@ -251,9 +262,9 @@ function rankedGomokuCandidates(board: (PlayerColor | null)[][], color: PlayerCo
   return candidates
     .map((move) => {
       board[move.row][move.col] = color;
-      const attack = hasFive(board, move.row, move.col, color) ? 9_000_000 : evaluateGomokuBoard(board, color);
+      const attack = isExactFive(board, move.row, move.col, color) ? 9_000_000 : evaluateGomokuBoard(board, color);
       board[move.row][move.col] = opponent;
-      const defense = hasFive(board, move.row, move.col, opponent) ? 8_000_000 : evaluateGomokuBoard(board, opponent) * 0.82;
+      const defense = isExactFive(board, move.row, move.col, opponent) ? 8_000_000 : evaluateGomokuBoard(board, opponent) * 0.82;
       board[move.row][move.col] = null;
       const center = 7 - Math.abs(move.row - 7) - Math.abs(move.col - 7) * 0.08;
       return { ...move, score: attack + defense + center + Math.random() * (difficulty === 'easy' ? 900 : 4) };
@@ -291,7 +302,7 @@ function gomokuCandidateCells(board: (PlayerColor | null)[][], radius: number): 
 function findImmediateGomokuMove(board: (PlayerColor | null)[][], color: PlayerColor): GomokuAiMove | undefined {
   for (const move of gomokuCandidateCells(board, 1)) {
     board[move.row][move.col] = color;
-    const wins = hasFive(board, move.row, move.col, color);
+    const wins = isExactFive(board, move.row, move.col, color);
     board[move.row][move.col] = null;
     if (wins) return move;
   }
