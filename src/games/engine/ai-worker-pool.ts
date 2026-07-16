@@ -25,7 +25,14 @@ export class AiWorkerPool {
     try {
       const remainingMs = deadlineAt - Date.now();
       if (remainingMs <= 0) {
-        return { type: 'final', move: null, depth: 0, score: 0, nodes: 0 };
+        return {
+          type: 'final',
+          move: null,
+          depth: 0,
+          score: 0,
+          nodes: 0,
+          terminationReason: 'queue_timeout',
+        };
       }
       return await this.execute({
         ...request,
@@ -83,7 +90,10 @@ export class AiWorkerPool {
         reject(err instanceof Error ? err : new Error(String(err)));
       };
 
-      killTimer = setTimeout(() => finish(lastInterim), request.budgetMs);
+      killTimer = setTimeout(
+        () => finish({ ...lastInterim, terminationReason: 'worker_timeout' }),
+        request.budgetMs,
+      );
 
       worker.on('message', (msg: AiWorkerMessage) => {
         if (msg.type === 'interim') {

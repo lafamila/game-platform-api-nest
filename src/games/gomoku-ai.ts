@@ -20,9 +20,10 @@ const ROOT_PROFILE_LIMIT = 24;
 const VCF_MAX_DEPTH = 12;
 const VCT_MAX_DEPTH = 5;
 const MAX_FORCED_EXTENSIONS = 8;
-const ENGINE_VERSION = 'gomoku-hard-v2';
+export const GOMOKU_AI_ENGINE_VERSION = 'gomoku-hard-v2';
 const TIMEOUT = Symbol('gomoku-ai-timeout');
 const NODE_LIMIT = Symbol('gomoku-ai-node-limit');
+const WORKER_RETURN_MARGIN_MS = 5;
 
 interface ScoredMove extends AiWorkerMove {
   score: number;
@@ -45,6 +46,7 @@ type ExitReason = AiSearchDiagnostics['exitReason'];
 
 export interface GomokuSearchOptions {
   maxSearchNodes?: number;
+  deadlineAt?: number;
 }
 
 function opposite(color: PlayerColor): PlayerColor {
@@ -485,7 +487,7 @@ class GomokuSearch {
       score,
       nodes: metrics.searchNodes,
       diagnostics: {
-        engineVersion: ENGINE_VERSION,
+        engineVersion: GOMOKU_AI_ENGINE_VERSION,
         boardHash: this.initialBoardHash,
         budgetMs: this.budgetMs,
         elapsedMs: Date.now() - this.startedAt,
@@ -510,7 +512,11 @@ export function searchGomokuMove(
   onDepth?: AiDepthReporter,
   options?: GomokuSearchOptions,
 ): AiSearchResult {
-  const budgetMs = gomokuPhaseBudgetMs(board, configuredBudgetMs);
+  const phaseBudgetMs = gomokuPhaseBudgetMs(board, configuredBudgetMs);
+  const absoluteRemainingMs = options?.deadlineAt === undefined
+    ? phaseBudgetMs
+    : options.deadlineAt - Date.now() - WORKER_RETURN_MARGIN_MS;
+  const budgetMs = Math.max(0, Math.min(phaseBudgetMs, absoluteRemainingMs));
   const search = new GomokuSearch(board, budgetMs, options);
 
   if (search.position.stoneCount === 0) {
@@ -534,6 +540,10 @@ export function searchGomokuMove(
 
   const rootCandidates = search.candidates(turn, CANDIDATE_LIMIT, true);
   if (rootCandidates.length === 0) return search.result(null, 0, 0, 'no_legal_move');
+  // Publish a deterministic legal fallback before VCF/VCT. If tactical search
+  // consumes the worker deadline, the pool can still return a real candidate
+  // instead of forcing the service into a board-wide random fallback.
+  onDepth?.({ depth: 0, move: rootCandidates[0], score: 0 });
   let restrictedRoot: AiWorkerMove[] | undefined;
 
   try {

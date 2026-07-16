@@ -32,8 +32,10 @@ export interface AiSearchDiagnostics {
   forbiddenChecks: number;
   candidateGenerations: number;
   principalVariation: AiWorkerMove[];
-  exitReason: 'empty_board' | 'no_legal_move' | 'immediate_win' | 'forced_block' | 'vcf' | 'vct' | 'proven' | 'exact' | 'exact_timeout' | 'predicted_timeout' | 'node_limit' | 'timeout' | 'completed';
+  exitReason: 'empty_board' | 'no_legal_move' | 'immediate_win' | 'forced_block' | 'vcf' | 'vct' | 'proven' | 'exact' | 'exact_timeout' | 'predicted_timeout' | 'node_limit' | 'timeout' | 'completed' | AiWorkerTerminationReason | 'worker_error' | 'worker_no_move';
 }
+
+export type AiWorkerTerminationReason = 'queue_timeout' | 'worker_timeout';
 
 // 완료된 깊이마다 보고되는 잠정 최선수. 메인은 타임아웃 강제 종료 시 마지막 interim 을 사용한다.
 export interface AiWorkerInterim {
@@ -50,6 +52,7 @@ export interface AiWorkerFinal {
   score: number;
   nodes: number;
   diagnostics?: AiSearchDiagnostics;
+  terminationReason?: AiWorkerTerminationReason;
 }
 
 export type AiWorkerMessage = AiWorkerInterim | AiWorkerFinal;

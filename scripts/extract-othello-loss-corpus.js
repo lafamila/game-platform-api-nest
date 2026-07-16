@@ -2,7 +2,7 @@
 
 const { main } = require('./extract-ai-loss-corpus');
 
-main('gomoku').catch((error) => {
+main('othello').catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

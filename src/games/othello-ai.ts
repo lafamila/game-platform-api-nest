@@ -21,7 +21,7 @@ const OPPORTUNISTIC_EXACT_EMPTIES = 18;
 const TERMINAL_BASE = 1_000_000;
 const WIN_GUARD = 500_000;
 const MAX_SEARCH_PLIES = 128;
-const ENGINE_VERSION = 'othello-hard-v2';
+export const OTHELLO_AI_ENGINE_VERSION = 'othello-hard-v2';
 const TIMEOUT = Symbol('othello-ai-timeout');
 const NODE_LIMIT = Symbol('othello-ai-node-limit');
 const WORKER_RETURN_MARGIN_MS = 5;
@@ -758,7 +758,7 @@ class OthelloSearch {
       score,
       nodes: this.nodes,
       diagnostics: {
-        engineVersion: ENGINE_VERSION,
+        engineVersion: OTHELLO_AI_ENGINE_VERSION,
         boardHash: this.initialBoardHash,
         budgetMs: this.budgetMs,
         elapsedMs: Date.now() - this.startedAt,

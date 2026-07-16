@@ -112,10 +112,14 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
         score integer NOT NULL,
         principal_variation_json jsonb NOT NULL DEFAULT '[]'::jsonb,
         exit_reason text NOT NULL,
+        decision_source text NOT NULL DEFAULT 'search_final',
+        fallback_reason text NULL,
         created_at timestamptz NOT NULL DEFAULT now(),
         UNIQUE(session_id, ply, color)
       )
     `);
+    await this.query(`ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS decision_source text NOT NULL DEFAULT 'search_final'`);
+    await this.query(`ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS fallback_reason text NULL`);
     await this.query(`CREATE INDEX IF NOT EXISTS idx_ai_decisions_session ON ai_decisions(session_id, ply)`);
     await this.query(`CREATE INDEX IF NOT EXISTS idx_ai_decisions_game_created ON ai_decisions(game_key, created_at DESC)`);
 

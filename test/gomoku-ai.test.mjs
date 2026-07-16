@@ -146,6 +146,23 @@ test('gomoku phase budgets reserve short opening responses and full late-game ti
   assert.equal(gomokuPhaseBudgetMs(boardWith([[7, 7]]), 120), 120, 'tiny test budgets remain intact');
 });
 
+test('hard gomoku publishes a deterministic depth-zero fallback before tactical search', () => {
+  const board = boardWith([[7, 7], [6, 6]], [[7, 8], [8, 8]]);
+  const reports = [];
+  const result = searchGomokuMove(board, 'black', 25_000, (report) => reports.push(report), {
+    deadlineAt: Date.now() - 1,
+  });
+
+  assert.ok(result.move);
+  assert.equal(result.diagnostics.exitReason, 'timeout');
+  assert.equal(reports[0].depth, 0);
+  assert.deepEqual(result.move, reports[0].move);
+  assert.ok(
+    Math.abs(result.move.row - 7) <= 3 && Math.abs(result.move.col - 7) <= 3,
+    `deadline fallback must stay near the live position, got ${JSON.stringify(result.move)}`,
+  );
+});
+
 test('hard gomoku is deterministic under a fixed search-node cap', () => {
   const board = boardWith([[7, 7]]);
   const first = searchGomokuMove(board, 'white', 25_000, undefined, { maxSearchNodes: 5_000 });

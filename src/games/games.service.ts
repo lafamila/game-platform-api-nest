@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { BadRequestException, ForbiddenException, Injectable, ConflictException, NotFoundException, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
 import { intEnv } from '../config/env';
@@ -88,10 +88,14 @@ import {
   validateGomokuIndex,
 } from './gomoku-engine';
 import { getForbiddenReason } from './gomoku-rules';
-import { searchGomokuMove } from './gomoku-ai';
-import { searchOthelloMove } from './othello-ai';
+import { GOMOKU_AI_ENGINE_VERSION, searchGomokuMove } from './gomoku-ai';
+import { OTHELLO_AI_ENGINE_VERSION, searchOthelloMove } from './othello-ai';
 import { AiWorkerPool } from './engine/ai-worker-pool';
-import { AiSearchDiagnostics } from './engine/ai-worker-protocol';
+import {
+  AiSearchDiagnostics,
+  AiWorkerFinal,
+  AiWorkerTerminationReason,
+} from './engine/ai-worker-protocol';
 import {
   ALKKAGI_AI_BUDGET_MS,
   ALKKAGI_BOARD_SIZE,
@@ -155,6 +159,10 @@ const LOCAL_AI_INITIAL_RESPONSE_DELAY_MS =
   MATCH_READY_DELAY_MS + LOCAL_AI_RESPONSE_DELAY_MS;
 // hard AI 예산이 이 값 이상이면 워커 스레드에서 실행(이벤트 루프 비차단), 미만이면 동기 실행(테스트/소예산).
 const AI_WORKER_MIN_BUDGET_MS = 400;
+
+type AiDecisionGame = 'gomoku' | 'othello';
+type AiDecisionSource = 'search_final' | 'worker_interim' | 'deterministic_fallback';
+type AiFallbackReason = AiWorkerTerminationReason | 'worker_error' | 'worker_no_move';
 const MIGHTY_AI_RESPONSE_DELAY_MS = 1_500;
 const SEOTDA_AI_RESPONSE_DELAY_MS = 1_200;
 const SEOTDA_TURN_LIMIT_MS = 30_000;
@@ -6469,12 +6477,43 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return Math.max(1, intEnv(key, 25_000));
   }
 
-  private async recordGomokuAiDecision(
-    session: GomokuSession,
+  private aiFallbackDiagnostics(
+    gameKey: AiDecisionGame,
+    board: (PlayerColor | null)[][],
+    budgetMs: number,
+    startedAt: number,
+    result: Pick<AiWorkerFinal, 'move' | 'depth' | 'score' | 'nodes'>,
+    exitReason: AiSearchDiagnostics['exitReason'],
+  ): AiSearchDiagnostics {
+    const compactBoard = board
+      .map((row) => row.map((cell) => cell === 'black' ? 'b' : cell === 'white' ? 'w' : '.').join(''))
+      .join('/');
+    return {
+      engineVersion: gameKey === 'gomoku' ? GOMOKU_AI_ENGINE_VERSION : OTHELLO_AI_ENGINE_VERSION,
+      boardHash: `sha256:${createHash('sha256').update(`${gameKey}:${compactBoard}`).digest('hex').slice(0, 24)}`,
+      budgetMs,
+      elapsedMs: Math.max(0, Date.now() - startedAt),
+      completedDepth: result.depth,
+      searchNodes: result.nodes,
+      vcfNodes: 0,
+      vctNodes: 0,
+      evaluationCalls: 0,
+      forbiddenChecks: 0,
+      candidateGenerations: 0,
+      principalVariation: result.move ? [result.move] : [],
+      exitReason,
+    };
+  }
+
+  private async recordAiDecision(
+    session: GomokuSession | OthelloSession,
+    gameKey: AiDecisionGame,
     color: PlayerColor,
     move: { row: number; col: number } | null,
     score: number,
     diagnostics?: AiSearchDiagnostics,
+    decisionSource: AiDecisionSource = 'search_final',
+    fallbackReason: AiFallbackReason | null = null,
   ): Promise<void> {
     if (!diagnostics) return;
     const ply = session.moveHistory?.length ?? session.moves.length;
@@ -6485,14 +6524,16 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
            chosen_row, chosen_col, budget_ms, elapsed_ms, completed_depth,
            search_nodes, vcf_nodes, vct_nodes, evaluation_calls,
            forbidden_checks, candidate_generations, score,
-           principal_variation_json, exit_reason
+           principal_variation_json, exit_reason, decision_source,
+           fallback_reason
          ) VALUES (
-           $1::uuid, $2, 'gomoku', $3, $4, $5,
-           $6, $7, $8, $9, $10,
-           $11, $12, $13, $14,
-           $15, $16, $17, $18::jsonb, $19
+           $1::uuid, $2, $3, $4, $5, $6,
+           $7, $8, $9, $10, $11,
+           $12, $13, $14, $15,
+           $16, $17, $18, $19::jsonb, $20, $21, $22
          )
          ON CONFLICT (session_id, ply, color) DO UPDATE SET
+           game_key = EXCLUDED.game_key,
            engine_version = EXCLUDED.engine_version,
            board_hash = EXCLUDED.board_hash,
            chosen_row = EXCLUDED.chosen_row,
@@ -6508,10 +6549,13 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
            candidate_generations = EXCLUDED.candidate_generations,
            score = EXCLUDED.score,
            principal_variation_json = EXCLUDED.principal_variation_json,
-           exit_reason = EXCLUDED.exit_reason`,
+           exit_reason = EXCLUDED.exit_reason,
+           decision_source = EXCLUDED.decision_source,
+           fallback_reason = EXCLUDED.fallback_reason`,
         [
           session.id,
           ply,
+          gameKey,
           diagnostics.engineVersion,
           color,
           diagnostics.boardHash,
@@ -6529,55 +6573,133 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
           score,
           JSON.stringify(diagnostics.principalVariation),
           diagnostics.exitReason,
+          decisionSource,
+          fallbackReason,
         ],
       );
     } catch (error) {
-      console.warn('failed to record gomoku AI decision telemetry', error);
+      console.warn(`failed to record ${gameKey} AI decision telemetry`, error);
     }
   }
 
-  // 오목 hard 착수. 예산이 크면 워커에서(이벤트 루프 비차단), 작으면 동기로 신 엔진을 실행한다.
-  // 워커 스폰/직렬화 실패 시 동기 구 엔진으로 강등한다(가용성 우선).
+  // 오목 hard 착수. 예산이 크면 워커에서 실행하고, 워커가 결과를 내지 못하면
+  // 전역 랜덤 수 대신 동일 엔진의 결정론적 depth-zero 후보를 사용한다.
   private async computeHardGomokuMove(session: GomokuSession): Promise<{ row: number; col: number } | undefined> {
     const budgetMs = this.aiBudgetMs('gomoku');
+    const startedAt = Date.now();
     const deadlineAt = Date.now() + budgetMs;
     const board = session.board;
     const turn = session.currentTurn;
     if (budgetMs >= AI_WORKER_MIN_BUDGET_MS) {
       try {
         const result = await this.getAiWorkerPool().run({ game: 'gomoku', board, turn, aiColor: turn, budgetMs, deadlineAt });
+        if (result.diagnostics) {
+          await this.recordAiDecision(session, 'gomoku', turn, result.move, result.score, result.diagnostics);
+          return result.move ?? undefined;
+        }
         if (result.move) {
-          await this.recordGomokuAiDecision(session, turn, result.move, result.score, result.diagnostics);
+          const reason = result.terminationReason ?? 'worker_no_move';
+          const diagnostics = this.aiFallbackDiagnostics('gomoku', board, budgetMs, startedAt, result, reason);
+          await this.recordAiDecision(session, 'gomoku', turn, result.move, result.score, diagnostics, 'worker_interim', reason);
           return result.move;
         }
+        const reason = result.terminationReason ?? 'worker_no_move';
+        const fallback = searchGomokuMove(board, turn, 1);
+        const diagnostics: AiSearchDiagnostics = fallback.diagnostics
+          ? {
+              ...fallback.diagnostics,
+              budgetMs,
+              elapsedMs: Math.max(0, Date.now() - startedAt),
+              exitReason: reason,
+            }
+          : this.aiFallbackDiagnostics('gomoku', board, budgetMs, startedAt, fallback, reason);
+        await this.recordAiDecision(
+          session,
+          'gomoku',
+          turn,
+          fallback.move,
+          fallback.score,
+          diagnostics,
+          'deterministic_fallback',
+          reason,
+        );
+        return fallback.move ?? undefined;
       } catch (error) {
-        console.warn('gomoku hard AI worker failed; falling back to the sync engine', error);
+        console.warn('gomoku hard AI worker failed; using deterministic fallback', error);
+        const fallback = searchGomokuMove(board, turn, 1);
+        const diagnostics: AiSearchDiagnostics = fallback.diagnostics
+          ? {
+              ...fallback.diagnostics,
+              budgetMs,
+              elapsedMs: Math.max(0, Date.now() - startedAt),
+              exitReason: 'worker_error' as const,
+            }
+          : this.aiFallbackDiagnostics('gomoku', board, budgetMs, startedAt, fallback, 'worker_error');
+        await this.recordAiDecision(
+          session,
+          'gomoku',
+          turn,
+          fallback.move,
+          fallback.score,
+          diagnostics,
+          'deterministic_fallback',
+          'worker_error',
+        );
+        return fallback.move ?? undefined;
       }
-      const fallbackMs = Math.max(1, Math.min(GOMOKU_AI_BUDGET_MS, deadlineAt - Date.now()));
-      return chooseGomokuAiMove(session, 'hard', Date.now() + fallbackMs);
     }
     const result = searchGomokuMove(board, turn, budgetMs);
-    await this.recordGomokuAiDecision(session, turn, result.move, result.score, result.diagnostics);
-    return result.move ?? chooseGomokuAiMove(session, 'hard', Date.now() + GOMOKU_AI_BUDGET_MS);
+    await this.recordAiDecision(session, 'gomoku', turn, result.move, result.score, result.diagnostics);
+    return result.move ?? undefined;
   }
 
   // 오델로 hard 착수. 오목과 동일한 워커/동기/폴백 전략.
   private async computeHardOthelloMove(session: OthelloSession): Promise<{ row: number; col: number } | undefined> {
     const budgetMs = this.aiBudgetMs('othello');
+    const startedAt = Date.now();
     const deadlineAt = Date.now() + budgetMs;
     const board = session.board;
     const turn = session.currentTurn;
     if (budgetMs >= AI_WORKER_MIN_BUDGET_MS) {
       try {
         const result = await this.getAiWorkerPool().run({ game: 'othello', board, turn, aiColor: turn, budgetMs, deadlineAt });
-        if (result.move) return result.move;
+        if (result.diagnostics) {
+          await this.recordAiDecision(session, 'othello', turn, result.move, result.score, result.diagnostics);
+          return result.move ?? undefined;
+        }
+        if (result.move) {
+          const reason = result.terminationReason ?? 'worker_no_move';
+          const diagnostics = this.aiFallbackDiagnostics('othello', board, budgetMs, startedAt, result, reason);
+          await this.recordAiDecision(session, 'othello', turn, result.move, result.score, diagnostics, 'worker_interim', reason);
+          return result.move;
+        }
+        const reason = result.terminationReason ?? 'worker_no_move';
+        const move = chooseOthelloAiMove(session) ?? null;
+        const fallbackResult = { type: 'final' as const, move, depth: 0, score: 0, nodes: 0 };
+        const diagnostics = this.aiFallbackDiagnostics('othello', board, budgetMs, startedAt, fallbackResult, reason);
+        await this.recordAiDecision(session, 'othello', turn, move, 0, diagnostics, 'deterministic_fallback', reason);
+        return move ?? undefined;
       } catch (error) {
-        console.warn('othello hard AI worker failed; falling back to the sync engine', error);
+        console.warn('othello hard AI worker failed; using deterministic fallback', error);
+        const move = chooseOthelloAiMove(session) ?? null;
+        const fallbackResult = { type: 'final' as const, move, depth: 0, score: 0, nodes: 0 };
+        const diagnostics = this.aiFallbackDiagnostics('othello', board, budgetMs, startedAt, fallbackResult, 'worker_error');
+        await this.recordAiDecision(
+          session,
+          'othello',
+          turn,
+          move,
+          0,
+          diagnostics,
+          'deterministic_fallback',
+          'worker_error',
+        );
+        return move ?? undefined;
       }
-      return chooseOthelloAiMove(session);
     }
     const result = searchOthelloMove(board, turn, budgetMs);
-    return result.move ?? chooseOthelloAiMove(session);
+    await this.recordAiDecision(session, 'othello', turn, result.move, result.score, result.diagnostics);
+    return result.move ?? undefined;
   }
 
   private scheduleLocalGomokuAiTurn(

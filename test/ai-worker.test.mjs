@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { AiWorkerPool } from '../dist/games/engine/ai-worker-pool.js';
@@ -77,6 +78,7 @@ test('worker queue time is charged to the absolute request deadline', async () =
   await first;
   const result = await second;
   assert.equal(result.move, null, 'expired queued work must not start a fresh full-budget search');
+  assert.equal(result.terminationReason, 'queue_timeout');
   assert.ok(Date.now() - deadlineAt < 550, 'the queued request returned as soon as the occupied slot was released');
 });
 
@@ -96,6 +98,22 @@ test('an Othello worker search observes the forwarded absolute deadline', async 
   assert.ok(result.diagnostics, 'the search should return cleanly before the pool kills its worker');
   assert.ok(result.diagnostics.budgetMs < 1_200, 'worker startup and the absolute deadline reduce the engine budget');
   assert.ok(Date.now() - deadlineAt < 150, 'the worker returns at the absolute deadline rather than starting a fresh budget');
+});
+
+test('a killed worker returns its last interim with an explicit timeout reason', async () => {
+  const workerFile = fileURLToPath(new URL('./fixtures/slow-ai-worker.cjs', import.meta.url));
+  const pool = new AiWorkerPool(1, workerFile);
+  const result = await pool.run({
+    game: 'gomoku',
+    board: seededGomoku(),
+    turn: 'white',
+    aiColor: 'white',
+    budgetMs: 100,
+  });
+
+  assert.deepEqual(result.move, { row: 6, col: 7 });
+  assert.equal(result.depth, 0);
+  assert.equal(result.terminationReason, 'worker_timeout');
 });
 
 test('a worker spawn failure rejects so the caller can fall back to the sync engine', async () => {
