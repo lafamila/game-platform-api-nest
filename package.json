@@ -9,6 +9,7 @@
     "seed:local-auth": "node scripts/seed-local-auth.js",
     "smoke:local-flow": "node scripts/smoke-local-flow.js",
     "corpus:gomoku-hard-losses": "node scripts/extract-gomoku-loss-corpus.js",
+    "benchmark:othello-hard": "npm run build && node scripts/benchmark-othello-ai.js",
     "start": "node dist/main.js",
     "start:dev": "ts-node src/main.ts",
     "test": "npm run build && node --test test/*.test.mjs"

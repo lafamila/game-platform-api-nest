@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { searchOthelloMove } from '../dist/games/othello-ai.js';
+import { othelloPhaseBudgetMs, searchOthelloMove } from '../dist/games/othello-ai.js';
 import {
   applyOthelloMove,
   chooseOthelloAiMove,
@@ -30,6 +30,86 @@ function session(board, currentTurn = 'black') {
   };
 }
 
+function boardWithEmpties(count) {
+  const board = Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => 'black'));
+  for (let index = 0; index < count; index += 1) board[Math.floor(index / 8)][index % 8] = null;
+  return board;
+}
+
+const ORACLE_DIRECTIONS = [
+  [-1, -1], [-1, 0], [-1, 1],
+  [0, -1], [0, 1],
+  [1, -1], [1, 0], [1, 1],
+];
+
+function oracleMoves(board, color) {
+  const opponent = color === 'black' ? 'white' : 'black';
+  const moves = [];
+  for (let row = 0; row < 8; row += 1) {
+    for (let col = 0; col < 8; col += 1) {
+      if (board[row][col] !== null) continue;
+      const flips = [];
+      for (const [dr, dc] of ORACLE_DIRECTIONS) {
+        const line = [];
+        let r = row + dr;
+        let c = col + dc;
+        while (r >= 0 && r < 8 && c >= 0 && c < 8 && board[r][c] === opponent) {
+          line.push([r, c]);
+          r += dr;
+          c += dc;
+        }
+        if (line.length > 0 && r >= 0 && r < 8 && c >= 0 && c < 8 && board[r][c] === color) {
+          flips.push(...line);
+        }
+      }
+      if (flips.length > 0) moves.push({ row, col, flips });
+    }
+  }
+  return moves;
+}
+
+function oracleApply(board, color, move) {
+  const next = board.map((row) => [...row]);
+  next[move.row][move.col] = color;
+  for (const [row, col] of move.flips) next[row][col] = color;
+  return next;
+}
+
+function oracleSolve(board, color, memo = new Map()) {
+  const key = `${color}:${board.flat().map((cell) => cell?.[0] ?? '.').join('')}`;
+  const cached = memo.get(key);
+  if (cached) return cached;
+  const opponent = color === 'black' ? 'white' : 'black';
+  const moves = oracleMoves(board, color);
+  if (moves.length === 0) {
+    if (oracleMoves(board, opponent).length === 0) {
+      const discs = board.flat();
+      const score = discs.filter((cell) => cell === color).length - discs.filter((cell) => cell === opponent).length;
+      const result = { score, moves: [] };
+      memo.set(key, result);
+      return result;
+    }
+    const result = { score: -oracleSolve(board, opponent, memo).score, moves: [] };
+    memo.set(key, result);
+    return result;
+  }
+  let bestScore = Number.NEGATIVE_INFINITY;
+  const bestMoves = [];
+  for (const move of moves) {
+    const score = -oracleSolve(oracleApply(board, color, move), opponent, memo).score;
+    if (score > bestScore) {
+      bestScore = score;
+      bestMoves.length = 0;
+      bestMoves.push({ row: move.row, col: move.col });
+    } else if (score === bestScore) {
+      bestMoves.push({ row: move.row, col: move.col });
+    }
+  }
+  const result = { score: bestScore, moves: bestMoves };
+  memo.set(key, result);
+  return result;
+}
+
 // ---------------------------------------------------------------------------
 // tactics
 // ---------------------------------------------------------------------------
@@ -40,6 +120,58 @@ test('hard othello opens with a legal move and searches several plies', () => {
   const legal = [[2, 3], [3, 2], [4, 5], [5, 4]];
   assert.ok(legal.some(([r, c]) => res.move.row === r && res.move.col === c));
   assert.ok(res.depth >= 3, `expected a multi-ply search, got depth ${res.depth}`);
+});
+
+test('othello phase budget caps the opening through 50 empties and never increases a small budget', () => {
+  assert.equal(othelloPhaseBudgetMs(boardWithEmpties(60), 25_000), 3_000);
+  assert.equal(othelloPhaseBudgetMs(boardWithEmpties(50), 25_000), 3_000);
+  assert.equal(othelloPhaseBudgetMs(boardWithEmpties(49), 25_000), 25_000);
+  assert.equal(othelloPhaseBudgetMs(boardWithEmpties(60), 300), 300);
+});
+
+test('hard othello restores state and is deterministic when a node cap interrupts nested search', () => {
+  const board = initialOthelloBoard();
+  const original = structuredClone(board);
+  const runs = [];
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const reports = [];
+    const result = searchOthelloMove(
+      board,
+      'black',
+      10_000,
+      (report) => reports.push(report),
+      { maxSearchNodes: 5_000, exactMode: 'off' },
+    );
+    assert.equal(result.diagnostics.exitReason, 'node_limit');
+    assert.ok(result.move);
+    assert.ok(othelloLegalMoves(board, 'black').some((move) => move.row === result.move.row && move.col === result.move.col));
+    assert.deepEqual(board, original, 'search must not mutate the caller board');
+    runs.push({ move: result.move, depth: result.depth, score: result.score, nodes: result.nodes, reports });
+  }
+  assert.deepEqual(runs[1], runs[0]);
+});
+
+test('every completed-depth report is legal on the unchanged root board', () => {
+  const board = initialOthelloBoard();
+  const legal = new Set(othelloLegalMoves(board, 'black').map((move) => `${move.row},${move.col}`));
+  const reports = [];
+  searchOthelloMove(board, 'black', 10_000, (report) => reports.push(report), {
+    maxSearchNodes: 20_000,
+    exactMode: 'off',
+  });
+  assert.ok(reports.length > 0);
+  for (const report of reports) assert.ok(legal.has(`${report.move.row},${report.move.col}`));
+});
+
+test('an expired absolute deadline returns the legal depth-zero fallback without searching', () => {
+  const board = initialOthelloBoard();
+  const result = searchOthelloMove(board, 'black', 10_000, undefined, { deadlineAt: Date.now() - 1 });
+  assert.ok(result.move);
+  assert.equal(result.depth, 0);
+  assert.equal(result.nodes, 0);
+  assert.equal(result.diagnostics.budgetMs, 0);
+  assert.equal(result.diagnostics.exitReason, 'timeout');
+  assert.ok(othelloLegalMoves(board, 'black').some((move) => move.row === result.move.row && move.col === result.move.col));
 });
 
 test('hard othello prefers a dominant corner capture over an available X-square', () => {
@@ -90,6 +222,51 @@ test('hard othello solves a decided low-empty endgame as a win', () => {
   }
   const finalScore = othelloScore(state.board);
   assert.ok(finalScore.black > finalScore.white, `black should keep the win: ${JSON.stringify(finalScore)}`);
+});
+
+test('hard othello exact result matches an independent oracle', () => {
+  const board = [
+    [null, 'black', 'white', 'white', 'white', 'white', 'white', 'white'],
+    [null, 'white', 'white', 'white', 'black', 'black', 'black', 'black'],
+    ['white', 'white', 'white', 'white', 'white', 'white', 'black', null],
+    [null, 'black', 'black', 'white', 'white', 'white', 'black', 'black'],
+    ['black', 'black', 'black', 'white', 'white', 'black', 'black', 'black'],
+    [null, 'black', 'white', 'black', 'white', 'black', 'white', 'black'],
+    [null, 'white', 'black', 'black', 'black', 'white', null, 'black'],
+    ['white', null, 'white', 'black', 'black', 'black', 'black', 'black'],
+  ];
+  const oracle = oracleSolve(board, 'black');
+  const result = searchOthelloMove(board, 'black', 500);
+  assert.ok(result.move);
+  assert.ok(oracle.moves.some((move) => move.row === result.move.row && move.col === result.move.col));
+  const terminalDiscDifference = result.score > 500_000
+    ? result.score - 1_000_000
+    : result.score < -500_000
+      ? result.score + 1_000_000
+      : 0;
+  assert.equal(terminalDiscDifference, oracle.score);
+  assert.ok(['exact', 'proven'].includes(result.diagnostics.exitReason));
+});
+
+test('hard othello exact search handles an internal forced pass', () => {
+  const board = Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => 'black'));
+  board[0][1] = 'white';
+  board[0][2] = null;
+  board[7][1] = 'white';
+  board[7][2] = null;
+  const oracle = oracleSolve(board, 'black');
+  const result = searchOthelloMove(board, 'black', 500);
+  assert.ok(result.move);
+  assert.ok(oracle.moves.some((move) => move.row === result.move.row && move.col === result.move.col));
+  assert.equal(result.score - 1_000_000, oracle.score);
+  assert.equal(result.diagnostics.exitReason, 'exact');
+});
+
+test('hard othello returns null when the current color has no legal move', () => {
+  const board = Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => 'black'));
+  const result = searchOthelloMove(board, 'white', 1_000);
+  assert.equal(result.move, null);
+  assert.equal(result.diagnostics.exitReason, 'no_legal_move');
 });
 
 // ---------------------------------------------------------------------------

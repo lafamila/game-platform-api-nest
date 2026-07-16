@@ -19,8 +19,8 @@ test('a hard AI think runs off the main event loop (worker isolation)', async ()
   const pool = new AiWorkerPool(2);
   const budgetMs = 1200;
   const started = Date.now();
-  // Othello from the opening keeps deepening until the deadline, so it genuinely
-  // occupies its whole budget — a good stress for the isolation check.
+  // Othello performs a non-trivial search but may now return before the hard
+  // deadline when the next iterative-deepening layer is predicted not to finish.
   const runPromise = pool.run({
     game: 'othello',
     board: initialOthelloBoard(),
@@ -38,7 +38,7 @@ test('a hard AI think runs off the main event loop (worker isolation)', async ()
   const elapsed = Date.now() - started;
 
   assert.ok(result.move, 'worker produced a move');
-  assert.ok(elapsed >= 1000, `the search actually used its budget (elapsed ${elapsed}ms)`);
+  assert.ok(elapsed >= 100, `the worker performed a non-trivial search (elapsed ${elapsed}ms)`);
   assert.ok(
     timerLatency < 200,
     `main event loop stayed responsive during the worker think (timer latency ${timerLatency}ms)`,
@@ -78,6 +78,24 @@ test('worker queue time is charged to the absolute request deadline', async () =
   const result = await second;
   assert.equal(result.move, null, 'expired queued work must not start a fresh full-budget search');
   assert.ok(Date.now() - deadlineAt < 550, 'the queued request returned as soon as the occupied slot was released');
+});
+
+test('an Othello worker search observes the forwarded absolute deadline', async () => {
+  const pool = new AiWorkerPool(1);
+  const startedAt = Date.now();
+  const deadlineAt = startedAt + 800;
+  const result = await pool.run({
+    game: 'othello',
+    board: initialOthelloBoard(),
+    turn: 'black',
+    aiColor: 'black',
+    budgetMs: 1_200,
+    deadlineAt,
+  });
+  assert.ok(result.move, 'the depth-zero interim provides a legal deadline fallback');
+  assert.ok(result.diagnostics, 'the search should return cleanly before the pool kills its worker');
+  assert.ok(result.diagnostics.budgetMs < 1_200, 'worker startup and the absolute deadline reduce the engine budget');
+  assert.ok(Date.now() - deadlineAt < 150, 'the worker returns at the absolute deadline rather than starting a fresh budget');
 });
 
 test('a worker spawn failure rejects so the caller can fall back to the sync engine', async () => {

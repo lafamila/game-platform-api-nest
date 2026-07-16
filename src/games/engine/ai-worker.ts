@@ -21,7 +21,7 @@ port.on('message', (request: AiWorkerRequest) => {
 
   const result =
     request.game === 'othello'
-      ? searchOthelloMove(request.board, request.turn, request.budgetMs, onDepth)
+      ? searchOthelloMove(request.board, request.turn, request.budgetMs, onDepth, { deadlineAt: request.deadlineAt })
       : searchGomokuMove(request.board, request.turn, request.budgetMs, onDepth);
 
   const final: AiWorkerMessage = {
