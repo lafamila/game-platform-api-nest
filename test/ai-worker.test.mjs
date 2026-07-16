@@ -55,6 +55,31 @@ test('two concurrent worker jobs both complete on a pool of size 2', async () =>
   assert.ok(b.move);
 });
 
+test('worker queue time is charged to the absolute request deadline', async () => {
+  const pool = new AiWorkerPool(1);
+  const first = pool.run({
+    game: 'othello',
+    board: initialOthelloBoard(),
+    turn: 'black',
+    aiColor: 'black',
+    budgetMs: 500,
+  });
+  const deadlineAt = Date.now() + 100;
+  const second = pool.run({
+    game: 'gomoku',
+    board: seededGomoku(),
+    turn: 'white',
+    aiColor: 'white',
+    budgetMs: 500,
+    deadlineAt,
+  });
+
+  await first;
+  const result = await second;
+  assert.equal(result.move, null, 'expired queued work must not start a fresh full-budget search');
+  assert.ok(Date.now() - deadlineAt < 550, 'the queued request returned as soon as the occupied slot was released');
+});
+
 test('a worker spawn failure rejects so the caller can fall back to the sync engine', async () => {
   const badPool = new AiWorkerPool(2, '/nonexistent/path/ai-worker.js');
   await assert.rejects(

@@ -30,6 +30,7 @@ port.on('message', (request: AiWorkerRequest) => {
     depth: result.depth,
     score: result.score,
     nodes: result.nodes,
+    diagnostics: result.diagnostics,
   };
   port.postMessage(final);
 });

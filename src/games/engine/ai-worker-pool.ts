@@ -3,10 +3,9 @@ import * as path from 'node:path';
 import { AiWorkerFinal, AiWorkerMessage, AiWorkerRequest } from './ai-worker-protocol';
 
 // AI 워커 실행기 — 동시 실행을 상한(기본 2)으로 묶고 초과분은 FIFO 큐로 대기시킨다.
-// 코어 포화를 막고, 예산+2s 를 넘기면 워커를 강제 종료한 뒤 마지막 interim 최선수를 사용한다.
+// 코어 포화를 막고, 큐 대기부터 계산까지 하나의 절대 마감 안에서 처리한다.
 // 잡마다 워커를 새로 스폰해 상태 누수를 원천 차단한다(스폰 비용은 25초 예산 대비 무시 가능).
 
-const TERMINATE_SLACK_MS = 2_000;
 const DEFAULT_WORKER_FILE = path.join(__dirname, 'ai-worker.js');
 
 export class AiWorkerPool {
@@ -21,9 +20,18 @@ export class AiWorkerPool {
   // 검색을 워커에서 수행하고 final(또는 타임아웃 시 마지막 interim)을 반환한다.
   // 스폰/직렬화 실패 등은 reject → 호출부가 동기 구 엔진으로 강등한다.
   async run(request: AiWorkerRequest): Promise<AiWorkerFinal> {
+    const deadlineAt = request.deadlineAt ?? Date.now() + request.budgetMs;
     await this.acquire();
     try {
-      return await this.execute(request);
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        return { type: 'final', move: null, depth: 0, score: 0, nodes: 0 };
+      }
+      return await this.execute({
+        ...request,
+        budgetMs: Math.max(1, Math.min(request.budgetMs, remainingMs)),
+        deadlineAt,
+      });
     } finally {
       this.release();
     }
@@ -75,7 +83,7 @@ export class AiWorkerPool {
         reject(err instanceof Error ? err : new Error(String(err)));
       };
 
-      killTimer = setTimeout(() => finish(lastInterim), request.budgetMs + TERMINATE_SLACK_MS);
+      killTimer = setTimeout(() => finish(lastInterim), request.budgetMs);
 
       worker.on('message', (msg: AiWorkerMessage) => {
         if (msg.type === 'interim') {

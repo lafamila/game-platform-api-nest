@@ -91,6 +91,7 @@ import { getForbiddenReason } from './gomoku-rules';
 import { searchGomokuMove } from './gomoku-ai';
 import { searchOthelloMove } from './othello-ai';
 import { AiWorkerPool } from './engine/ai-worker-pool';
+import { AiSearchDiagnostics } from './engine/ai-worker-protocol';
 import {
   ALKKAGI_AI_BUDGET_MS,
   ALKKAGI_BOARD_SIZE,
@@ -6468,33 +6469,107 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     return Math.max(1, intEnv(key, 25_000));
   }
 
+  private async recordGomokuAiDecision(
+    session: GomokuSession,
+    color: PlayerColor,
+    move: { row: number; col: number } | null,
+    score: number,
+    diagnostics?: AiSearchDiagnostics,
+  ): Promise<void> {
+    if (!diagnostics) return;
+    const ply = session.moveHistory?.length ?? session.moves.length;
+    try {
+      await this.db.query(
+        `INSERT INTO ai_decisions (
+           session_id, ply, game_key, engine_version, color, board_hash,
+           chosen_row, chosen_col, budget_ms, elapsed_ms, completed_depth,
+           search_nodes, vcf_nodes, vct_nodes, evaluation_calls,
+           forbidden_checks, candidate_generations, score,
+           principal_variation_json, exit_reason
+         ) VALUES (
+           $1::uuid, $2, 'gomoku', $3, $4, $5,
+           $6, $7, $8, $9, $10,
+           $11, $12, $13, $14,
+           $15, $16, $17, $18::jsonb, $19
+         )
+         ON CONFLICT (session_id, ply, color) DO UPDATE SET
+           engine_version = EXCLUDED.engine_version,
+           board_hash = EXCLUDED.board_hash,
+           chosen_row = EXCLUDED.chosen_row,
+           chosen_col = EXCLUDED.chosen_col,
+           budget_ms = EXCLUDED.budget_ms,
+           elapsed_ms = EXCLUDED.elapsed_ms,
+           completed_depth = EXCLUDED.completed_depth,
+           search_nodes = EXCLUDED.search_nodes,
+           vcf_nodes = EXCLUDED.vcf_nodes,
+           vct_nodes = EXCLUDED.vct_nodes,
+           evaluation_calls = EXCLUDED.evaluation_calls,
+           forbidden_checks = EXCLUDED.forbidden_checks,
+           candidate_generations = EXCLUDED.candidate_generations,
+           score = EXCLUDED.score,
+           principal_variation_json = EXCLUDED.principal_variation_json,
+           exit_reason = EXCLUDED.exit_reason`,
+        [
+          session.id,
+          ply,
+          diagnostics.engineVersion,
+          color,
+          diagnostics.boardHash,
+          move?.row ?? null,
+          move?.col ?? null,
+          diagnostics.budgetMs,
+          diagnostics.elapsedMs,
+          diagnostics.completedDepth,
+          diagnostics.searchNodes,
+          diagnostics.vcfNodes,
+          diagnostics.vctNodes,
+          diagnostics.evaluationCalls,
+          diagnostics.forbiddenChecks,
+          diagnostics.candidateGenerations,
+          score,
+          JSON.stringify(diagnostics.principalVariation),
+          diagnostics.exitReason,
+        ],
+      );
+    } catch (error) {
+      console.warn('failed to record gomoku AI decision telemetry', error);
+    }
+  }
+
   // 오목 hard 착수. 예산이 크면 워커에서(이벤트 루프 비차단), 작으면 동기로 신 엔진을 실행한다.
   // 워커 스폰/직렬화 실패 시 동기 구 엔진으로 강등한다(가용성 우선).
   private async computeHardGomokuMove(session: GomokuSession): Promise<{ row: number; col: number } | undefined> {
     const budgetMs = this.aiBudgetMs('gomoku');
+    const deadlineAt = Date.now() + budgetMs;
     const board = session.board;
     const turn = session.currentTurn;
     if (budgetMs >= AI_WORKER_MIN_BUDGET_MS) {
       try {
-        const result = await this.getAiWorkerPool().run({ game: 'gomoku', board, turn, aiColor: turn, budgetMs });
-        if (result.move) return result.move;
+        const result = await this.getAiWorkerPool().run({ game: 'gomoku', board, turn, aiColor: turn, budgetMs, deadlineAt });
+        if (result.move) {
+          await this.recordGomokuAiDecision(session, turn, result.move, result.score, result.diagnostics);
+          return result.move;
+        }
       } catch (error) {
         console.warn('gomoku hard AI worker failed; falling back to the sync engine', error);
       }
-      return chooseGomokuAiMove(session, 'hard', Date.now() + GOMOKU_AI_BUDGET_MS);
+      const fallbackMs = Math.max(1, Math.min(GOMOKU_AI_BUDGET_MS, deadlineAt - Date.now()));
+      return chooseGomokuAiMove(session, 'hard', Date.now() + fallbackMs);
     }
     const result = searchGomokuMove(board, turn, budgetMs);
+    await this.recordGomokuAiDecision(session, turn, result.move, result.score, result.diagnostics);
     return result.move ?? chooseGomokuAiMove(session, 'hard', Date.now() + GOMOKU_AI_BUDGET_MS);
   }
 
   // 오델로 hard 착수. 오목과 동일한 워커/동기/폴백 전략.
   private async computeHardOthelloMove(session: OthelloSession): Promise<{ row: number; col: number } | undefined> {
     const budgetMs = this.aiBudgetMs('othello');
+    const deadlineAt = Date.now() + budgetMs;
     const board = session.board;
     const turn = session.currentTurn;
     if (budgetMs >= AI_WORKER_MIN_BUDGET_MS) {
       try {
-        const result = await this.getAiWorkerPool().run({ game: 'othello', board, turn, aiColor: turn, budgetMs });
+        const result = await this.getAiWorkerPool().run({ game: 'othello', board, turn, aiColor: turn, budgetMs, deadlineAt });
         if (result.move) return result.move;
       } catch (error) {
         console.warn('othello hard AI worker failed; falling back to the sync engine', error);

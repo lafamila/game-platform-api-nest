@@ -1,446 +1,605 @@
 import { PlayerColor } from './games.types';
-import { AiDepthReporter, AiSearchResult, AiWorkerMove } from './engine/ai-worker-protocol';
-import { TTEntry, Zobrist } from './engine/zobrist';
-import { countFours, countOpenThrees, getForbiddenReason, isExactFive } from './gomoku-rules';
+import {
+  AiDepthReporter,
+  AiSearchDiagnostics,
+  AiSearchResult,
+  AiWorkerMove,
+} from './engine/ai-worker-protocol';
+import { TTFlag } from './engine/zobrist';
+import {
+  GOMOKU_AI_SIZE,
+  GomokuAiBoard,
+  GomokuAiPosition,
+  GomokuThreatProfile,
+} from './gomoku-ai-position';
+import { countOpenThrees } from './gomoku-rules';
 
-// Gomoku hard 엔진 — 위협 우선 후보 + 반복 심화 알파베타 + Zobrist TT + VCF 확장.
-// 렌주 금수(흑) 를 탐색 전체에서 배제하고(자신·상대 시뮬 모두), 승리는 정확히 5(장목 비승리)로 판정한다.
-// 순수 모듈(부작용 없음). hard 전용이며 easy/medium 은 gomoku-engine 의 gomokuMinimax 를 계속 사용한다.
-// 입력 board 는 복제해서 사용하므로 변경하지 않는다.
-
-const SIZE = 15;
-const CELLS = SIZE * SIZE;
 const WIN = 10_000_000;
 const CANDIDATE_LIMIT = 16;
+const ROOT_PROFILE_LIMIT = 24;
 const VCF_MAX_DEPTH = 12;
+const VCT_MAX_DEPTH = 5;
+const MAX_FORCED_EXTENSIONS = 8;
+const ENGINE_VERSION = 'gomoku-hard-v2';
 const TIMEOUT = Symbol('gomoku-ai-timeout');
+const NODE_LIMIT = Symbol('gomoku-ai-node-limit');
 
-const DIRS: ReadonlyArray<readonly [number, number]> = [
-  [0, 1],
-  [1, 0],
-  [1, 1],
-  [1, -1],
-];
+interface ScoredMove extends AiWorkerMove {
+  score: number;
+}
 
-// opp-free 5칸 창의 자기 돌 수별 점수(가파른 가중 — 3·4 를 강하게 평가). 숫자 스캔이라 문자열보다 빠르다.
-const WINDOW_SCORE = [0, 2, 45, 600, 20_000, 1_000_000];
+interface GomokuTtEntry {
+  verifier: number;
+  depth: number;
+  score: number;
+  flag: TTFlag;
+  move: number;
+}
 
-type Board = (PlayerColor | null)[][];
+interface TacticalBudget {
+  remaining: number;
+  exhausted: boolean;
+}
+
+type ExitReason = AiSearchDiagnostics['exitReason'];
+
+export interface GomokuSearchOptions {
+  maxSearchNodes?: number;
+}
 
 function opposite(color: PlayerColor): PlayerColor {
   return color === 'black' ? 'white' : 'black';
 }
 
-function cloneBoard(board: Board): Board {
-  return board.map((row) => row.slice());
+function moveIndex(move: AiWorkerMove): number {
+  return move.row * GOMOKU_AI_SIZE + move.col;
 }
 
-function inBounds(r: number, c: number): boolean {
-  return r >= 0 && r < SIZE && c >= 0 && c < SIZE;
+function moveFromIndex(index: number): AiWorkerMove {
+  return { row: Math.floor(index / GOMOKU_AI_SIZE), col: index % GOMOKU_AI_SIZE };
 }
 
-interface Scored {
-  row: number;
-  col: number;
-  score: number;
+function sameMove(first: AiWorkerMove, second: AiWorkerMove): boolean {
+  return first.row === second.row && first.col === second.col;
+}
+
+function stoneCount(board: GomokuAiBoard): number {
+  let count = 0;
+  for (const row of board) for (const cell of row) if (cell) count += 1;
+  return count;
+}
+
+export function gomokuPhaseBudgetMs(board: GomokuAiBoard, configuredBudgetMs: number): number {
+  const safeBudget = Math.max(1, configuredBudgetMs);
+  if (safeBudget < 500) return safeBudget;
+  const stones = stoneCount(board);
+  if (stones <= 4) return Math.min(safeBudget, 3_000);
+  if (stones <= 8) return Math.min(safeBudget, 8_000);
+  return safeBudget;
+}
+
+function threatValue(profile: GomokuThreatProfile | null): number {
+  if (!profile) return 0;
+  if (profile.exactFive) return WIN;
+  if (profile.fours >= 2) return WIN / 2;
+  if (profile.fours >= 1 && profile.openThrees >= 1) return WIN / 2;
+  if (profile.openThrees >= 2) return WIN / 4;
+  return profile.fours * 16_000 + profile.openThrees * 1_800;
 }
 
 class GomokuSearch {
-  readonly board: Board;
-  readonly zob = new Zobrist(CELLS, 3);
-  readonly turnKey: bigint;
-  tt = new Map<bigint, TTEntry>();
-  hash = 0n;
-  nodes = 0;
-  deadline: number;
+  readonly position: GomokuAiPosition;
+  readonly tt = new Map<number, GomokuTtEntry>();
+  readonly startedAt = Date.now();
+  readonly deadline: number;
+  readonly budgetMs: number;
+  readonly initialBoardHash: string;
+  private readonly maxSearchNodes?: number;
 
-  constructor(board: Board, budgetMs: number) {
-    this.board = cloneBoard(board);
-    this.turnKey = this.zob.key(0, 2);
-    for (let r = 0; r < SIZE; r += 1) {
-      for (let c = 0; c < SIZE; c += 1) {
-        const cell = this.board[r][c];
-        if (cell) this.hash ^= this.zob.key(r * SIZE + c, cell === 'black' ? 0 : 1);
+  constructor(board: GomokuAiBoard, budgetMs: number, options?: GomokuSearchOptions) {
+    this.position = new GomokuAiPosition(board);
+    this.budgetMs = budgetMs;
+    this.deadline = this.startedAt + budgetMs;
+    this.initialBoardHash = this.position.boardHash();
+    this.maxSearchNodes = options?.maxSearchNodes;
+  }
+
+  private checkDeadline(force = false): void {
+    if (this.maxSearchNodes !== undefined && this.position.metrics.searchNodes >= this.maxSearchNodes) {
+      throw NODE_LIMIT;
+    }
+    if ((force || (this.position.metrics.searchNodes & 255) === 0) && Date.now() >= this.deadline) {
+      throw TIMEOUT;
+    }
+  }
+
+  remainingMs(): number {
+    return Math.max(0, this.deadline - Date.now());
+  }
+
+  private ttEntry(color: PlayerColor): GomokuTtEntry | undefined {
+    const [primary, verifier] = this.position.hash(color);
+    const entry = this.tt.get(primary);
+    return entry?.verifier === verifier ? entry : undefined;
+  }
+
+  private storeTt(color: PlayerColor, depth: number, score: number, flag: TTFlag, move: AiWorkerMove): void {
+    const [primary, verifier] = this.position.hash(color);
+    const existing = this.tt.get(primary);
+    if (!existing || existing.verifier !== verifier || existing.depth <= depth) {
+      this.tt.set(primary, { verifier, depth, score, flag, move: moveIndex(move) });
+    }
+  }
+
+  private validTtMove(color: PlayerColor, entry: GomokuTtEntry | undefined): AiWorkerMove | null {
+    if (!entry || entry.move < 0) return null;
+    const move = moveFromIndex(entry.move);
+    if (!this.position.isEmpty(move.row, move.col)) return null;
+    return this.position.isLegal(move.row, move.col, color) ? move : null;
+  }
+
+  candidates(color: PlayerColor, limit = CANDIDATE_LIMIT, precise = false): AiWorkerMove[] {
+    const opponent = opposite(color);
+    const scored: ScoredMove[] = this.position.candidateCells().map((move) => {
+      const attack = this.position.moveOrderingScore(move.row, move.col, color);
+      let defense = this.position.moveOrderingScore(move.row, move.col, opponent);
+      // Only tactical-looking black threats pay the full forbidden-rule cost.
+      // This keeps an illegal 3-3/4-4 from distorting defensive ordering without
+      // reintroducing a forbidden scan for every empty cell at every node.
+      if (opponent === 'black' && defense >= 2_500 && !this.position.isLegal(move.row, move.col, opponent)) {
+        defense = 0;
       }
-    }
-    this.deadline = Date.now() + budgetMs;
-  }
+      const center = 14 - Math.abs(move.row - 7) - Math.abs(move.col - 7);
+      return { ...move, score: attack + defense * 0.92 + center };
+    });
+    scored.sort((first, second) => second.score - first.score);
 
-  private mapKey(color: PlayerColor): bigint {
-    return color === 'white' ? this.hash ^ this.turnKey : this.hash;
-  }
-
-  private place(r: number, c: number, color: PlayerColor): void {
-    this.board[r][c] = color;
-    this.hash ^= this.zob.key(r * SIZE + c, color === 'black' ? 0 : 1);
-  }
-
-  private remove(r: number, c: number): void {
-    const color = this.board[r][c];
-    if (!color) return;
-    this.hash ^= this.zob.key(r * SIZE + c, color === 'black' ? 0 : 1);
-    this.board[r][c] = null;
-  }
-
-  private checkDeadline(): void {
-    if ((this.nodes & 1023) === 0 && Date.now() > this.deadline) throw TIMEOUT;
-  }
-
-  hasStones(): boolean {
-    for (let r = 0; r < SIZE; r += 1) {
-      for (let c = 0; c < SIZE; c += 1) if (this.board[r][c]) return true;
-    }
-    return false;
-  }
-
-  // 돌 주변 radius 이내의 빈칸.
-  private nearbyEmpties(radius: number): AiWorkerMove[] {
-    const seen = new Set<number>();
-    const cells: AiWorkerMove[] = [];
-    for (let r = 0; r < SIZE; r += 1) {
-      for (let c = 0; c < SIZE; c += 1) {
-        if (!this.board[r][c]) continue;
-        for (let dr = -radius; dr <= radius; dr += 1) {
-          for (let dc = -radius; dc <= radius; dc += 1) {
-            const nr = r + dr;
-            const nc = c + dc;
-            if (!inBounds(nr, nc) || this.board[nr][nc]) continue;
-            const idx = nr * SIZE + nc;
-            if (!seen.has(idx)) {
-              seen.add(idx);
-              cells.push({ row: nr, col: nc });
-            }
-          }
-        }
+    if (precise) {
+      for (const move of scored.slice(0, ROOT_PROFILE_LIMIT)) {
+        const attack = this.position.threatProfile(move.row, move.col, color);
+        const defense = this.position.threatProfile(move.row, move.col, opponent);
+        move.score += threatValue(attack) + threatValue(defense) * 0.95;
       }
+      scored.sort((first, second) => second.score - first.score);
     }
-    return cells;
-  }
 
-  private consec(r: number, c: number, dr: number, dc: number, color: PlayerColor): number {
-    let n = 0;
-    let nr = r + dr;
-    let nc = c + dc;
-    while (inBounds(nr, nc) && this.board[nr][nc] === color) {
-      n += 1;
-      nr += dr;
-      nc += dc;
+    // Lazy legality quota: illegal black moves do not consume one of the 16
+    // candidate slots. Continue down the ordered list until the quota is full.
+    const legal: AiWorkerMove[] = [];
+    for (const move of scored) {
+      if (!this.position.isLegal(move.row, move.col, color)) continue;
+      legal.push({ row: move.row, col: move.col });
+      if (legal.length >= limit) break;
     }
-    return n;
+    return legal;
   }
 
-  // (r,c) 에 color 를 두었을 때 만들어지는 국지 위협 점수(정렬용, 저비용). 돌은 이미 놓였다고 가정.
-  private localThreat(r: number, c: number, color: PlayerColor): number {
-    let value = 0;
-    for (const [dr, dc] of DIRS) {
-      const fwd = this.consec(r, c, dr, dc, color);
-      const bwd = this.consec(r, c, -dr, -dc, color);
-      const total = 1 + fwd + bwd;
-      const openF = inBounds(r + dr * (fwd + 1), c + dc * (fwd + 1)) && this.board[r + dr * (fwd + 1)][c + dc * (fwd + 1)] === null;
-      const openB = inBounds(r - dr * (bwd + 1), c - dc * (bwd + 1)) && this.board[r - dr * (bwd + 1)][c - dc * (bwd + 1)] === null;
-      const opens = (openF ? 1 : 0) + (openB ? 1 : 0);
-      if (total >= 5) value += 100_000;
-      else if (total === 4) value += opens === 2 ? 50_000 : opens === 1 ? 8_000 : 0;
-      else if (total === 3) value += opens === 2 ? 4_000 : opens === 1 ? 400 : 0;
-      else if (total === 2) value += opens === 2 ? 200 : opens === 1 ? 20 : 0;
-      else value += opens;
+  private withTtFirst(color: PlayerColor, moves: AiWorkerMove[]): AiWorkerMove[] {
+    const ttMove = this.validTtMove(color, this.ttEntry(color));
+    if (!ttMove || moves.some((move) => sameMove(move, ttMove))) {
+      return ttMove ? [ttMove, ...moves.filter((move) => !sameMove(move, ttMove))] : moves;
     }
-    return value;
+    return [ttMove, ...moves].slice(0, CANDIDATE_LIMIT);
   }
 
-  // 착수 (r,c,color) 의 공격 가치(빈칸 가정). 즉승/이중위협을 크게 친다.
-  private attackValue(r: number, c: number, color: PlayerColor): number {
-    this.place(r, c, color);
-    let value: number;
-    if (isExactFive(this.board, r, c, color)) {
-      value = WIN;
-    } else {
-      const fours = countFours(this.board, r, c, color);
-      const threes = countOpenThrees(this.board, r, c, color);
-      if (fours >= 2) value = WIN / 2; // 사사(이중 4)
-      else if (fours >= 1 && threes >= 1) value = WIN / 2; // 사삼
-      else if (threes >= 2) value = WIN / 4; // 삼삼(백 강수; 흑은 금수라 후보에서 배제됨)
-      else value = fours * 12_000 + threes * 1_200 + this.localThreat(r, c, color);
-    }
-    this.remove(r, c);
-    return value;
-  }
-
-  // 저비용 정렬 점수: 즉승 + 국지 연속 위협만(countFours/countOpenThrees 미사용 → 탐색 노드에서 빠름).
-  private orderScore(r: number, c: number, color: PlayerColor): number {
-    this.place(r, c, color);
-    const value = isExactFive(this.board, r, c, color) ? WIN : this.localThreat(r, c, color);
-    this.remove(r, c);
-    return value;
-  }
-
-  // 흑이면 금수 배제. 정렬은 공격 + 방어(상대가 그 자리에 두었을 때의 위협) 가중.
-  // precise=true(루트 전용)는 이중위협까지 보는 attackValue 로 정밀 정렬; 탐색 내부는 저비용 orderScore.
-  candidates(color: PlayerColor, limit: number, precise = false): AiWorkerMove[] {
-    const opp = opposite(color);
-    const cells = this.hasStones() ? this.nearbyEmpties(2) : [{ row: 7, col: 7 }];
-    const scored: Scored[] = [];
-    for (const cell of cells) {
-      if (color === 'black' && getForbiddenReason(this.board, cell.row, cell.col) !== null) continue;
-      const attack = precise ? this.attackValue(cell.row, cell.col, color) : this.orderScore(cell.row, cell.col, color);
-      const defense = precise ? this.attackValue(cell.row, cell.col, opp) : this.orderScore(cell.row, cell.col, opp);
-      const center = 14 - Math.abs(cell.row - 7) - Math.abs(cell.col - 7);
-      scored.push({ row: cell.row, col: cell.col, score: attack + defense * 0.9 + center });
-    }
-    scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, limit).map((s) => ({ row: s.row, col: s.col }));
-  }
-
-  // 한 색의 5칸 창 점수 합 + 이중위협 보너스(숫자 스캔, 빠름). 겹치는 창을 세어 자연히 열린 형태를 더 높게 친다.
-  // 이중위협(사사·사삼·삼삼)은 상대가 한 수로 다 막을 수 없어 사실상 승세 → 가산 합보다 훨씬 크게 친다.
-  private scoreColor(color: PlayerColor): number {
-    let score = 0;
-    let fours = 0;
-    let threes = 0;
-    for (const [dr, dc] of DIRS) {
-      for (let r = 0; r < SIZE; r += 1) {
-        for (let c = 0; c < SIZE; c += 1) {
-          const er = r + dr * 4;
-          const ec = c + dc * 4;
-          if (!inBounds(er, ec)) continue;
-          let self = 0;
-          let blocked = 0;
-          for (let k = 0; k < 5; k += 1) {
-            const cell = this.board[r + dr * k][c + dc * k];
-            if (cell === color) self += 1;
-            else if (cell !== null) blocked += 1;
-          }
-          if (blocked > 0 || self === 0) continue;
-          score += WINDOW_SCORE[self];
-          if (self === 4) fours += 1;
-          else if (self === 3) threes += 1;
-        }
-      }
-    }
-    if (fours >= 2 || (fours >= 1 && threes >= 1)) score += 90_000;
-    else if (threes >= 2) score += 40_000;
-    return score;
-  }
-
-  // color 관점 평가(대칭 — 네가맥스 일관성 유지). 상대 위협도 같은 척도로 평가해 자연스럽게 방어한다.
-  private evaluate(color: PlayerColor): number {
-    return this.scoreColor(color) - this.scoreColor(opposite(color));
-  }
-
-  private negamax(color: PlayerColor, depth: number, alphaIn: number, betaIn: number, ply: number): number {
-    this.nodes += 1;
+  private negamax(
+    color: PlayerColor,
+    depth: number,
+    alphaIn: number,
+    betaIn: number,
+    ply: number,
+    forcedExtensions: number,
+  ): number {
+    this.position.metrics.searchNodes += 1;
     this.checkDeadline();
+
     let alpha = alphaIn;
     let beta = betaIn;
-    const key = this.mapKey(color);
-    const entry = this.tt.get(key);
-    let ttMove = -1;
+    const entry = this.ttEntry(color);
     if (entry && entry.depth >= depth) {
       if (entry.flag === 'exact') return entry.score;
-      if (entry.flag === 'lower' && entry.score > alpha) alpha = entry.score;
-      else if (entry.flag === 'upper' && entry.score < beta) beta = entry.score;
+      if (entry.flag === 'lower') alpha = Math.max(alpha, entry.score);
+      else if (entry.flag === 'upper') beta = Math.min(beta, entry.score);
       if (alpha >= beta) return entry.score;
-      ttMove = entry.move;
-    } else if (entry) {
-      ttMove = entry.move;
     }
 
-    if (depth <= 0) return this.evaluate(color);
+    const ownWins = this.position.immediateWinningMoves(color);
+    if (ownWins.length > 0) return WIN - ply;
 
-    const opp = opposite(color);
-    let moves = this.candidates(color, CANDIDATE_LIMIT);
-    if (moves.length === 0) return this.evaluate(color); // 금수뿐이거나 둘 곳 없음
-    if (ttMove >= 0) {
-      const tr = Math.floor(ttMove / SIZE);
-      const tc = ttMove % SIZE;
-      moves = [{ row: tr, col: tc }, ...moves.filter((m) => m.row !== tr || m.col !== tc)];
-    }
+    const opponent = opposite(color);
+    const opponentWins = this.position.immediateWinningMoves(opponent);
+    const forced = opponentWins.length > 0;
+    if (!forced && depth <= 0) return this.position.evaluate(color);
+    if (opponentWins.length >= 2) return -WIN + ply;
 
+    let moves = forced
+      ? opponentWins.filter((move) => this.position.isLegal(move.row, move.col, color))
+      : this.candidates(color);
+    if (moves.length === 0) return forced ? -WIN + ply : this.position.evaluate(color);
+    moves = this.withTtFirst(color, moves);
+
+    const originalAlpha = alpha;
     let best = Number.NEGATIVE_INFINITY;
-    let bestMove = moves[0].row * SIZE + moves[0].col;
-    const origAlpha = alpha;
-    for (const m of moves) {
-      this.place(m.row, m.col, color);
+    let bestMove = moves[0];
+    for (const move of moves) {
+      this.position.makeMove(move.row, move.col, color);
       let score: number;
-      if (isExactFive(this.board, m.row, m.col, color)) {
-        score = WIN - ply;
-      } else {
-        score = -this.negamax(opp, depth - 1, -beta, -alpha, ply + 1);
+      try {
+        if (this.position.isExactFiveAt(move.row, move.col, color)) {
+          score = WIN - ply;
+        } else {
+          const extend = forced && forcedExtensions < MAX_FORCED_EXTENSIONS;
+          score = -this.negamax(
+            opponent,
+            extend ? depth : depth - 1,
+            -beta,
+            -alpha,
+            ply + 1,
+            extend ? forcedExtensions + 1 : forcedExtensions,
+          );
+        }
+      } finally {
+        this.position.unmakeMove(move.row, move.col);
       }
-      this.remove(m.row, m.col);
       if (score > best) {
         best = score;
-        bestMove = m.row * SIZE + m.col;
+        bestMove = move;
       }
-      if (best > alpha) alpha = best;
+      alpha = Math.max(alpha, best);
       if (alpha >= beta) break;
     }
-    const flag: TTEntry['flag'] = best <= origAlpha ? 'upper' : best >= beta ? 'lower' : 'exact';
-    this.tt.set(key, { depth, score: best, flag, move: bestMove });
+
+    const flag: TTFlag = best <= originalAlpha ? 'upper' : best >= betaIn ? 'lower' : 'exact';
+    this.storeTt(color, depth, best, flag, bestMove);
     return best;
   }
 
-  searchRoot(color: PlayerColor, depth: number): { move: AiWorkerMove | null; score: number } {
-    const opp = opposite(color);
-    let moves = this.candidates(color, CANDIDATE_LIMIT);
+  searchRoot(color: PlayerColor, depth: number, restrictedMoves?: AiWorkerMove[]): { move: AiWorkerMove | null; score: number } {
+    let moves = restrictedMoves?.length ? restrictedMoves.slice() : this.candidates(color);
+    moves = moves.filter((move) => this.position.isEmpty(move.row, move.col) && this.position.isLegal(move.row, move.col, color));
     if (moves.length === 0) return { move: null, score: 0 };
-    const ttMove = this.tt.get(this.mapKey(color))?.move ?? -1;
-    if (ttMove >= 0) {
-      const tr = Math.floor(ttMove / SIZE);
-      const tc = ttMove % SIZE;
-      moves = [{ row: tr, col: tc }, ...moves.filter((m) => m.row !== tr || m.col !== tc)];
-    }
-    let best = Number.NEGATIVE_INFINITY;
-    let bestMove = moves[0];
+    moves = this.withTtFirst(color, moves);
+
+    const opponent = opposite(color);
     let alpha = Number.NEGATIVE_INFINITY;
     const beta = Number.POSITIVE_INFINITY;
-    for (const m of moves) {
-      this.place(m.row, m.col, color);
+    let best = Number.NEGATIVE_INFINITY;
+    let bestMove = moves[0];
+    for (const move of moves) {
+      this.checkDeadline(true);
+      this.position.makeMove(move.row, move.col, color);
       let score: number;
-      if (isExactFive(this.board, m.row, m.col, color)) {
-        score = WIN - 1;
-      } else {
-        score = -this.negamax(opp, depth - 1, -beta, -alpha, 1);
+      try {
+        score = this.position.isExactFiveAt(move.row, move.col, color)
+          ? WIN - 1
+          : -this.negamax(opponent, depth - 1, -beta, -alpha, 1, 0);
+      } finally {
+        this.position.unmakeMove(move.row, move.col);
       }
-      this.remove(m.row, m.col);
       if (score > best) {
         best = score;
-        bestMove = m;
+        bestMove = move;
       }
-      if (best > alpha) alpha = best;
+      alpha = Math.max(alpha, best);
     }
-    this.tt.set(this.mapKey(color), { depth, score: best, flag: 'exact', move: bestMove.row * SIZE + bestMove.col });
+    this.storeTt(color, depth, best, 'exact', bestMove);
     return { move: bestMove, score: best };
   }
 
-  // color 가 즉시 정확 5를 만들 수 있는 빈칸들.
-  fivePoints(color: PlayerColor): AiWorkerMove[] {
-    const pts: AiWorkerMove[] = [];
-    for (const cell of this.nearbyEmpties(1)) {
-      this.place(cell.row, cell.col, color);
-      const win = isExactFive(this.board, cell.row, cell.col, color);
-      this.remove(cell.row, cell.col);
-      if (win) pts.push(cell);
+  private forcingMoves(color: PlayerColor, includeThrees: boolean, limit: number): AiWorkerMove[] {
+    const cells = this.position.candidateCells()
+      .map((move) => ({ ...move, score: this.position.moveOrderingScore(move.row, move.col, color) }))
+      .sort((first, second) => second.score - first.score)
+      .slice(0, Math.max(24, limit * 2));
+    const result: AiWorkerMove[] = [];
+    for (const move of cells) {
+      this.checkDeadline(true);
+      if (!this.position.isLegal(move.row, move.col, color)) continue;
+      this.position.makeMove(move.row, move.col, color);
+      let forcing = false;
+      try {
+        forcing =
+          this.position.isExactFiveAt(move.row, move.col, color) ||
+          this.position.immediateWinningMoves(color).length > 0 ||
+          (includeThrees && countOpenThrees(this.position.ruleBoard, move.row, move.col, color) > 0);
+      } finally {
+        this.position.unmakeMove(move.row, move.col);
+      }
+      if (forcing) result.push({ row: move.row, col: move.col });
+      if (result.length >= limit) break;
     }
-    return pts;
+    return result;
   }
 
-  // 4(오목 완성 위협)를 만드는 착수. 흑이면 금수 배제.
-  private fourMoves(color: PlayerColor): AiWorkerMove[] {
-    const moves: AiWorkerMove[] = [];
-    for (const cell of this.nearbyEmpties(1)) {
-      if (color === 'black' && getForbiddenReason(this.board, cell.row, cell.col) !== null) continue;
-      this.place(cell.row, cell.col, color);
-      const makesFive = isExactFive(this.board, cell.row, cell.col, color);
-      const fours = makesFive ? 0 : countFours(this.board, cell.row, cell.col, color);
-      this.remove(cell.row, cell.col);
-      if (makesFive || fours >= 1) moves.push(cell);
-    }
-    return moves;
-  }
-
-  // 연속 4 위협으로 강제 승리를 찾는다. 첫 수를 반환하거나 null.
   vcf(attacker: PlayerColor, depthLeft: number): AiWorkerMove | null {
+    this.position.metrics.vcfNodes += 1;
+    this.checkDeadline(true);
     if (depthLeft <= 0) return null;
-    this.checkDeadline();
     const defender = opposite(attacker);
-    for (const m of this.fourMoves(attacker)) {
-      this.place(m.row, m.col, attacker);
-      if (isExactFive(this.board, m.row, m.col, attacker)) {
-        this.remove(m.row, m.col);
-        return m;
+    const attackerWins = this.position.immediateWinningMoves(attacker);
+    if (attackerWins.length > 0) return attackerWins[0];
+    if (this.position.immediateWinningMoves(defender).length > 0) return null;
+
+    for (const move of this.forcingMoves(attacker, false, CANDIDATE_LIMIT)) {
+      this.position.makeMove(move.row, move.col, attacker);
+      let succeeds = false;
+      try {
+        if (this.position.isExactFiveAt(move.row, move.col, attacker)) return move;
+        const attackerPoints = this.position.immediateWinningMoves(attacker);
+        if (attackerPoints.length === 0) continue;
+        // Counter-win must be checked before treating a two-point four as forced.
+        if (this.position.immediateWinningMoves(defender).length > 0) continue;
+        if (attackerPoints.length >= 2) return move;
+
+        const block = attackerPoints[0];
+        if (!this.position.isLegal(block.row, block.col, defender)) return move;
+        this.position.makeMove(block.row, block.col, defender);
+        try {
+          if (!this.position.isExactFiveAt(block.row, block.col, defender)) {
+            succeeds = this.vcf(attacker, depthLeft - 1) !== null;
+          }
+        } finally {
+          this.position.unmakeMove(block.row, block.col);
+        }
+      } finally {
+        this.position.unmakeMove(move.row, move.col);
       }
-      const pts = this.fivePoints(attacker);
-      if (pts.length === 0) {
-        this.remove(m.row, m.col);
-        continue;
-      }
-      if (pts.length >= 2) {
-        // 열린 4 / 이중 4 — 상대가 모두 막을 수 없다.
-        this.remove(m.row, m.col);
-        return m;
-      }
-      const block = pts[0];
-      if (defender === 'black' && getForbiddenReason(this.board, block.row, block.col) !== null) {
-        // 수비수(흑)가 금수라 막을 수 없다 → 공격 성공.
-        this.remove(m.row, m.col);
-        return m;
-      }
-      this.place(block.row, block.col, defender);
-      const cont = this.vcf(attacker, depthLeft - 1);
-      this.remove(block.row, block.col);
-      this.remove(m.row, m.col);
-      if (cont) return m;
+      if (succeeds) return move;
     }
     return null;
+  }
+
+  private spendTacticalNode(budget: TacticalBudget): boolean {
+    if (budget.remaining <= 0) {
+      budget.exhausted = true;
+      return false;
+    }
+    budget.remaining -= 1;
+    this.position.metrics.vctNodes += 1;
+    this.checkDeadline(true);
+    return true;
+  }
+
+  private relevantVctReplies(attacker: PlayerColor, defender: PlayerColor): AiWorkerMove[] {
+    const replies = new Map<number, AiWorkerMove>();
+    const add = (move: AiWorkerMove) => replies.set(moveIndex(move), move);
+    // A relevant VCT defense must either occupy an attacker's next forcing
+    // point or create a forcing counter-threat. Quiet moves cannot refute a
+    // continuous-threat line and only multiply equivalent losing branches.
+    for (const move of this.forcingMoves(attacker, false, 10)) add(move);
+    for (const move of this.forcingMoves(defender, false, 8)) add(move);
+    return [...replies.values()].filter((move) => this.position.isLegal(move.row, move.col, defender));
+  }
+
+  vct(attacker: PlayerColor, depthLeft: number, budget: TacticalBudget): AiWorkerMove | null {
+    if (depthLeft <= 0 || !this.spendTacticalNode(budget)) return null;
+    const defender = opposite(attacker);
+    const attackerWins = this.position.immediateWinningMoves(attacker);
+    if (attackerWins.length > 0) return attackerWins[0];
+    if (this.position.immediateWinningMoves(defender).length > 0) return null;
+
+    for (const move of this.forcingMoves(attacker, true, 12)) {
+      this.position.makeMove(move.row, move.col, attacker);
+      let succeeds = false;
+      try {
+        if (this.position.isExactFiveAt(move.row, move.col, attacker)) return move;
+        if (this.position.immediateWinningMoves(defender).length > 0) continue;
+        const directWins = this.position.immediateWinningMoves(attacker);
+        if (directWins.length >= 2) return move;
+
+        const replies = directWins.length === 1
+          ? directWins.filter((reply) => this.position.isLegal(reply.row, reply.col, defender))
+          : this.relevantVctReplies(attacker, defender);
+        if (replies.length === 0) continue;
+
+        succeeds = true;
+        for (const reply of replies) {
+          if (!this.spendTacticalNode(budget)) {
+            succeeds = false;
+            break;
+          }
+          this.position.makeMove(reply.row, reply.col, defender);
+          let continues = false;
+          try {
+            continues =
+              !this.position.isExactFiveAt(reply.row, reply.col, defender) &&
+              this.vct(attacker, depthLeft - 1, budget) !== null;
+          } finally {
+            this.position.unmakeMove(reply.row, reply.col);
+          }
+          if (!continues) {
+            succeeds = false;
+            break;
+          }
+        }
+      } finally {
+        this.position.unmakeMove(move.row, move.col);
+      }
+      if (succeeds && !budget.exhausted) return move;
+    }
+    return null;
+  }
+
+  findVctDefenses(
+    defender: PlayerColor,
+    attacker: PlayerColor,
+    attackerFirst: AiWorkerMove,
+    depth: number,
+    budget: TacticalBudget,
+  ): AiWorkerMove[] {
+    const options = this.candidates(defender, CANDIDATE_LIMIT, true);
+    if (this.position.isLegal(attackerFirst.row, attackerFirst.col, defender) &&
+      !options.some((move) => sameMove(move, attackerFirst))) options.unshift(attackerFirst);
+    const defenses: AiWorkerMove[] = [];
+    for (const move of options) {
+      if (budget.exhausted) break;
+      this.position.makeMove(move.row, move.col, defender);
+      try {
+        if (this.position.isExactFiveAt(move.row, move.col, defender)) {
+          defenses.push(move);
+          continue;
+        }
+        const probe = this.vct(attacker, Math.max(1, depth - 1), budget);
+        if (!probe && !budget.exhausted) defenses.push(move);
+      } finally {
+        this.position.unmakeMove(move.row, move.col);
+      }
+    }
+    return defenses;
+  }
+
+  principalVariation(color: PlayerColor, maxDepth: number): AiWorkerMove[] {
+    const result: AiWorkerMove[] = [];
+    const made: AiWorkerMove[] = [];
+    let turn = color;
+    try {
+      for (let depth = 0; depth < maxDepth; depth += 1) {
+        const move = this.validTtMove(turn, this.ttEntry(turn));
+        if (!move) break;
+        result.push(move);
+        this.position.makeMove(move.row, move.col, turn);
+        made.push(move);
+        if (this.position.isExactFiveAt(move.row, move.col, turn)) break;
+        turn = opposite(turn);
+      }
+    } finally {
+      while (made.length > 0) {
+        const move = made.pop();
+        if (move) this.position.unmakeMove(move.row, move.col);
+      }
+    }
+    return result;
+  }
+
+  result(
+    move: AiWorkerMove | null,
+    depth: number,
+    score: number,
+    exitReason: ExitReason,
+    principalVariation?: AiWorkerMove[],
+  ): AiSearchResult {
+    const metrics = this.position.metrics;
+    return {
+      move,
+      depth,
+      score,
+      nodes: metrics.searchNodes,
+      diagnostics: {
+        engineVersion: ENGINE_VERSION,
+        boardHash: this.initialBoardHash,
+        budgetMs: this.budgetMs,
+        elapsedMs: Date.now() - this.startedAt,
+        completedDepth: depth,
+        searchNodes: metrics.searchNodes,
+        vcfNodes: metrics.vcfNodes,
+        vctNodes: metrics.vctNodes,
+        evaluationCalls: metrics.evaluationCalls,
+        forbiddenChecks: metrics.forbiddenChecks,
+        candidateGenerations: metrics.candidateGenerations,
+        principalVariation: principalVariation ?? (move ? [move] : []),
+        exitReason,
+      },
+    };
   }
 }
 
 export function searchGomokuMove(
-  board: Board,
+  board: GomokuAiBoard,
   turn: PlayerColor,
-  budgetMs: number,
+  configuredBudgetMs: number,
   onDepth?: AiDepthReporter,
+  options?: GomokuSearchOptions,
 ): AiSearchResult {
-  const search = new GomokuSearch(board, budgetMs);
-  const color = turn;
+  const budgetMs = gomokuPhaseBudgetMs(board, configuredBudgetMs);
+  const search = new GomokuSearch(board, budgetMs, options);
 
-  if (!search.hasStones()) {
-    onDepth?.({ depth: 1, move: { row: 7, col: 7 }, score: 0 });
-    return { move: { row: 7, col: 7 }, depth: 1, score: 0, nodes: 0 };
+  if (search.position.stoneCount === 0) {
+    const move = { row: 7, col: 7 };
+    onDepth?.({ depth: 1, move, score: 0 });
+    return search.result(move, 1, 0, 'empty_board');
   }
 
-  const rootCandidates = search.candidates(color, CANDIDATE_LIMIT, true);
-  if (rootCandidates.length === 0) {
-    return { move: null, depth: 0, score: 0, nodes: search.nodes };
+  const immediate = search.position.immediateWinningMoves(turn);
+  if (immediate.length > 0) {
+    onDepth?.({ depth: 1, move: immediate[0], score: WIN });
+    return search.result(immediate[0], 1, WIN, 'immediate_win');
   }
 
-  const opp = opposite(color);
-  const legalForMover = (m: AiWorkerMove) => color !== 'black' || getForbiddenReason(board, m.row, m.col) === null;
-
-  // 1) 즉승: 정확 5를 완성하는 수가 있으면 바로 둔다(깊이 무관 보장).
-  const myFives = search.fivePoints(color).filter(legalForMover);
-  if (myFives.length > 0) {
-    onDepth?.({ depth: 1, move: myFives[0], score: WIN });
-    return { move: myFives[0], depth: 1, score: WIN, nodes: search.nodes };
+  const opponent = opposite(turn);
+  const opponentWins = search.position.immediateWinningMoves(opponent);
+  if (opponentWins.length === 1 && search.position.isLegal(opponentWins[0].row, opponentWins[0].col, turn)) {
+    onDepth?.({ depth: 1, move: opponentWins[0], score: 0 });
+    return search.result(opponentWins[0], 1, 0, 'forced_block');
   }
 
-  // 2) VCF: 연속 4 강제 승리 수순.
+  const rootCandidates = search.candidates(turn, CANDIDATE_LIMIT, true);
+  if (rootCandidates.length === 0) return search.result(null, 0, 0, 'no_legal_move');
+  let restrictedRoot: AiWorkerMove[] | undefined;
+
   try {
-    const vcfMove = search.vcf(color, VCF_MAX_DEPTH);
+    const vcfMove = search.vcf(turn, VCF_MAX_DEPTH);
     if (vcfMove) {
       onDepth?.({ depth: VCF_MAX_DEPTH, move: vcfMove, score: WIN });
-      return { move: vcfMove, depth: VCF_MAX_DEPTH, score: WIN, nodes: search.nodes };
+      return search.result(vcfMove, VCF_MAX_DEPTH, WIN, 'vcf');
     }
-  } catch (err) {
-    if (err !== TIMEOUT) throw err;
+
+    if (budgetMs >= 700 && search.position.stoneCount >= 5 && search.remainingMs() >= 250) {
+      const ownVctBudget: TacticalBudget = { remaining: 3_500, exhausted: false };
+      const vctMove = search.vct(turn, VCT_MAX_DEPTH, ownVctBudget);
+      if (vctMove && !ownVctBudget.exhausted) {
+        onDepth?.({ depth: VCT_MAX_DEPTH, move: vctMove, score: WIN - 500 });
+        return search.result(vctMove, VCT_MAX_DEPTH, WIN - 500, 'vct');
+      }
+
+      const opponentVctBudget: TacticalBudget = { remaining: 2_000, exhausted: false };
+      const opponentVct = search.vct(opponent, VCT_MAX_DEPTH, opponentVctBudget);
+      if (opponentVct && !opponentVctBudget.exhausted && search.remainingMs() >= 200) {
+        const defenseBudget: TacticalBudget = { remaining: 2_500, exhausted: false };
+        const defenses = search.findVctDefenses(turn, opponent, opponentVct, VCT_MAX_DEPTH, defenseBudget);
+        if (defenses.length > 0 && !defenseBudget.exhausted) restrictedRoot = defenses;
+      }
+    }
+  } catch (error) {
+    if (error !== TIMEOUT && error !== NODE_LIMIT) throw error;
+    return search.result(rootCandidates[0], 0, 0, error === NODE_LIMIT ? 'node_limit' : 'timeout');
   }
 
-  // 3) 즉시 방어: 상대의 5 위협이 하나뿐이면 반드시 막는다(탐색 깊이에 의존하지 않는 필수 방어).
-  //    둘 이상이면 한 수로 다 못 막으므로 탐색이 최선의 발버둥을 고르게 둔다.
-  const oppFives = search.fivePoints(opp);
-  if (oppFives.length === 1 && legalForMover(oppFives[0])) {
-    onDepth?.({ depth: 1, move: oppFives[0], score: 0 });
-    return { move: oppFives[0], depth: 1, score: 0, nodes: search.nodes };
-  }
-
-  let best: { move: AiWorkerMove | null; score: number; depth: number } = {
-    move: rootCandidates[0],
-    score: 0,
-    depth: 0,
-  };
-
+  let best = { move: rootCandidates[0] as AiWorkerMove | null, score: 0, depth: 0 };
+  let previousDepthMs = 0;
+  let exitReason: ExitReason = 'completed';
   try {
     for (let depth = 1; depth <= 24; depth += 1) {
-      const res = search.searchRoot(color, depth);
-      if (res.move) best = { move: res.move, score: res.score, depth };
+      const depthStartedAt = Date.now();
+      const result = search.searchRoot(turn, depth, restrictedRoot);
+      const depthMs = Math.max(1, Date.now() - depthStartedAt);
+      if (result.move) best = { move: result.move, score: result.score, depth };
       onDepth?.({ depth, move: best.move, score: best.score });
-      if (Math.abs(best.score) >= WIN - 1000) break; // 승패 확정
-      if (Date.now() > search.deadline) break;
+      if (Math.abs(best.score) >= WIN - 1_000) {
+        exitReason = 'proven';
+        break;
+      }
+
+      if (depth >= 2) {
+        const measuredGrowth = previousDepthMs > 0 ? depthMs / previousDepthMs : 2.8;
+        const growth = Math.min(3.5, Math.max(1.8, measuredGrowth));
+        const expectedNextMs = Math.ceil(depthMs * growth * 1.12);
+        if (search.remainingMs() <= expectedNextMs) {
+          exitReason = 'predicted_timeout';
+          break;
+        }
+      }
+      previousDepthMs = depthMs;
     }
-  } catch (err) {
-    if (err !== TIMEOUT) throw err;
+  } catch (error) {
+    if (error !== TIMEOUT && error !== NODE_LIMIT) throw error;
+    exitReason = error === NODE_LIMIT ? 'node_limit' : 'timeout';
   }
 
-  return { move: best.move, depth: best.depth, score: best.score, nodes: search.nodes };
+  return search.result(
+    best.move,
+    best.depth,
+    best.score,
+    exitReason,
+    search.principalVariation(turn, best.depth),
+  );
 }

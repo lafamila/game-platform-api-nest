@@ -90,6 +90,36 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     await this.query(`CREATE INDEX IF NOT EXISTS idx_game_sessions_opponent ON game_sessions(opponent_account_id)`);
 
     await this.query(`
+      CREATE TABLE IF NOT EXISTS ai_decisions (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        session_id uuid NOT NULL REFERENCES game_sessions(id) ON DELETE CASCADE,
+        ply integer NOT NULL CHECK (ply >= 0),
+        game_key text NOT NULL,
+        engine_version text NOT NULL,
+        color text NOT NULL,
+        board_hash text NOT NULL,
+        chosen_row integer NULL,
+        chosen_col integer NULL,
+        budget_ms integer NOT NULL,
+        elapsed_ms integer NOT NULL,
+        completed_depth integer NOT NULL,
+        search_nodes integer NOT NULL,
+        vcf_nodes integer NOT NULL,
+        vct_nodes integer NOT NULL,
+        evaluation_calls integer NOT NULL,
+        forbidden_checks integer NOT NULL,
+        candidate_generations integer NOT NULL,
+        score integer NOT NULL,
+        principal_variation_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+        exit_reason text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        UNIQUE(session_id, ply, color)
+      )
+    `);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_ai_decisions_session ON ai_decisions(session_id, ply)`);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_ai_decisions_game_created ON ai_decisions(game_key, created_at DESC)`);
+
+    await this.query(`
       CREATE TABLE IF NOT EXISTS game_session_players (
         session_id uuid NOT NULL REFERENCES game_sessions(id) ON DELETE CASCADE,
         seat integer NOT NULL CHECK (seat >= 0),

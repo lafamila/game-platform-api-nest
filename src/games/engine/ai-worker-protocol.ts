@@ -10,11 +10,29 @@ export interface AiWorkerRequest {
   turn: AiCellColor; // 착수할 차례(= AI 가 두는 색)
   aiColor: AiCellColor; // 프로토콜 명세상 포함. 현재는 turn 과 동일.
   budgetMs: number;
+  // Submission-to-response absolute deadline. Pool queue time is charged to it.
+  deadlineAt?: number;
 }
 
 export interface AiWorkerMove {
   row: number;
   col: number;
+}
+
+export interface AiSearchDiagnostics {
+  engineVersion: string;
+  boardHash: string;
+  budgetMs: number;
+  elapsedMs: number;
+  completedDepth: number;
+  searchNodes: number;
+  vcfNodes: number;
+  vctNodes: number;
+  evaluationCalls: number;
+  forbiddenChecks: number;
+  candidateGenerations: number;
+  principalVariation: AiWorkerMove[];
+  exitReason: 'empty_board' | 'no_legal_move' | 'immediate_win' | 'forced_block' | 'vcf' | 'vct' | 'proven' | 'predicted_timeout' | 'node_limit' | 'timeout' | 'completed';
 }
 
 // 완료된 깊이마다 보고되는 잠정 최선수. 메인은 타임아웃 강제 종료 시 마지막 interim 을 사용한다.
@@ -31,6 +49,7 @@ export interface AiWorkerFinal {
   depth: number;
   score: number;
   nodes: number;
+  diagnostics?: AiSearchDiagnostics;
 }
 
 export type AiWorkerMessage = AiWorkerInterim | AiWorkerFinal;
@@ -43,4 +62,5 @@ export interface AiSearchResult {
   depth: number;
   score: number;
   nodes: number;
+  diagnostics?: AiSearchDiagnostics;
 }

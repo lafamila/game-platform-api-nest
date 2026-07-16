@@ -12,9 +12,35 @@ export class FakeDb {
   saves = [];
   customEmotes = [];
   localAiResults = [];
+  aiDecisions = [];
   nextId = 1;
 
   async query(sql, args = []) {
+    if (sql.includes('INSERT INTO ai_decisions')) {
+      const row = {
+        session_id: args[0],
+        ply: args[1],
+        engine_version: args[2],
+        color: args[3],
+        board_hash: args[4],
+        chosen_row: args[5],
+        chosen_col: args[6],
+        budget_ms: args[7],
+        elapsed_ms: args[8],
+        completed_depth: args[9],
+        search_nodes: args[10],
+        vcf_nodes: args[11],
+        vct_nodes: args[12],
+        evaluation_calls: args[13],
+        forbidden_checks: args[14],
+        candidate_generations: args[15],
+        score: args[16],
+        principal_variation_json: JSON.parse(args[17]),
+        exit_reason: args[18],
+      };
+      this.aiDecisions.push(row);
+      return { rows: [row] };
+    }
     if (sql.includes('INSERT INTO custom_emotes')) {
       const existingIndex = this.customEmotes.findIndex(
         (item) => item.account_id === args[0] && item.slot === args[1],
