@@ -24,7 +24,7 @@ export interface GomokuThreatProfile {
   exactFive: boolean;
   fours: number;
   openThrees: number;
-  score: number;
+  crossingThreats: number;
 }
 
 interface LineAnalysis {
@@ -523,15 +523,26 @@ export class GomokuAiPosition {
     return result;
   }
 
+  openThreeExtensionMoves(color: PlayerColor): Array<{ row: number; col: number }> {
+    const counts = this.openThreeCounts[codeOf(color)];
+    const result: Array<{ row: number; col: number }> = [];
+    for (let index = 0; index < CELL_COUNT; index += 1) {
+      if (counts[index] > 0 && this.cells[index] === EMPTY) {
+        result.push({ row: rowOf(index), col: colOf(index) });
+      }
+    }
+    return result;
+  }
+
   threatProfile(row: number, col: number, color: PlayerColor): GomokuThreatProfile | null {
     if (!this.isLegal(row, col, color)) return null;
     this.makeMove(row, col, color);
     const exactFive = isExactFive(this.ruleBoard, row, col, color);
     const fours = exactFive ? 0 : countFours(this.ruleBoard, row, col, color);
     const openThrees = exactFive ? 0 : countOpenThrees(this.ruleBoard, row, col, color);
-    const score = this.evaluate(color);
+    const crossingThreats = Math.max(0, fours + openThrees - 1);
     this.unmakeMove(row, col);
-    return { exactFive, fours, openThrees, score };
+    return { exactFive, fours, openThrees, crossingThreats };
   }
 
   private scoreFor(code: 1 | 2): number {
@@ -542,6 +553,7 @@ export class GomokuAiPosition {
     else if (winning === 1) score += 22_000;
     if (threes >= 2) score += 18_000 + threes * 2_500;
     else if (threes === 1) score += 2_000;
+    if (winning > 0 && threes > 0) score += 26_000;
     return score;
   }
 
@@ -596,6 +608,7 @@ export function evaluateGomokuBoardFull(board: GomokuAiBoard, color: PlayerColor
     else if (winning[code].size === 1) score += 22_000;
     if (threes[code].size >= 2) score += 18_000 + threes[code].size * 2_500;
     else if (threes[code].size === 1) score += 2_000;
+    if (winning[code].size > 0 && threes[code].size > 0) score += 26_000;
     return score;
   };
   const code = codeOf(color);

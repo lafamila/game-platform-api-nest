@@ -11,6 +11,8 @@
     "corpus:gomoku-hard-losses": "node scripts/extract-gomoku-loss-corpus.js",
     "corpus:othello-hard-losses": "node scripts/extract-othello-loss-corpus.js",
     "benchmark:othello-hard": "npm run build && node scripts/benchmark-othello-ai.js",
+    "benchmark:gomoku-hard": "npm run build && node scripts/benchmark-gomoku-ai.js",
+    "book:gomoku-hard": "npm run build && node scripts/generate-gomoku-opening-book.js",
     "start": "node dist/main.js",
     "start:dev": "ts-node src/main.ts",
     "test": "npm run build && node --test test/*.test.mjs"

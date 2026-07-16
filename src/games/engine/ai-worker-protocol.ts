@@ -32,7 +32,7 @@ export interface AiSearchDiagnostics {
   forbiddenChecks: number;
   candidateGenerations: number;
   principalVariation: AiWorkerMove[];
-  exitReason: 'empty_board' | 'no_legal_move' | 'immediate_win' | 'forced_block' | 'vcf' | 'vct' | 'proven' | 'exact' | 'exact_timeout' | 'predicted_timeout' | 'node_limit' | 'timeout' | 'completed' | AiWorkerTerminationReason | 'worker_error' | 'worker_no_move';
+  exitReason: 'empty_board' | 'opening_book' | 'no_legal_move' | 'immediate_win' | 'forced_block' | 'vcf' | 'vct' | 'proven' | 'exact' | 'exact_timeout' | 'predicted_timeout' | 'node_limit' | 'timeout' | 'completed' | AiWorkerTerminationReason | 'worker_error' | 'worker_no_move';
 }
 
 export type AiWorkerTerminationReason = 'queue_timeout' | 'worker_timeout';

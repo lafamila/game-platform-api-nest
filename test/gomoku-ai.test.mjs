@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { gomokuPhaseBudgetMs, searchGomokuMove } from '../dist/games/gomoku-ai.js';
+import { GOMOKU_TACTICAL_SCAN_FLOOR, gomokuPhaseBudgetMs, searchGomokuMove } from '../dist/games/gomoku-ai.js';
 import { GomokuAiPosition, evaluateGomokuBoardFull } from '../dist/games/gomoku-ai-position.js';
 import { applyGomokuMove, chooseGomokuAiMove, initialGomokuBoard } from '../dist/games/gomoku-engine.js';
 import { getForbiddenReason, isExactFive } from '../dist/games/gomoku-rules.js';
@@ -133,6 +133,35 @@ test('gomoku pattern evaluation distinguishes open, broken, and closed threes', 
   assert.ok(broken > closed, `broken three (${broken}) should outrank closed three (${closed})`);
 });
 
+test('cheap ordering conservatively includes canonical four and open-three threats', () => {
+  let seed = 0x51f15e;
+  const next = () => {
+    seed = (Math.imul(seed, 1_664_525) + 1_013_904_223) >>> 0;
+    return seed;
+  };
+  for (let sample = 0; sample < 30; sample += 1) {
+    const board = initialGomokuBoard();
+    const occupied = new Set();
+    for (let stone = 0; stone < 32; stone += 1) {
+      let index = next() % 225;
+      while (occupied.has(index)) index = (index + 1) % 225;
+      occupied.add(index);
+      board[Math.floor(index / 15)][index % 15] = stone % 2 === 0 ? 'black' : 'white';
+    }
+    const position = new GomokuAiPosition(board);
+    for (const color of ['black', 'white']) {
+      for (const move of position.candidateCells()) {
+        const profile = position.threatProfile(move.row, move.col, color);
+        if (!profile || (profile.fours === 0 && profile.openThrees === 0)) continue;
+        assert.ok(
+          position.moveOrderingScore(move.row, move.col, color) >= GOMOKU_TACTICAL_SCAN_FLOOR,
+          `tactical move fell below scan floor at ${sample}:${color}:${move.row},${move.col}`,
+        );
+      }
+    }
+  }
+});
+
 test('gomoku phase budgets reserve short opening responses and full late-game time', () => {
   assert.equal(gomokuPhaseBudgetMs(boardWith([[7, 7]]), 25_000), 3_000);
   assert.equal(gomokuPhaseBudgetMs(boardWith([[7, 7], [6, 6], [8, 8]], [[6, 7], [8, 7]]), 25_000), 8_000);
@@ -185,6 +214,15 @@ test('default opening budget returns within five seconds with diagnostics', () =
   assert.equal(result.diagnostics.completedDepth, result.depth);
   assert.equal(result.diagnostics.searchNodes, result.nodes);
   assert.ok(result.diagnostics.principalVariation.length > 0);
+});
+
+test('hard gomoku serves a legal opening-book move without search nodes', () => {
+  const board = boardWith([[7, 7]]);
+  const result = searchGomokuMove(board, 'white', 25_000);
+  assert.deepEqual(result.move, { row: 7, col: 6 });
+  assert.equal(result.diagnostics.exitReason, 'opening_book');
+  assert.equal(result.diagnostics.searchNodes, 0);
+  assert.equal(board[7][6], null, 'opening lookup must not mutate the board');
 });
 
 // ---------------------------------------------------------------------------
@@ -247,6 +285,17 @@ test('hard gomoku finds a forced win via an open four (VCF)', () => {
   );
 });
 
+test('hard gomoku proves a multi-node VCF line', () => {
+  const board = boardWith(
+    [[5, 1], [2, 3], [8, 2], [4, 13], [6, 5], [5, 6], [2, 12], [12, 12], [8, 3], [8, 10], [11, 6], [8, 7]],
+    [[8, 6], [5, 2], [9, 8], [5, 4], [4, 6], [13, 4], [2, 2], [11, 2], [1, 4], [6, 6], [4, 4], [1, 5]],
+  );
+  const result = searchGomokuMove(board, 'white', 700, undefined, { useOpeningBook: false });
+  assert.deepEqual(result.move, { row: 3, col: 4 });
+  assert.equal(result.diagnostics.exitReason, 'vcf');
+  assert.ok(result.diagnostics.vcfNodes > 1);
+});
+
 test('hard gomoku finds a bounded VCT win from independent open-three threats', () => {
   const board = boardWith(
     [[3, 3], [3, 10], [10, 3], [10, 10]],
@@ -276,6 +325,22 @@ test('hard gomoku blocks an opponent open three before it becomes a double threa
   assert.ok(res.move);
   const blocksEnd = res.move.row === 7 && (res.move.col === 4 || res.move.col === 8);
   assert.ok(blocksEnd, `expected a block at (7,4)/(7,8), got ${JSON.stringify(res.move)}`);
+});
+
+test('adaptive candidates retain a mandatory open-three defense among decoys', () => {
+  const board = boardWith(
+    [[2, 2], [2, 3], [2, 7], [2, 8], [2, 12], [3, 12], [6, 2], [6, 3], [10, 2], [11, 2], [10, 11], [10, 12], [12, 6], [12, 7], [12, 12], [13, 13]],
+    [[7, 5], [7, 6], [7, 7]],
+  );
+  const result = searchGomokuMove(board, 'black', 25_000, undefined, {
+    maxSearchNodes: 1_000,
+    useOpeningBook: false,
+  });
+  assert.ok(result.move);
+  assert.ok(
+    result.move.row === 7 && (result.move.col === 4 || result.move.col === 8),
+    `expected a mandatory block, got ${JSON.stringify(result.move)}`,
+  );
 });
 
 test('hard gomoku playing black never returns a forbidden move (search-level)', () => {

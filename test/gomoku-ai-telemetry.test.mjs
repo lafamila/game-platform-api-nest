@@ -36,7 +36,7 @@ test('hard gomoku persists best-effort decision telemetry before applying the mo
     assert.equal(db.aiDecisions[0].game_key, 'gomoku');
     assert.equal(db.aiDecisions[0].chosen_row, move.row);
     assert.equal(db.aiDecisions[0].chosen_col, move.col);
-    assert.equal(db.aiDecisions[0].engine_version, 'gomoku-hard-v2');
+    assert.equal(db.aiDecisions[0].engine_version, 'gomoku-hard-v3');
     assert.equal(db.aiDecisions[0].decision_source, 'search_final');
     assert.equal(db.aiDecisions[0].fallback_reason, null);
     assert.ok(db.aiDecisions[0].principal_variation_json.length > 0);

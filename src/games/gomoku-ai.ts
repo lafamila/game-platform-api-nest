@@ -5,6 +5,7 @@ import {
   AiSearchResult,
   AiWorkerMove,
 } from './engine/ai-worker-protocol';
+import { FixedTranspositionTable } from './engine/fixed-transposition-table';
 import { TTFlag } from './engine/zobrist';
 import {
   GOMOKU_AI_SIZE,
@@ -12,29 +13,34 @@ import {
   GomokuAiPosition,
   GomokuThreatProfile,
 } from './gomoku-ai-position';
-import { countOpenThrees } from './gomoku-rules';
+import { lookupGomokuOpeningMove } from './gomoku-opening-book';
 
 const WIN = 10_000_000;
-const CANDIDATE_LIMIT = 16;
-const ROOT_PROFILE_LIMIT = 24;
+const ROOT_QUIET_LIMIT = 28;
+const SHALLOW_QUIET_LIMIT = 14;
+const DEEP_QUIET_LIMIT = 10;
+// Canonical threat-profile property sampling keeps 360 as the lowest observed
+// open-three ordering score. Use a small margin while excluding quiet noise.
+export const GOMOKU_TACTICAL_SCAN_FLOOR = 350;
 const VCF_MAX_DEPTH = 12;
-const VCT_MAX_DEPTH = 5;
+const THREAT_MAX_DEPTH = 9;
 const MAX_FORCED_EXTENSIONS = 8;
-export const GOMOKU_AI_ENGINE_VERSION = 'gomoku-hard-v2';
+const MAX_SEARCH_PLIES = 64;
+const TT_POWER = 19;
+const THREAT_TT_POWER = 16;
+const ASPIRATION_INITIAL = 2_000;
+const PROOF_INFINITY = 1_000_000_000;
+const SHARED_SEARCH_TT = new FixedTranspositionTable(TT_POWER);
+const SHARED_THREAT_TT = new FixedTranspositionTable(THREAT_TT_POWER);
+export const GOMOKU_AI_ENGINE_VERSION = 'gomoku-hard-v3';
 const TIMEOUT = Symbol('gomoku-ai-timeout');
 const NODE_LIMIT = Symbol('gomoku-ai-node-limit');
 const WORKER_RETURN_MARGIN_MS = 5;
 
 interface ScoredMove extends AiWorkerMove {
   score: number;
-}
-
-interface GomokuTtEntry {
-  verifier: number;
-  depth: number;
-  score: number;
-  flag: TTFlag;
-  move: number;
+  tacticalScore: number;
+  mandatory: boolean;
 }
 
 interface TacticalBudget {
@@ -42,11 +48,18 @@ interface TacticalBudget {
   exhausted: boolean;
 }
 
+interface ThreatProof {
+  proof: number;
+  disproof: number;
+  move: AiWorkerMove | null;
+}
+
 type ExitReason = AiSearchDiagnostics['exitReason'];
 
 export interface GomokuSearchOptions {
   maxSearchNodes?: number;
   deadlineAt?: number;
+  useOpeningBook?: boolean;
 }
 
 function opposite(color: PlayerColor): PlayerColor {
@@ -83,19 +96,26 @@ export function gomokuPhaseBudgetMs(board: GomokuAiBoard, configuredBudgetMs: nu
 function threatValue(profile: GomokuThreatProfile | null): number {
   if (!profile) return 0;
   if (profile.exactFive) return WIN;
-  if (profile.fours >= 2) return WIN / 2;
-  if (profile.fours >= 1 && profile.openThrees >= 1) return WIN / 2;
+  if (profile.fours >= 2 || (profile.fours >= 1 && profile.openThrees >= 1)) return WIN / 2;
   if (profile.openThrees >= 2) return WIN / 4;
-  return profile.fours * 16_000 + profile.openThrees * 1_800;
+  return profile.fours * 16_000 + profile.openThrees * 1_800 + profile.crossingThreats * 900;
+}
+
+function saturatingAdd(first: number, second: number): number {
+  return Math.min(PROOF_INFINITY, first + second);
 }
 
 class GomokuSearch {
   readonly position: GomokuAiPosition;
-  readonly tt = new Map<number, GomokuTtEntry>();
   readonly startedAt = Date.now();
   readonly deadline: number;
   readonly budgetMs: number;
   readonly initialBoardHash: string;
+
+  private readonly tt = SHARED_SEARCH_TT;
+  private readonly threatTt = SHARED_THREAT_TT;
+  private readonly killers = new Int16Array(MAX_SEARCH_PLIES * 2);
+  private readonly history = new Int32Array(GOMOKU_AI_SIZE * GOMOKU_AI_SIZE * 2);
   private readonly maxSearchNodes?: number;
 
   constructor(board: GomokuAiBoard, budgetMs: number, options?: GomokuSearchOptions) {
@@ -104,6 +124,13 @@ class GomokuSearch {
     this.deadline = this.startedAt + budgetMs;
     this.initialBoardHash = this.position.boardHash();
     this.maxSearchNodes = options?.maxSearchNodes;
+    this.killers.fill(-1);
+    // Search is synchronous within each worker isolate, so these backing
+    // arrays can be reused without per-turn multi-megabyte allocations.
+    this.tt.clear();
+    this.threatTt.clear();
+    this.tt.beginGeneration();
+    this.threatTt.beginGeneration();
   }
 
   private checkDeadline(force = false): void {
@@ -119,69 +146,133 @@ class GomokuSearch {
     return Math.max(0, this.deadline - Date.now());
   }
 
-  private ttEntry(color: PlayerColor): GomokuTtEntry | undefined {
-    const [primary, verifier] = this.position.hash(color);
-    const entry = this.tt.get(primary);
-    return entry?.verifier === verifier ? entry : undefined;
-  }
-
-  private storeTt(color: PlayerColor, depth: number, score: number, flag: TTFlag, move: AiWorkerMove): void {
-    const [primary, verifier] = this.position.hash(color);
-    const existing = this.tt.get(primary);
-    if (!existing || existing.verifier !== verifier || existing.depth <= depth) {
-      this.tt.set(primary, { verifier, depth, score, flag, move: moveIndex(move) });
+  private probe(table: FixedTranspositionTable, color: PlayerColor, attacker?: PlayerColor): number {
+    let [primary, verifier] = this.position.hash(color);
+    if (attacker === 'white') {
+      primary = (primary ^ 0xa511e9b3) >>> 0;
+      verifier = (verifier ^ 0x63d83595) >>> 0;
     }
+    return table.probe(primary, verifier);
   }
 
-  private validTtMove(color: PlayerColor, entry: GomokuTtEntry | undefined): AiWorkerMove | null {
-    if (!entry || entry.move < 0) return null;
-    const move = moveFromIndex(entry.move);
+  private store(
+    table: FixedTranspositionTable,
+    color: PlayerColor,
+    depth: number,
+    score: number,
+    flag: TTFlag,
+    move: AiWorkerMove | null,
+    attacker?: PlayerColor,
+  ): void {
+    let [primary, verifier] = this.position.hash(color);
+    if (attacker === 'white') {
+      primary = (primary ^ 0xa511e9b3) >>> 0;
+      verifier = (verifier ^ 0x63d83595) >>> 0;
+    }
+    table.store(primary, verifier, depth, score, flag, move ? moveIndex(move) : -1);
+  }
+
+  private validTtMove(color: PlayerColor, slot: number): AiWorkerMove | null {
+    if (slot < 0) return null;
+    const index = this.tt.moveAt(slot);
+    if (index < 0) return null;
+    const move = moveFromIndex(index);
     if (!this.position.isEmpty(move.row, move.col)) return null;
     return this.position.isLegal(move.row, move.col, color) ? move : null;
   }
 
-  candidates(color: PlayerColor, limit = CANDIDATE_LIMIT, precise = false): AiWorkerMove[] {
+  private quietLimit(ply: number): number {
+    if (ply === 0) return ROOT_QUIET_LIMIT;
+    if (ply <= 2) return SHALLOW_QUIET_LIMIT;
+    return DEEP_QUIET_LIMIT;
+  }
+
+  private historyScore(color: PlayerColor, move: AiWorkerMove): number {
+    const offset = color === 'black' ? 0 : GOMOKU_AI_SIZE * GOMOKU_AI_SIZE;
+    return this.history[offset + moveIndex(move)];
+  }
+
+  private recordCutoff(color: PlayerColor, move: AiWorkerMove, depth: number, ply: number): void {
+    if (ply < MAX_SEARCH_PLIES) {
+      const index = moveIndex(move);
+      const first = ply * 2;
+      if (this.killers[first] !== index) {
+        this.killers[first + 1] = this.killers[first];
+        this.killers[first] = index;
+      }
+    }
+    const offset = color === 'black' ? 0 : GOMOKU_AI_SIZE * GOMOKU_AI_SIZE;
+    const slot = offset + moveIndex(move);
+    this.history[slot] += Math.max(1, depth * depth);
+    if (this.history[slot] > 1_000_000) {
+      for (let index = 0; index < this.history.length; index += 1) this.history[index] >>= 1;
+    }
+  }
+
+  candidates(color: PlayerColor, ply = 0, depth = 1, precise = false): AiWorkerMove[] {
     const opponent = opposite(color);
-    const scored: ScoredMove[] = this.position.candidateCells().map((move) => {
+    const cells = this.position.candidateCells();
+    const ownWins = new Set(this.position.immediateWinningMoves(color).map(moveIndex));
+    const opponentWins = new Set(this.position.immediateWinningMoves(opponent).map(moveIndex));
+    const scored: ScoredMove[] = cells.map((move) => {
       const attack = this.position.moveOrderingScore(move.row, move.col, color);
       let defense = this.position.moveOrderingScore(move.row, move.col, opponent);
-      // Only tactical-looking black threats pay the full forbidden-rule cost.
-      // This keeps an illegal 3-3/4-4 from distorting defensive ordering without
-      // reintroducing a forbidden scan for every empty cell at every node.
       if (opponent === 'black' && defense >= 2_500 && !this.position.isLegal(move.row, move.col, opponent)) {
         defense = 0;
       }
       const center = 14 - Math.abs(move.row - 7) - Math.abs(move.col - 7);
-      return { ...move, score: attack + defense * 0.92 + center };
+      const index = moveIndex(move);
+      const killerBase = Math.min(ply, MAX_SEARCH_PLIES - 1) * 2;
+      const killer = this.killers[killerBase] === index ? 45_000 : this.killers[killerBase + 1] === index ? 22_000 : 0;
+      return {
+        ...move,
+        score: attack + defense * 0.92 + center + killer + this.historyScore(color, move),
+        tacticalScore: Math.max(attack, defense),
+        mandatory: ownWins.has(index) || opponentWins.has(index),
+      };
     });
-    scored.sort((first, second) => second.score - first.score);
+    scored.sort((first, second) => second.score - first.score || moveIndex(first) - moveIndex(second));
 
-    if (precise) {
-      for (const move of scored.slice(0, ROOT_PROFILE_LIMIT)) {
-        const attack = this.position.threatProfile(move.row, move.col, color);
-        const defense = this.position.threatProfile(move.row, move.col, opponent);
-        move.score += threatValue(attack) + threatValue(defense) * 0.95;
+    const profileCount = Math.min(
+      scored.length,
+      precise ? 48 : Math.max(32, this.quietLimit(ply) * 2),
+    );
+    for (let index = 0; index < scored.length; index += 1) {
+      const move = scored[index];
+      if (!precise || index >= profileCount) {
+        // The cheap ordering score deliberately over-approximates tactical
+        // shapes. Deep nodes keep every such move without paying two full
+        // canonical forbidden/profile simulations per candidate.
+        move.mandatory ||= move.tacticalScore >= GOMOKU_TACTICAL_SCAN_FLOOR;
+        continue;
       }
-      scored.sort((first, second) => second.score - first.score);
+      const attack = this.position.threatProfile(move.row, move.col, color);
+      const defense = this.position.threatProfile(move.row, move.col, opponent);
+      const tactical = Boolean(
+        attack?.exactFive || attack?.fours || attack?.openThrees ||
+        defense?.exactFive || defense?.fours || defense?.openThrees,
+      );
+      move.mandatory ||= tactical;
+      move.score += threatValue(attack) + threatValue(defense) * 0.95;
     }
+    scored.sort((first, second) => second.score - first.score || moveIndex(first) - moveIndex(second));
 
-    // Lazy legality quota: illegal black moves do not consume one of the 16
-    // candidate slots. Continue down the ordered list until the quota is full.
     const legal: AiWorkerMove[] = [];
+    let quiet = 0;
+    const quietLimit = this.quietLimit(ply);
     for (const move of scored) {
       if (!this.position.isLegal(move.row, move.col, color)) continue;
+      if (!move.mandatory && quiet >= quietLimit) continue;
       legal.push({ row: move.row, col: move.col });
-      if (legal.length >= limit) break;
+      if (!move.mandatory) quiet += 1;
     }
     return legal;
   }
 
   private withTtFirst(color: PlayerColor, moves: AiWorkerMove[]): AiWorkerMove[] {
-    const ttMove = this.validTtMove(color, this.ttEntry(color));
-    if (!ttMove || moves.some((move) => sameMove(move, ttMove))) {
-      return ttMove ? [ttMove, ...moves.filter((move) => !sameMove(move, ttMove))] : moves;
-    }
-    return [ttMove, ...moves].slice(0, CANDIDATE_LIMIT);
+    const ttMove = this.validTtMove(color, this.probe(this.tt, color));
+    if (!ttMove) return moves;
+    return [ttMove, ...moves.filter((move) => !sameMove(move, ttMove))];
   }
 
   private negamax(
@@ -197,12 +288,14 @@ class GomokuSearch {
 
     let alpha = alphaIn;
     let beta = betaIn;
-    const entry = this.ttEntry(color);
-    if (entry && entry.depth >= depth) {
-      if (entry.flag === 'exact') return entry.score;
-      if (entry.flag === 'lower') alpha = Math.max(alpha, entry.score);
-      else if (entry.flag === 'upper') beta = Math.min(beta, entry.score);
-      if (alpha >= beta) return entry.score;
+    const slot = this.probe(this.tt, color);
+    if (slot >= 0 && this.tt.depthAt(slot) >= depth) {
+      const score = this.tt.scoreAt(slot);
+      const flag = this.tt.flagAt(slot);
+      if (flag === 'exact') return score;
+      if (flag === 'lower') alpha = Math.max(alpha, score);
+      if (flag === 'upper') beta = Math.min(beta, score);
+      if (alpha >= beta) return score;
     }
 
     const ownWins = this.position.immediateWinningMoves(color);
@@ -216,13 +309,15 @@ class GomokuSearch {
 
     let moves = forced
       ? opponentWins.filter((move) => this.position.isLegal(move.row, move.col, color))
-      : this.candidates(color);
+      : this.candidates(color, ply, depth);
     if (moves.length === 0) return forced ? -WIN + ply : this.position.evaluate(color);
     moves = this.withTtFirst(color, moves);
 
-    const originalAlpha = alpha;
+    const searchedAlpha = alpha;
+    const searchedBeta = beta;
     let best = Number.NEGATIVE_INFINITY;
     let bestMove = moves[0];
+    let firstMove = true;
     for (const move of moves) {
       this.position.makeMove(move.row, move.col, color);
       let score: number;
@@ -231,86 +326,132 @@ class GomokuSearch {
           score = WIN - ply;
         } else {
           const extend = forced && forcedExtensions < MAX_FORCED_EXTENSIONS;
-          score = -this.negamax(
-            opponent,
-            extend ? depth : depth - 1,
-            -beta,
-            -alpha,
-            ply + 1,
-            extend ? forcedExtensions + 1 : forcedExtensions,
-          );
+          const nextDepth = extend ? depth : depth - 1;
+          const nextExtensions = extend ? forcedExtensions + 1 : forcedExtensions;
+          if (firstMove) {
+            score = -this.negamax(opponent, nextDepth, -beta, -alpha, ply + 1, nextExtensions);
+          } else {
+            score = -this.negamax(opponent, nextDepth, -alpha - 1, -alpha, ply + 1, nextExtensions);
+            if (score > alpha && score < beta) {
+              score = -this.negamax(opponent, nextDepth, -beta, -alpha, ply + 1, nextExtensions);
+            }
+          }
         }
       } finally {
         this.position.unmakeMove(move.row, move.col);
       }
+      firstMove = false;
       if (score > best) {
         best = score;
         bestMove = move;
       }
-      alpha = Math.max(alpha, best);
-      if (alpha >= beta) break;
+      if (best > alpha) alpha = best;
+      if (alpha >= beta) {
+        this.recordCutoff(color, move, depth, ply);
+        break;
+      }
     }
 
-    const flag: TTFlag = best <= originalAlpha ? 'upper' : best >= betaIn ? 'lower' : 'exact';
-    this.storeTt(color, depth, best, flag, bestMove);
+    const flag: TTFlag = best <= searchedAlpha ? 'upper' : best >= searchedBeta ? 'lower' : 'exact';
+    this.store(this.tt, color, depth, best, flag, bestMove);
     return best;
   }
 
-  searchRoot(color: PlayerColor, depth: number, restrictedMoves?: AiWorkerMove[]): { move: AiWorkerMove | null; score: number } {
-    let moves = restrictedMoves?.length ? restrictedMoves.slice() : this.candidates(color);
+  searchRoot(
+    color: PlayerColor,
+    depth: number,
+    alphaIn = -WIN,
+    betaIn = WIN,
+    restrictedMoves?: AiWorkerMove[],
+  ): { move: AiWorkerMove | null; score: number } {
+    let moves = restrictedMoves?.length ? restrictedMoves.slice() : this.candidates(color, 0, depth, true);
     moves = moves.filter((move) => this.position.isEmpty(move.row, move.col) && this.position.isLegal(move.row, move.col, color));
     if (moves.length === 0) return { move: null, score: 0 };
     moves = this.withTtFirst(color, moves);
 
     const opponent = opposite(color);
-    let alpha = Number.NEGATIVE_INFINITY;
-    const beta = Number.POSITIVE_INFINITY;
+    let alpha = alphaIn;
     let best = Number.NEGATIVE_INFINITY;
     let bestMove = moves[0];
+    let firstMove = true;
     for (const move of moves) {
       this.checkDeadline(true);
       this.position.makeMove(move.row, move.col, color);
       let score: number;
       try {
-        score = this.position.isExactFiveAt(move.row, move.col, color)
-          ? WIN - 1
-          : -this.negamax(opponent, depth - 1, -beta, -alpha, 1, 0);
+        if (this.position.isExactFiveAt(move.row, move.col, color)) {
+          score = WIN - 1;
+        } else if (firstMove) {
+          score = -this.negamax(opponent, depth - 1, -betaIn, -alpha, 1, 0);
+        } else {
+          score = -this.negamax(opponent, depth - 1, -alpha - 1, -alpha, 1, 0);
+          if (score > alpha && score < betaIn) {
+            score = -this.negamax(opponent, depth - 1, -betaIn, -alpha, 1, 0);
+          }
+        }
       } finally {
         this.position.unmakeMove(move.row, move.col);
       }
+      firstMove = false;
       if (score > best) {
         best = score;
         bestMove = move;
       }
-      alpha = Math.max(alpha, best);
+      if (best > alpha) alpha = best;
+      if (alpha >= betaIn) {
+        this.recordCutoff(color, move, depth, 0);
+        break;
+      }
     }
-    this.storeTt(color, depth, best, 'exact', bestMove);
+    const flag: TTFlag = best <= alphaIn ? 'upper' : best >= betaIn ? 'lower' : 'exact';
+    this.store(this.tt, color, depth, best, flag, bestMove);
     return { move: bestMove, score: best };
+  }
+
+  searchRootAspiration(
+    color: PlayerColor,
+    depth: number,
+    previousScore: number,
+    restrictedMoves?: AiWorkerMove[],
+  ): { move: AiWorkerMove | null; score: number } {
+    if (depth <= 2 || Math.abs(previousScore) >= WIN - 10_000) {
+      return this.searchRoot(color, depth, -WIN, WIN, restrictedMoves);
+    }
+    let window = ASPIRATION_INITIAL;
+    while (window < WIN) {
+      const alpha = Math.max(-WIN, previousScore - window);
+      const beta = Math.min(WIN, previousScore + window);
+      const result = this.searchRoot(color, depth, alpha, beta, restrictedMoves);
+      if (result.score > alpha && result.score < beta) return result;
+      window = Math.min(WIN, window * 4);
+    }
+    return this.searchRoot(color, depth, -WIN, WIN, restrictedMoves);
   }
 
   private forcingMoves(color: PlayerColor, includeThrees: boolean, limit: number): AiWorkerMove[] {
     const cells = this.position.candidateCells()
       .map((move) => ({ ...move, score: this.position.moveOrderingScore(move.row, move.col, color) }))
-      .sort((first, second) => second.score - first.score)
-      .slice(0, Math.max(24, limit * 2));
-    const result: AiWorkerMove[] = [];
+      .sort((first, second) => second.score - first.score || moveIndex(first) - moveIndex(second));
+    const result: ScoredMove[] = [];
     for (const move of cells) {
+      // The numeric ordering score is a conservative prefilter: every exact
+      // five/four scores at least 2,800 and every open-three at least 4,500.
+      // Avoid canonical rule simulation for unrelated quiet cells.
+      if (move.score < (includeThrees ? GOMOKU_TACTICAL_SCAN_FLOOR : 2_500)) break;
       this.checkDeadline(true);
-      if (!this.position.isLegal(move.row, move.col, color)) continue;
-      this.position.makeMove(move.row, move.col, color);
-      let forcing = false;
-      try {
-        forcing =
-          this.position.isExactFiveAt(move.row, move.col, color) ||
-          this.position.immediateWinningMoves(color).length > 0 ||
-          (includeThrees && countOpenThrees(this.position.ruleBoard, move.row, move.col, color) > 0);
-      } finally {
-        this.position.unmakeMove(move.row, move.col);
+      const profile = this.position.threatProfile(move.row, move.col, color);
+      if (!profile) continue;
+      if (profile.exactFive || profile.fours > 0 || (includeThrees && profile.openThrees > 0)) {
+        result.push({
+          ...move,
+          score: threatValue(profile) + move.score,
+          tacticalScore: move.score,
+          mandatory: true,
+        });
       }
-      if (forcing) result.push({ row: move.row, col: move.col });
-      if (result.length >= limit) break;
     }
-    return result;
+    result.sort((first, second) => second.score - first.score || moveIndex(first) - moveIndex(second));
+    return result.slice(0, limit).map(({ row, col }) => ({ row, col }));
   }
 
   vcf(attacker: PlayerColor, depthLeft: number): AiWorkerMove | null {
@@ -322,14 +463,13 @@ class GomokuSearch {
     if (attackerWins.length > 0) return attackerWins[0];
     if (this.position.immediateWinningMoves(defender).length > 0) return null;
 
-    for (const move of this.forcingMoves(attacker, false, CANDIDATE_LIMIT)) {
+    for (const move of this.forcingMoves(attacker, false, GOMOKU_AI_SIZE * GOMOKU_AI_SIZE)) {
       this.position.makeMove(move.row, move.col, attacker);
       let succeeds = false;
       try {
         if (this.position.isExactFiveAt(move.row, move.col, attacker)) return move;
         const attackerPoints = this.position.immediateWinningMoves(attacker);
         if (attackerPoints.length === 0) continue;
-        // Counter-win must be checked before treating a two-point four as forced.
         if (this.position.immediateWinningMoves(defender).length > 0) continue;
         if (attackerPoints.length >= 2) return move;
 
@@ -362,74 +502,134 @@ class GomokuSearch {
     return true;
   }
 
-  private relevantVctReplies(attacker: PlayerColor, defender: PlayerColor): AiWorkerMove[] {
+  private exactThreatDefenses(attacker: PlayerColor, defender: PlayerColor): AiWorkerMove[] {
     const replies = new Map<number, AiWorkerMove>();
-    const add = (move: AiWorkerMove) => replies.set(moveIndex(move), move);
-    // A relevant VCT defense must either occupy an attacker's next forcing
-    // point or create a forcing counter-threat. Quiet moves cannot refute a
-    // continuous-threat line and only multiply equivalent losing branches.
-    for (const move of this.forcingMoves(attacker, false, 10)) add(move);
-    for (const move of this.forcingMoves(defender, false, 8)) add(move);
-    return [...replies.values()].filter((move) => this.position.isLegal(move.row, move.col, defender));
+    const add = (move: AiWorkerMove) => {
+      if (this.position.isLegal(move.row, move.col, defender)) replies.set(moveIndex(move), move);
+    };
+
+    const defenderWins = this.position.immediateWinningMoves(defender);
+    for (const move of defenderWins) add(move);
+    const attackerWins = this.position.immediateWinningMoves(attacker);
+    if (attackerWins.length > 0) {
+      for (const move of attackerWins) add(move);
+      return [...replies.values()];
+    }
+
+    const extensions = this.position.openThreeExtensionMoves(attacker);
+    if (extensions.length <= 2) {
+      // A single open-three can have non-obvious line-changing replies under
+      // the custom forbidden rules. Enumerate every legal defense; if the node
+      // budget cannot cover them the proof stays unknown, never a false win.
+      for (let index = 0; index < GOMOKU_AI_SIZE * GOMOKU_AI_SIZE; index += 1) {
+        add(moveFromIndex(index));
+      }
+      return [...replies.values()];
+    }
+
+    // Independent/crossing threats use their complete cost-square set.
+    for (const move of extensions) add(move);
+    for (const move of this.forcingMoves(attacker, true, GOMOKU_AI_SIZE * GOMOKU_AI_SIZE)) add(move);
+    for (const move of this.forcingMoves(defender, false, GOMOKU_AI_SIZE * GOMOKU_AI_SIZE)) add(move);
+    return [...replies.values()];
   }
 
-  vct(attacker: PlayerColor, depthLeft: number, budget: TacticalBudget): AiWorkerMove | null {
-    if (depthLeft <= 0 || !this.spendTacticalNode(budget)) return null;
+  threatSpace(attacker: PlayerColor, depthLeft: number, budget: TacticalBudget): ThreatProof {
+    if (!this.spendTacticalNode(budget)) return { proof: 1, disproof: 1, move: null };
     const defender = opposite(attacker);
     const attackerWins = this.position.immediateWinningMoves(attacker);
-    if (attackerWins.length > 0) return attackerWins[0];
-    if (this.position.immediateWinningMoves(defender).length > 0) return null;
+    if (attackerWins.length > 0) return { proof: 0, disproof: PROOF_INFINITY, move: attackerWins[0] };
+    if (this.position.immediateWinningMoves(defender).length > 0 || depthLeft <= 0) {
+      return { proof: 1, disproof: 0, move: null };
+    }
 
-    for (const move of this.forcingMoves(attacker, true, 12)) {
+    const ttSlot = this.probe(this.threatTt, attacker, attacker);
+    if (ttSlot >= 0 && this.threatTt.depthAt(ttSlot) >= depthLeft) {
+      const score = this.threatTt.scoreAt(ttSlot);
+      const index = this.threatTt.moveAt(ttSlot);
+      return score > 0
+        ? { proof: 0, disproof: PROOF_INFINITY, move: index >= 0 ? moveFromIndex(index) : null }
+        : { proof: 1, disproof: 0, move: null };
+    }
+
+    const attacks = this.forcingMoves(attacker, true, GOMOKU_AI_SIZE * GOMOKU_AI_SIZE);
+    if (attacks.length === 0) {
+      this.store(this.threatTt, attacker, depthLeft, -1, 'exact', null, attacker);
+      return { proof: 1, disproof: 0, move: null };
+    }
+
+    let proof = PROOF_INFINITY;
+    let disproof = 0;
+    for (const move of attacks) {
       this.position.makeMove(move.row, move.col, attacker);
-      let succeeds = false;
+      let moveProof = 0;
+      let moveDisproof = PROOF_INFINITY;
       try {
-        if (this.position.isExactFiveAt(move.row, move.col, attacker)) return move;
-        if (this.position.immediateWinningMoves(defender).length > 0) continue;
-        const directWins = this.position.immediateWinningMoves(attacker);
-        if (directWins.length >= 2) return move;
-
-        const replies = directWins.length === 1
-          ? directWins.filter((reply) => this.position.isLegal(reply.row, reply.col, defender))
-          : this.relevantVctReplies(attacker, defender);
-        if (replies.length === 0) continue;
-
-        succeeds = true;
-        for (const reply of replies) {
-          if (!this.spendTacticalNode(budget)) {
-            succeeds = false;
-            break;
-          }
-          this.position.makeMove(reply.row, reply.col, defender);
-          let continues = false;
-          try {
-            continues =
-              !this.position.isExactFiveAt(reply.row, reply.col, defender) &&
-              this.vct(attacker, depthLeft - 1, budget) !== null;
-          } finally {
-            this.position.unmakeMove(reply.row, reply.col);
-          }
-          if (!continues) {
-            succeeds = false;
-            break;
+        if (!this.position.isExactFiveAt(move.row, move.col, attacker)) {
+          if (this.position.immediateWinningMoves(defender).length > 0) {
+            moveProof = 1;
+            moveDisproof = 0;
+          } else {
+            const defenses = this.exactThreatDefenses(attacker, defender);
+            if (defenses.length === 0) {
+              moveProof = 1;
+              moveDisproof = 0;
+            } else {
+              for (const defense of defenses) {
+                if (!this.spendTacticalNode(budget)) {
+                  moveProof = Math.max(1, moveProof);
+                  moveDisproof = Math.min(moveDisproof, 1);
+                  break;
+                }
+                this.position.makeMove(defense.row, defense.col, defender);
+                let child: ThreatProof;
+                try {
+                  child = this.position.isExactFiveAt(defense.row, defense.col, defender)
+                    ? { proof: 1, disproof: 0, move: null }
+                    : this.threatSpace(attacker, depthLeft - 1, budget);
+                } finally {
+                  this.position.unmakeMove(defense.row, defense.col);
+                }
+                moveProof = saturatingAdd(moveProof, child.proof);
+                moveDisproof = Math.min(moveDisproof, child.disproof);
+                if (child.proof !== 0 || budget.exhausted) break;
+              }
+            }
           }
         }
       } finally {
         this.position.unmakeMove(move.row, move.col);
       }
-      if (succeeds && !budget.exhausted) return move;
+
+      proof = Math.min(proof, moveProof);
+      disproof = saturatingAdd(disproof, moveDisproof);
+      if (moveProof === 0 && !budget.exhausted) {
+        this.store(this.threatTt, attacker, depthLeft, 1, 'exact', move, attacker);
+        return { proof: 0, disproof: PROOF_INFINITY, move };
+      }
+      if (budget.exhausted) break;
     }
-    return null;
+
+    if (!budget.exhausted) this.store(this.threatTt, attacker, depthLeft, -1, 'exact', null, attacker);
+    return { proof: Math.max(1, proof), disproof: Math.min(disproof, PROOF_INFINITY), move: null };
   }
 
-  findVctDefenses(
+  findThreatDefenses(
     defender: PlayerColor,
     attacker: PlayerColor,
     attackerFirst: AiWorkerMove,
     depth: number,
     budget: TacticalBudget,
   ): AiWorkerMove[] {
-    const options = this.candidates(defender, CANDIDATE_LIMIT, true);
+    const options = this.candidates(defender, 0, depth, true);
+    const seen = new Set(options.map(moveIndex));
+    for (let index = 0; index < GOMOKU_AI_SIZE * GOMOKU_AI_SIZE; index += 1) {
+      const move = moveFromIndex(index);
+      if (!seen.has(index) && this.position.isLegal(move.row, move.col, defender)) {
+        options.push(move);
+        seen.add(index);
+      }
+    }
     if (this.position.isLegal(attackerFirst.row, attackerFirst.col, defender) &&
       !options.some((move) => sameMove(move, attackerFirst))) options.unshift(attackerFirst);
     const defenses: AiWorkerMove[] = [];
@@ -441,8 +641,8 @@ class GomokuSearch {
           defenses.push(move);
           continue;
         }
-        const probe = this.vct(attacker, Math.max(1, depth - 1), budget);
-        if (!probe && !budget.exhausted) defenses.push(move);
+        const probe = this.threatSpace(attacker, Math.max(1, depth - 1), budget);
+        if (probe.proof !== 0 && !budget.exhausted) defenses.push(move);
       } finally {
         this.position.unmakeMove(move.row, move.col);
       }
@@ -456,7 +656,7 @@ class GomokuSearch {
     let turn = color;
     try {
       for (let depth = 0; depth < maxDepth; depth += 1) {
-        const move = this.validTtMove(turn, this.ttEntry(turn));
+        const move = this.validTtMove(turn, this.probe(this.tt, turn));
         if (!move) break;
         result.push(move);
         this.position.makeMove(move.row, move.col, turn);
@@ -538,34 +738,42 @@ export function searchGomokuMove(
     return search.result(opponentWins[0], 1, 0, 'forced_block');
   }
 
-  const rootCandidates = search.candidates(turn, CANDIDATE_LIMIT, true);
+  const useOpeningBook = options?.useOpeningBook ?? options?.maxSearchNodes === undefined;
+  if (useOpeningBook && budgetMs > 0) {
+    const opening = lookupGomokuOpeningMove(board, turn);
+    if (opening && search.position.isLegal(opening.row, opening.col, turn)) {
+      onDepth?.({ depth: 0, move: opening, score: 0 });
+      return search.result(opening, 0, 0, 'opening_book');
+    }
+  }
+
+  const rootCandidates = search.candidates(turn, 0, 1, true);
   if (rootCandidates.length === 0) return search.result(null, 0, 0, 'no_legal_move');
-  // Publish a deterministic legal fallback before VCF/VCT. If tactical search
-  // consumes the worker deadline, the pool can still return a real candidate
-  // instead of forcing the service into a board-wide random fallback.
   onDepth?.({ depth: 0, move: rootCandidates[0], score: 0 });
   let restrictedRoot: AiWorkerMove[] | undefined;
 
   try {
-    const vcfMove = search.vcf(turn, VCF_MAX_DEPTH);
-    if (vcfMove) {
-      onDepth?.({ depth: VCF_MAX_DEPTH, move: vcfMove, score: WIN });
-      return search.result(vcfMove, VCF_MAX_DEPTH, WIN, 'vcf');
+    if (budgetMs >= 250) {
+      const vcfMove = search.vcf(turn, VCF_MAX_DEPTH);
+      if (vcfMove) {
+        onDepth?.({ depth: VCF_MAX_DEPTH, move: vcfMove, score: WIN });
+        return search.result(vcfMove, VCF_MAX_DEPTH, WIN, 'vcf');
+      }
     }
 
     if (budgetMs >= 700 && search.position.stoneCount >= 5 && search.remainingMs() >= 250) {
-      const ownVctBudget: TacticalBudget = { remaining: 3_500, exhausted: false };
-      const vctMove = search.vct(turn, VCT_MAX_DEPTH, ownVctBudget);
-      if (vctMove && !ownVctBudget.exhausted) {
-        onDepth?.({ depth: VCT_MAX_DEPTH, move: vctMove, score: WIN - 500 });
-        return search.result(vctMove, VCT_MAX_DEPTH, WIN - 500, 'vct');
+      const ownBudget: TacticalBudget = { remaining: 6_000, exhausted: false };
+      const ownProof = search.threatSpace(turn, THREAT_MAX_DEPTH, ownBudget);
+      if (ownProof.proof === 0 && ownProof.move && !ownBudget.exhausted) {
+        onDepth?.({ depth: THREAT_MAX_DEPTH, move: ownProof.move, score: WIN - 500 });
+        return search.result(ownProof.move, THREAT_MAX_DEPTH, WIN - 500, 'vct');
       }
 
-      const opponentVctBudget: TacticalBudget = { remaining: 2_000, exhausted: false };
-      const opponentVct = search.vct(opponent, VCT_MAX_DEPTH, opponentVctBudget);
-      if (opponentVct && !opponentVctBudget.exhausted && search.remainingMs() >= 200) {
-        const defenseBudget: TacticalBudget = { remaining: 2_500, exhausted: false };
-        const defenses = search.findVctDefenses(turn, opponent, opponentVct, VCT_MAX_DEPTH, defenseBudget);
+      const opponentBudget: TacticalBudget = { remaining: 4_000, exhausted: false };
+      const opponentProof = search.threatSpace(opponent, THREAT_MAX_DEPTH, opponentBudget);
+      if (opponentProof.proof === 0 && opponentProof.move && !opponentBudget.exhausted && search.remainingMs() >= 200) {
+        const defenseBudget: TacticalBudget = { remaining: 5_000, exhausted: false };
+        const defenses = search.findThreatDefenses(turn, opponent, opponentProof.move, THREAT_MAX_DEPTH, defenseBudget);
         if (defenses.length > 0 && !defenseBudget.exhausted) restrictedRoot = defenses;
       }
     }
@@ -580,7 +788,7 @@ export function searchGomokuMove(
   try {
     for (let depth = 1; depth <= 24; depth += 1) {
       const depthStartedAt = Date.now();
-      const result = search.searchRoot(turn, depth, restrictedRoot);
+      const result = search.searchRootAspiration(turn, depth, best.score, restrictedRoot);
       const depthMs = Math.max(1, Date.now() - depthStartedAt);
       if (result.move) best = { move: result.move, score: result.score, depth };
       onDepth?.({ depth, move: best.move, score: best.score });
