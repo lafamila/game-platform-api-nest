@@ -71,8 +71,17 @@ export const GOMOKU_ENGINE: GameEngine<GomokuSession> = {
     applyGomokuMove(state, accountId, Number(payload.row), Number(payload.col), 'manual');
     return { state };
   },
-  viewFor(state: GomokuSession) {
-    return state;
+  viewFor(state: GomokuSession, viewer) {
+    const viewerAccountId =
+      viewer === 0
+        ? state.players.black
+        : viewer === 1
+          ? state.players.white
+          : undefined;
+    if (!state.pendingMove || state.pendingMove.accountId === viewerAccountId) {
+      return state;
+    }
+    return { ...state, pendingMove: undefined };
   },
   finishInfo(state: GomokuSession) {
     if (state.status !== 'finished') {
@@ -127,6 +136,7 @@ export function applyGomokuMove(
     }
   }
   const at = new Date().toISOString();
+  delete session.pendingMove;
   session.board[row][col] = color;
   session.moves.push({ row, col, color, accountId, createdAt: at, source });
   recordMove(session, color, row, col, at);

@@ -552,6 +552,146 @@ test('gomoku local sessions are AI games and answer player moves', async () => {
   assert.equal(answered.currentTurn, 'black');
 });
 
+test('gomoku move selection is replaceable, private, and cleared by confirmation', async () => {
+  const realtime = new FakeRealtime();
+  const service = new GamesService(new FakeDb(), realtime);
+  try {
+    const session = await service.createGomokuSession(
+      user,
+      opponent.accountId,
+      undefined,
+      'medium',
+    );
+
+    const firstSelection = await service.applyGameAction(
+      'gomoku',
+      session.id,
+      user,
+      {
+        type: 'select_move',
+        payload: { row: 7, col: 7 },
+      },
+    );
+    assert.equal(firstSelection.board[7][7], null);
+    assert.equal(firstSelection.moves.length, 0);
+    assert.deepEqual(
+      {
+        row: firstSelection.pendingMove.row,
+        col: firstSelection.pendingMove.col,
+        color: firstSelection.pendingMove.color,
+        accountId: firstSelection.pendingMove.accountId,
+      },
+      { row: 7, col: 7, color: 'black', accountId: user.accountId },
+    );
+    const selectionEvent = realtime.events.find(
+      (event) => event.event === 'gomoku.selection.changed',
+    );
+    assert.deepEqual(selectionEvent.payload, {
+      id: session.id,
+      rev: firstSelection.rev,
+    });
+    assert.equal('row' in selectionEvent.payload, false);
+    assert.equal('col' in selectionEvent.payload, false);
+
+    const opponentView = await service.getGomokuSession(
+      session.id,
+      opponent,
+    );
+    assert.equal(opponentView.pendingMove, undefined);
+
+    const replaced = await service.applyGameAction(
+      'gomoku',
+      session.id,
+      user,
+      {
+        type: 'select_move',
+        payload: { row: 6, col: 8 },
+      },
+    );
+    assert.equal(replaced.pendingMove.row, 6);
+    assert.equal(replaced.pendingMove.col, 8);
+    assert.equal(replaced.board[6][8], null);
+
+    const moved = await service.playGomokuMove(
+      session.id,
+      user,
+      6,
+      8,
+    );
+    assert.equal(moved.board[6][8], 'black');
+    assert.equal(moved.moves.length, 1);
+    assert.equal(moved.pendingMove, undefined);
+  } finally {
+    service.onModuleDestroy();
+  }
+});
+
+test('gomoku timer confirms the current selection before online random fallback', async () => {
+  const db = new FakeDb();
+  const realtime = new FakeRealtime();
+  const service = new GamesService(db, realtime);
+  try {
+    const session = await service.createGomokuSession(
+      user,
+      opponent.accountId,
+      undefined,
+      'medium',
+    );
+    await service.selectGomokuMove(session.id, user, 4, 9);
+
+    const row = db.rows.get(session.id);
+    row.state_json.turnDeadlineAt = new Date(Date.now() - 100).toISOString();
+    realtime.online = false;
+    await service.handleTurnTimer(session.id, 'gomoku');
+
+    const timedOut = await service.getGomokuSession(session.id, user);
+    assert.equal(timedOut.board[4][9], 'black');
+    assert.equal(timedOut.moves.length, 1);
+    assert.equal(timedOut.moves[0].source, 'timeout');
+    assert.equal(timedOut.pendingMove, undefined);
+    assert.equal(timedOut.networkGraceDeadlineAt, undefined);
+  } finally {
+    service.onModuleDestroy();
+  }
+});
+
+test('gomoku timer retries with the latest selection after a revision race', async () => {
+  const db = new FakeDb();
+  const realtime = new FakeRealtime();
+  let releaseOnlineCheck;
+  realtime.isAccountOnline = () =>
+    new Promise((resolve) => {
+      releaseOnlineCheck = () => resolve(true);
+    });
+  const service = new GamesService(db, realtime);
+  try {
+    const session = await service.createGomokuSession(
+      user,
+      opponent.accountId,
+      undefined,
+      'medium',
+    );
+    const row = db.rows.get(session.id);
+    row.state_json.turnDeadlineAt = new Date(Date.now() - 100).toISOString();
+
+    const timer = service.handleTurnTimer(session.id, 'gomoku');
+    while (!releaseOnlineCheck) {
+      await wait(1);
+    }
+    await service.selectGomokuMove(session.id, user, 10, 3);
+    releaseOnlineCheck();
+    await timer;
+
+    const timedOut = await service.getGomokuSession(session.id, user);
+    assert.equal(timedOut.board[10][3], 'black');
+    assert.equal(timedOut.moves.length, 1);
+    assert.equal(timedOut.moves[0].source, 'timeout');
+    assert.equal(timedOut.pendingMove, undefined);
+  } finally {
+    service.onModuleDestroy();
+  }
+});
+
 test('generic game action route dispatches through handlers and migrated engines', async () => {
   const db = new FakeDb();
   db.sokobanMaps.push({

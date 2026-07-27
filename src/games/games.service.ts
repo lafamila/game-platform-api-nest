@@ -86,6 +86,7 @@ import {
   initialGomokuBoard,
   randomGomokuMove,
   validateGomokuIndex,
+  GOMOKU_FORBIDDEN_MESSAGES,
 } from './gomoku-engine';
 import { getForbiddenReason } from './gomoku-rules';
 import { GOMOKU_AI_ENGINE_VERSION, searchGomokuMove } from './gomoku-ai';
@@ -591,8 +592,18 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    if (gameKey === 'gomoku' && type === 'move') {
-      return this.applyGomokuEngineMove(id, user, payload, clientMoveId);
+    if (gameKey === 'gomoku') {
+      if (type === 'select_move') {
+        return this.selectGomokuMove(
+          id,
+          user,
+          Number(payload.row),
+          Number(payload.col),
+        );
+      }
+      if (type === 'move') {
+        return this.applyGomokuEngineMove(id, user, payload, clientMoveId);
+      }
     }
 
     if (gameKey === 'alkkagi' && type === 'shoot') {
@@ -1592,11 +1603,70 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   async getGomokuSession(id: string, user: AuthAccount): Promise<GomokuSession> {
     const session = this.gomokuFromRow(await this.requireGameRow(id, 'gomoku'));
     this.assertGameParticipant(user, session.players.black, session.players.white);
-    return session;
+    return this.gomokuViewFor(session, user);
   }
 
   async playGomokuMove(id: string, user: AuthAccount, row: number, col: number, clientMoveId?: string): Promise<GomokuSession> {
     return this.applyGomokuEngineMove(id, user, { row, col }, clientMoveId);
+  }
+
+  async selectGomokuMove(
+    id: string,
+    user: AuthAccount,
+    row: number,
+    col: number,
+  ): Promise<GomokuSession> {
+    validateGomokuIndex(row, 'row');
+    validateGomokuIndex(col, 'col');
+    const session = this.gomokuFromRow(await this.requireGameRow(id, 'gomoku'));
+    this.assertGameParticipant(user, session.players.black, session.players.white);
+    if (session.status !== 'playing') {
+      throw new BadRequestException('game is already finished');
+    }
+    this.assertNotPaused(session);
+    const color = session.currentTurn;
+    if (isLocalAiAccount(session.players[color]) || !this.canActAs(user, session.players[color])) {
+      throw new ForbiddenException('not your turn');
+    }
+    if (session.board[row][col] !== null) {
+      throw new BadRequestException('cell is already occupied');
+    }
+    if (color === 'black') {
+      const reason = getForbiddenReason(session.board, row, col);
+      if (reason) {
+        throw new BadRequestException(GOMOKU_FORBIDDEN_MESSAGES[reason]);
+      }
+    }
+    if (
+      session.pendingMove?.accountId === user.accountId &&
+      session.pendingMove.color === color &&
+      session.pendingMove.row === row &&
+      session.pendingMove.col === col
+    ) {
+      return this.gomokuViewFor(session, user);
+    }
+    session.pendingMove = {
+      row,
+      col,
+      color,
+      accountId: user.accountId,
+      updatedAt: new Date().toISOString(),
+    };
+    session.updatedAt = session.pendingMove.updatedAt;
+    const saved = this.gomokuFromRow(
+      await this.updateGame(
+        id,
+        session.status,
+        session.currentTurn,
+        session.winner ?? null,
+        session,
+      ),
+    );
+    this.emitSessionEvent(saved, 'gomoku.selection.changed', {
+      id: saved.id,
+      rev: saved.rev,
+    });
+    return this.gomokuViewFor(saved, user);
   }
 
   private async applyGomokuEngineMove(
@@ -1661,6 +1731,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     session.status = 'finished';
     session.winner = loser === 'black' ? 'white' : 'black';
     session.finishReason = 'forfeit';
+    delete session.pendingMove;
     session.updatedAt = new Date().toISOString();
     this.clearTurnTimer(id);
     const saved = this.gomokuFromRow(await this.updateGame(id, session.status, session.currentTurn, session.winner, session));
@@ -3774,6 +3845,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     if (gameKey === 'gomoku') {
       const session = this.gomokuFromRow(await this.requireGameRow(id, 'gomoku'));
       this.assertGameParticipant(user, session.players.black, session.players.white);
+      delete session.pendingMove;
       this.applyPause(session, user);
       this.clearTurnTimer(id);
       const saved = this.gomokuFromRow(await this.updateGame(id, session.status, session.currentTurn, session.winner ?? null, session));
@@ -6876,6 +6948,19 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async handleTurnTimer(id: string, gameKey: 'gomoku' | 'alkkagi' | 'othello'): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await this.handleTurnTimerOnce(id, gameKey);
+        return;
+      } catch (error) {
+        if (!(error instanceof GameStateConflictError) || attempt === 2) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  private async handleTurnTimerOnce(id: string, gameKey: 'gomoku' | 'alkkagi' | 'othello'): Promise<void> {
     const row = await this.requireGameRow(id, gameKey);
     if (row.mode !== 'friend_match' || row.status !== 'playing') {
       this.clearTurnTimer(id);
@@ -7070,6 +7155,41 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     const currentAccountId = session.players[session.currentTurn];
+    const pendingMove = session.pendingMove;
+    if (
+      pendingMove?.accountId === currentAccountId &&
+      pendingMove.color === session.currentTurn &&
+      session.board[pendingMove.row]?.[pendingMove.col] === null &&
+      (session.currentTurn !== 'black' ||
+        getForbiddenReason(session.board, pendingMove.row, pendingMove.col) === null)
+    ) {
+      this.applyGomokuMove(
+        session,
+        currentAccountId,
+        pendingMove.row,
+        pendingMove.col,
+        'timeout',
+      );
+      if (session.status === 'finished' && session.winner) {
+        session.finishReason = 'timeout_selected_win';
+      }
+      const saved = this.gomokuFromRow(
+        await this.updateGame(
+          session.id,
+          session.status,
+          session.currentTurn,
+          session.winner ?? null,
+          session,
+        ),
+      );
+      this.scheduleTurnTimer(saved, 'gomoku');
+      this.emitSessionEvent(saved, 'gomoku.move.played', saved);
+      if (saved.status === 'finished') {
+        this.emitSessionEvent(saved, 'game.session.finished', saved);
+      }
+      return;
+    }
+    delete session.pendingMove;
     if (!(await this.realtime.isAccountOnline(currentAccountId))) {
       await this.startDisconnectGrace(session, 'gomoku', currentAccountId);
       return;
@@ -7095,6 +7215,19 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     const saved = this.gomokuFromRow(await this.updateGame(session.id, session.status, session.currentTurn, session.winner ?? null, session));
     this.scheduleTurnTimer(saved, 'gomoku');
     this.emitSessionEvent(saved, 'gomoku.move.played', saved);
+    if (saved.status === 'finished') {
+      this.emitSessionEvent(saved, 'game.session.finished', saved);
+    }
+  }
+
+  private gomokuViewFor(
+    session: GomokuSession,
+    user: AuthAccount,
+  ): GomokuSession {
+    if (session.pendingMove?.accountId === user.accountId) {
+      return session;
+    }
+    return { ...session, pendingMove: undefined };
   }
 
   private async handleAlkkagiTimer(row: GameRow): Promise<void> {

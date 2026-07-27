@@ -115,7 +115,7 @@ export const REPLAY_VIEW_HTML = `<!doctype html>
     var FINISH_LABELS = {
       board_complete: '정상 종료', completed: '정상 종료', draw: '무승부',
       forfeit: '기권', opponent_left: '상대 이탈', abandoned: '장기 미접속',
-      timeout_random_win: '시간초과 랜덤 착수', disconnect: '연결 종료', server_restart: '서버 재시작'
+      timeout_random_win: '시간초과 랜덤 착수', timeout_selected_win: '시간초과 선택 착수', disconnect: '연결 종료', server_restart: '서버 재시작'
     };
     function finishLabel(reason) { if (!reason) return '-'; return FINISH_LABELS[reason] || reason; }
 

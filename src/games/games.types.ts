@@ -95,6 +95,13 @@ export interface GomokuSession {
   status: 'playing' | 'finished';
   players: Record<PlayerColor, string>;
   moves: Array<{ row: number; col: number; color: PlayerColor; accountId: string; createdAt: string; source?: 'manual' | 'timeout' | 'ai' }>;
+  pendingMove?: {
+    row: number;
+    col: number;
+    color: PlayerColor;
+    accountId: string;
+    updatedAt: string;
+  };
   moveHistory?: MoveHistoryEntry[];
   turnStartedAt?: string;
   turnDeadlineAt?: string;
