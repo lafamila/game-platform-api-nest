@@ -12,6 +12,9 @@ export interface AiWorkerRequest {
   budgetMs: number;
   // Submission-to-response absolute deadline. Pool queue time is charged to it.
   deadlineAt?: number;
+  // Stable per-session/per-ply seed used only for equivalent opening-book
+  // choices. Retries and synchronous fallbacks must receive the same value.
+  openingBookSeed?: number;
 }
 
 export interface AiWorkerMove {

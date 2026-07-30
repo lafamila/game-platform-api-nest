@@ -6662,9 +6662,22 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
     const deadlineAt = Date.now() + budgetMs;
     const board = session.board;
     const turn = session.currentTurn;
+    const ply = session.moveHistory?.length ?? session.moves.length;
+    const openingBookSeed = createHash('sha256')
+      .update(`${session.id}:${ply}:${turn}`)
+      .digest()
+      .readUInt32LE(0);
     if (budgetMs >= AI_WORKER_MIN_BUDGET_MS) {
       try {
-        const result = await this.getAiWorkerPool().run({ game: 'gomoku', board, turn, aiColor: turn, budgetMs, deadlineAt });
+        const result = await this.getAiWorkerPool().run({
+          game: 'gomoku',
+          board,
+          turn,
+          aiColor: turn,
+          budgetMs,
+          deadlineAt,
+          openingBookSeed,
+        });
         if (result.diagnostics) {
           await this.recordAiDecision(session, 'gomoku', turn, result.move, result.score, result.diagnostics);
           return result.move ?? undefined;
@@ -6676,7 +6689,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
           return result.move;
         }
         const reason = result.terminationReason ?? 'worker_no_move';
-        const fallback = searchGomokuMove(board, turn, 1);
+        const fallback = searchGomokuMove(board, turn, 1, undefined, { openingBookSeed });
         const diagnostics: AiSearchDiagnostics = fallback.diagnostics
           ? {
               ...fallback.diagnostics,
@@ -6698,7 +6711,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         return fallback.move ?? undefined;
       } catch (error) {
         console.warn('gomoku hard AI worker failed; using deterministic fallback', error);
-        const fallback = searchGomokuMove(board, turn, 1);
+        const fallback = searchGomokuMove(board, turn, 1, undefined, { openingBookSeed });
         const diagnostics: AiSearchDiagnostics = fallback.diagnostics
           ? {
               ...fallback.diagnostics,
@@ -6720,7 +6733,7 @@ export class GamesService implements OnModuleInit, OnModuleDestroy {
         return fallback.move ?? undefined;
       }
     }
-    const result = searchGomokuMove(board, turn, budgetMs);
+    const result = searchGomokuMove(board, turn, budgetMs, undefined, { openingBookSeed });
     await this.recordAiDecision(session, 'gomoku', turn, result.move, result.score, result.diagnostics);
     return result.move ?? undefined;
   }

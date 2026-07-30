@@ -82,13 +82,42 @@ test('gomoku opening lookup includes side to move and rejects non-15x15 boards',
   assert.equal(lookupGomokuOpeningMove(Array.from({ length: 14 }, () => Array(14).fill(null)), 'black'), null);
 });
 
+test('gomoku opening book reproducibly varies only among validated symmetric replies', () => {
+  const board = boardBefore(BOOK_LINES[0], 1);
+  const moves = Array.from({ length: 4 }, (_, seed) => lookupGomokuOpeningMove(board, 'white', seed));
+
+  assert.deepEqual(moves, [
+    { row: 7, col: 6 },
+    { row: 6, col: 7 },
+    { row: 7, col: 8 },
+    { row: 8, col: 7 },
+  ]);
+  assert.deepEqual(lookupGomokuOpeningMove(board, 'white', 2), moves[2], 'the same seed must be replayable');
+});
+
+test('gomoku opening book covers the first confirmed production-loss divergence', () => {
+  const board = initialGomokuBoard();
+  board[7][7] = 'black';
+  board[7][6] = 'white';
+  board[6][6] = 'black';
+  board[8][8] = 'white';
+  board[7][5] = 'black';
+
+  assert.deepEqual(lookupGomokuOpeningMove(board, 'white', 0xdeadbeef), { row: 8, col: 7 });
+  assert.equal(board[8][4], null, 'the repeatedly timed-out losing move remains unplayed');
+});
+
 test('gomoku opening book exposes a compact generator-facing format', () => {
-  assert.equal(GOMOKU_OPENING_BOOK.format, 'gomoku-opening-book-v1');
+  assert.equal(GOMOKU_OPENING_BOOK.format, 'gomoku-opening-book-v2');
   assert.equal(GOMOKU_OPENING_BOOK.boardSize, 15);
-  assert.equal(GOMOKU_OPENING_BOOK.entries.length, 12);
-  assert.equal(new Set(GOMOKU_OPENING_BOOK.entries.map(([key]) => key)).size, 12);
-  for (const [key, move] of GOMOKU_OPENING_BOOK.entries) {
+  assert.equal(GOMOKU_OPENING_BOOK.entries.length, 14);
+  assert.equal(new Set(GOMOKU_OPENING_BOOK.entries.map(([key]) => key)).size, 14);
+  for (const [key, candidates] of GOMOKU_OPENING_BOOK.entries) {
     assert.match(key, /^[bw]:(?:[0-9a-z]{2})*$/);
-    assert.ok(Number.isInteger(move) && move >= 0 && move < 225);
+    assert.ok(candidates.length > 0);
+    for (const [move, weight] of candidates) {
+      assert.ok(Number.isInteger(move) && move >= 0 && move < 225);
+      assert.ok(Number.isInteger(weight) && weight > 0);
+    }
   }
 });

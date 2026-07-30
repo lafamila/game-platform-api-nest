@@ -225,6 +225,19 @@ test('hard gomoku serves a legal opening-book move without search nodes', () => 
   assert.equal(board[7][6], null, 'opening lookup must not mutate the board');
 });
 
+test('hard gomoku uses the production-loss branch correction before the opening cap', () => {
+  const board = boardWith(
+    [[7, 7], [6, 6], [7, 5]],
+    [[7, 6], [8, 8]],
+  );
+  const result = searchGomokuMove(board, 'white', 25_000, undefined, { openingBookSeed: 17 });
+
+  assert.deepEqual(result.move, { row: 8, col: 7 });
+  assert.equal(result.diagnostics.exitReason, 'opening_book');
+  assert.equal(result.diagnostics.searchNodes, 0);
+  assert.equal(board[8][7], null, 'book lookup must leave the regression board untouched');
+});
+
 // ---------------------------------------------------------------------------
 // tactical must-moves
 // ---------------------------------------------------------------------------
@@ -315,6 +328,21 @@ test('hard gomoku converts an opponent VCT into a concrete root defense', () => 
   const result = searchGomokuMove(board, 'black', 1_000);
   assert.deepEqual(result.move, { row: 7, col: 7 });
   assert.ok(result.diagnostics.vctNodes > 0, 'opponent VCT and refutation search should run');
+});
+
+test('early unknown VCT stays bounded and falls through to the main search', () => {
+  const board = boardWith(
+    [[7, 7], [6, 6], [7, 5], [8, 6]],
+    [[7, 6], [8, 8], [8, 4]],
+  );
+  const result = searchGomokuMove(board, 'white', 1_000, undefined, { useOpeningBook: false });
+
+  assert.ok(result.move);
+  assert.notEqual(result.diagnostics.exitReason, 'vct', 'an exhausted selective proof must remain unknown');
+  assert.ok(
+    result.diagnostics.vctNodes <= 1_501,
+    `early opponent VCT exceeded its focused budget: ${result.diagnostics.vctNodes}`,
+  );
 });
 
 test('hard gomoku blocks an opponent open three before it becomes a double threat', () => {

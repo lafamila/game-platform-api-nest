@@ -16,6 +16,23 @@ test('the worker returns a legal move for a request', async () => {
   assert.ok(result.move.row >= 0 && result.move.row < 15);
 });
 
+test('the worker forwards the reproducible opening-book seed', async () => {
+  const pool = new AiWorkerPool(1);
+  const board = initialGomokuBoard();
+  board[7][7] = 'black';
+  const result = await pool.run({
+    game: 'gomoku',
+    board,
+    turn: 'white',
+    aiColor: 'white',
+    budgetMs: 300,
+    openingBookSeed: 1,
+  });
+
+  assert.deepEqual(result.move, { row: 6, col: 7 });
+  assert.equal(result.diagnostics?.exitReason, 'opening_book');
+});
+
 test('a hard AI think runs off the main event loop (worker isolation)', async () => {
   const pool = new AiWorkerPool(2);
   const budgetMs = 1200;

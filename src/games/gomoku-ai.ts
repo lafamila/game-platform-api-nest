@@ -24,6 +24,15 @@ const DEEP_QUIET_LIMIT = 10;
 export const GOMOKU_TACTICAL_SCAN_FLOOR = 350;
 const VCF_MAX_DEPTH = 12;
 const THREAT_MAX_DEPTH = 9;
+const MAX_VCT_ATTACKS_PER_NODE = 8;
+const MAX_VCT_DEFENSES_PER_NODE = 10;
+const MAX_VCT_ROOT_DEFENSES = 12;
+const EARLY_VCT_OWN_NODE_BUDGET = 2_500;
+const EARLY_VCT_OPPONENT_NODE_BUDGET = 1_500;
+const EARLY_VCT_DEFENSE_NODE_BUDGET = 2_500;
+const FULL_VCT_OWN_NODE_BUDGET = 6_000;
+const FULL_VCT_OPPONENT_NODE_BUDGET = 4_000;
+const FULL_VCT_DEFENSE_NODE_BUDGET = 5_000;
 const MAX_FORCED_EXTENSIONS = 8;
 const MAX_SEARCH_PLIES = 64;
 const TT_POWER = 19;
@@ -32,7 +41,7 @@ const ASPIRATION_INITIAL = 2_000;
 const PROOF_INFINITY = 1_000_000_000;
 const SHARED_SEARCH_TT = new FixedTranspositionTable(TT_POWER);
 const SHARED_THREAT_TT = new FixedTranspositionTable(THREAT_TT_POWER);
-export const GOMOKU_AI_ENGINE_VERSION = 'gomoku-hard-v3';
+export const GOMOKU_AI_ENGINE_VERSION = 'gomoku-hard-v4';
 const TIMEOUT = Symbol('gomoku-ai-timeout');
 const NODE_LIMIT = Symbol('gomoku-ai-node-limit');
 const WORKER_RETURN_MARGIN_MS = 5;
@@ -54,12 +63,19 @@ interface ThreatProof {
   move: AiWorkerMove | null;
 }
 
+interface ThreatDefenseSet {
+  moves: AiWorkerMove[];
+  complete: boolean;
+}
+
 type ExitReason = AiSearchDiagnostics['exitReason'];
 
 export interface GomokuSearchOptions {
   maxSearchNodes?: number;
   deadlineAt?: number;
   useOpeningBook?: boolean;
+  openingBookSeed?: number;
+  ignorePhaseBudget?: boolean;
 }
 
 function opposite(color: PlayerColor): PlayerColor {
@@ -99,10 +115,6 @@ function threatValue(profile: GomokuThreatProfile | null): number {
   if (profile.fours >= 2 || (profile.fours >= 1 && profile.openThrees >= 1)) return WIN / 2;
   if (profile.openThrees >= 2) return WIN / 4;
   return profile.fours * 16_000 + profile.openThrees * 1_800 + profile.crossingThreats * 900;
-}
-
-function saturatingAdd(first: number, second: number): number {
-  return Math.min(PROOF_INFINITY, first + second);
 }
 
 class GomokuSearch {
@@ -502,7 +514,11 @@ class GomokuSearch {
     return true;
   }
 
-  private exactThreatDefenses(attacker: PlayerColor, defender: PlayerColor): AiWorkerMove[] {
+  private exactThreatDefenses(
+    attacker: PlayerColor,
+    defender: PlayerColor,
+    attack: AiWorkerMove,
+  ): ThreatDefenseSet {
     const replies = new Map<number, AiWorkerMove>();
     const add = (move: AiWorkerMove) => {
       if (this.position.isLegal(move.row, move.col, defender)) replies.set(moveIndex(move), move);
@@ -513,25 +529,42 @@ class GomokuSearch {
     const attackerWins = this.position.immediateWinningMoves(attacker);
     if (attackerWins.length > 0) {
       for (const move of attackerWins) add(move);
-      return [...replies.values()];
+      return { moves: [...replies.values()], complete: true };
     }
 
+    // VCT cost squares are local to the line(s) changed by the attacking move.
+    // Visit the explicit open-three extensions first, then all empty points on
+    // the four affected radius-four lines. This includes outer endpoint blocks
+    // such as ".XXX.." without widening to unrelated board-wide quiet moves.
     const extensions = this.position.openThreeExtensionMoves(attacker);
+    for (const move of extensions) add(move);
     if (extensions.length <= 2) {
-      // A single open-three can have non-obvious line-changing replies under
-      // the custom forbidden rules. Enumerate every legal defense; if the node
-      // budget cannot cover them the proof stays unknown, never a false win.
-      for (let index = 0; index < GOMOKU_AI_SIZE * GOMOKU_AI_SIZE; index += 1) {
-        add(moveFromIndex(index));
+      for (let distance = 1; distance <= 4; distance += 1) {
+        for (const [dr, dc] of [[0, 1], [1, 0], [1, 1], [1, -1]] as const) {
+          for (const sign of [-1, 1] as const) {
+            const row = attack.row + dr * distance * sign;
+            const col = attack.col + dc * distance * sign;
+            if (row >= 0 && row < GOMOKU_AI_SIZE && col >= 0 && col < GOMOKU_AI_SIZE) {
+              add({ row, col });
+            }
+          }
+        }
       }
-      return [...replies.values()];
     }
 
-    // Independent/crossing threats use their complete cost-square set.
-    for (const move of extensions) add(move);
-    for (const move of this.forcingMoves(attacker, true, GOMOKU_AI_SIZE * GOMOKU_AI_SIZE)) add(move);
+    // A remote reply matters to a forcing sequence only when it creates an
+    // immediate counter-threat. Potential future attacker threats elsewhere
+    // are not defense costs for the move just played and would reintroduce the
+    // all-board branching that this tactical search is meant to avoid.
     for (const move of this.forcingMoves(defender, false, GOMOKU_AI_SIZE * GOMOKU_AI_SIZE)) add(move);
-    return [...replies.values()];
+    const all = [...replies.values()];
+    if (extensions.length > 2) {
+      return { moves: all, complete: true };
+    }
+    return {
+      moves: all.slice(0, MAX_VCT_DEFENSES_PER_NODE),
+      complete: all.length <= MAX_VCT_DEFENSES_PER_NODE,
+    };
   }
 
   threatSpace(attacker: PlayerColor, depthLeft: number, budget: TacticalBudget): ThreatProof {
@@ -552,48 +585,55 @@ class GomokuSearch {
         : { proof: 1, disproof: 0, move: null };
     }
 
-    const attacks = this.forcingMoves(attacker, true, GOMOKU_AI_SIZE * GOMOKU_AI_SIZE);
-    if (attacks.length === 0) {
+    const allAttacks = this.forcingMoves(attacker, true, GOMOKU_AI_SIZE * GOMOKU_AI_SIZE);
+    if (allAttacks.length === 0) {
       this.store(this.threatTt, attacker, depthLeft, -1, 'exact', null, attacker);
       return { proof: 1, disproof: 0, move: null };
     }
+    const attacks = allAttacks.slice(0, MAX_VCT_ATTACKS_PER_NODE);
+    let sawUnknown = allAttacks.length > attacks.length;
 
-    let proof = PROOF_INFINITY;
-    let disproof = 0;
     for (const move of attacks) {
       this.position.makeMove(move.row, move.col, attacker);
-      let moveProof = 0;
-      let moveDisproof = PROOF_INFINITY;
+      let moveProof: ThreatProof = { proof: 1, disproof: 0, move: null };
       try {
-        if (!this.position.isExactFiveAt(move.row, move.col, attacker)) {
-          if (this.position.immediateWinningMoves(defender).length > 0) {
-            moveProof = 1;
-            moveDisproof = 0;
-          } else {
-            const defenses = this.exactThreatDefenses(attacker, defender);
-            if (defenses.length === 0) {
-              moveProof = 1;
-              moveDisproof = 0;
-            } else {
-              for (const defense of defenses) {
-                if (!this.spendTacticalNode(budget)) {
-                  moveProof = Math.max(1, moveProof);
-                  moveDisproof = Math.min(moveDisproof, 1);
-                  break;
-                }
-                this.position.makeMove(defense.row, defense.col, defender);
-                let child: ThreatProof;
-                try {
-                  child = this.position.isExactFiveAt(defense.row, defense.col, defender)
-                    ? { proof: 1, disproof: 0, move: null }
-                    : this.threatSpace(attacker, depthLeft - 1, budget);
-                } finally {
-                  this.position.unmakeMove(defense.row, defense.col);
-                }
-                moveProof = saturatingAdd(moveProof, child.proof);
-                moveDisproof = Math.min(moveDisproof, child.disproof);
-                if (child.proof !== 0 || budget.exhausted) break;
+        if (this.position.isExactFiveAt(move.row, move.col, attacker)) {
+          moveProof = { proof: 0, disproof: PROOF_INFINITY, move };
+        } else if (this.position.immediateWinningMoves(defender).length === 0) {
+          const defenses = this.exactThreatDefenses(attacker, defender, move);
+          if (defenses.moves.length > 0) {
+            let allDefensesLose = true;
+            let unresolved = !defenses.complete;
+            for (const defense of defenses.moves) {
+              if (!this.spendTacticalNode(budget)) {
+                allDefensesLose = false;
+                unresolved = true;
+                break;
               }
+              this.position.makeMove(defense.row, defense.col, defender);
+              let child: ThreatProof;
+              try {
+                child = this.position.isExactFiveAt(defense.row, defense.col, defender)
+                  ? { proof: 1, disproof: 0, move: null }
+                  : this.threatSpace(attacker, depthLeft - 1, budget);
+              } finally {
+                this.position.unmakeMove(defense.row, defense.col);
+              }
+              if (child.disproof === 0) {
+                allDefensesLose = false;
+                unresolved = false;
+                break;
+              }
+              if (child.proof !== 0) {
+                allDefensesLose = false;
+                unresolved = true;
+                break;
+              }
+            }
+            if (allDefensesLose && defenses.complete) {
+              moveProof = { proof: 0, disproof: PROOF_INFINITY, move };
+            } else if (unresolved) {
+              moveProof = { proof: 1, disproof: 1, move: null };
             }
           }
         }
@@ -601,17 +641,17 @@ class GomokuSearch {
         this.position.unmakeMove(move.row, move.col);
       }
 
-      proof = Math.min(proof, moveProof);
-      disproof = saturatingAdd(disproof, moveDisproof);
-      if (moveProof === 0 && !budget.exhausted) {
+      if (moveProof.proof === 0 && !budget.exhausted) {
         this.store(this.threatTt, attacker, depthLeft, 1, 'exact', move, attacker);
         return { proof: 0, disproof: PROOF_INFINITY, move };
       }
+      if (moveProof.disproof !== 0) sawUnknown = true;
       if (budget.exhausted) break;
     }
 
-    if (!budget.exhausted) this.store(this.threatTt, attacker, depthLeft, -1, 'exact', null, attacker);
-    return { proof: Math.max(1, proof), disproof: Math.min(disproof, PROOF_INFINITY), move: null };
+    if (budget.exhausted || sawUnknown) return { proof: 1, disproof: 1, move: null };
+    this.store(this.threatTt, attacker, depthLeft, -1, 'exact', null, attacker);
+    return { proof: 1, disproof: 0, move: null };
   }
 
   findThreatDefenses(
@@ -621,19 +661,19 @@ class GomokuSearch {
     depth: number,
     budget: TacticalBudget,
   ): AiWorkerMove[] {
-    const options = this.candidates(defender, 0, depth, true);
-    const seen = new Set(options.map(moveIndex));
-    for (let index = 0; index < GOMOKU_AI_SIZE * GOMOKU_AI_SIZE; index += 1) {
-      const move = moveFromIndex(index);
-      if (!seen.has(index) && this.position.isLegal(move.row, move.col, defender)) {
-        options.push(move);
-        seen.add(index);
-      }
-    }
-    if (this.position.isLegal(attackerFirst.row, attackerFirst.col, defender) &&
-      !options.some((move) => sameMove(move, attackerFirst))) options.unshift(attackerFirst);
+    const optionMap = new Map<number, AiWorkerMove>();
+    const add = (move: AiWorkerMove) => {
+      if (this.position.isLegal(move.row, move.col, defender)) optionMap.set(moveIndex(move), move);
+    };
+    add(attackerFirst);
+    for (const move of this.position.immediateWinningMoves(defender)) add(move);
+    for (const move of this.position.immediateWinningMoves(attacker)) add(move);
+    for (const move of this.forcingMoves(defender, true, GOMOKU_AI_SIZE * GOMOKU_AI_SIZE)) add(move);
+    for (const move of this.forcingMoves(attacker, true, GOMOKU_AI_SIZE * GOMOKU_AI_SIZE)) add(move);
+    for (const move of this.candidates(defender, 0, depth, true)) add(move);
+
     const defenses: AiWorkerMove[] = [];
-    for (const move of options) {
+    for (const move of optionMap.values()) {
       if (budget.exhausted) break;
       this.position.makeMove(move.row, move.col, defender);
       try {
@@ -642,10 +682,11 @@ class GomokuSearch {
           continue;
         }
         const probe = this.threatSpace(attacker, Math.max(1, depth - 1), budget);
-        if (probe.proof !== 0 && !budget.exhausted) defenses.push(move);
+        if (probe.disproof === 0 && !budget.exhausted) defenses.push(move);
       } finally {
         this.position.unmakeMove(move.row, move.col);
       }
+      if (defenses.length >= MAX_VCT_ROOT_DEFENSES) break;
     }
     return defenses;
   }
@@ -712,7 +753,9 @@ export function searchGomokuMove(
   onDepth?: AiDepthReporter,
   options?: GomokuSearchOptions,
 ): AiSearchResult {
-  const phaseBudgetMs = gomokuPhaseBudgetMs(board, configuredBudgetMs);
+  const phaseBudgetMs = options?.ignorePhaseBudget
+    ? Math.max(1, configuredBudgetMs)
+    : gomokuPhaseBudgetMs(board, configuredBudgetMs);
   const absoluteRemainingMs = options?.deadlineAt === undefined
     ? phaseBudgetMs
     : options.deadlineAt - Date.now() - WORKER_RETURN_MARGIN_MS;
@@ -740,7 +783,7 @@ export function searchGomokuMove(
 
   const useOpeningBook = options?.useOpeningBook ?? options?.maxSearchNodes === undefined;
   if (useOpeningBook && budgetMs > 0) {
-    const opening = lookupGomokuOpeningMove(board, turn);
+    const opening = lookupGomokuOpeningMove(board, turn, options?.openingBookSeed);
     if (opening && search.position.isLegal(opening.row, opening.col, turn)) {
       onDepth?.({ depth: 0, move: opening, score: 0 });
       return search.result(opening, 0, 0, 'opening_book');
@@ -762,17 +805,27 @@ export function searchGomokuMove(
     }
 
     if (budgetMs >= 700 && search.position.stoneCount >= 5 && search.remainingMs() >= 250) {
-      const ownBudget: TacticalBudget = { remaining: 6_000, exhausted: false };
+      const early = search.position.stoneCount <= 8;
+      const ownBudget: TacticalBudget = {
+        remaining: early ? EARLY_VCT_OWN_NODE_BUDGET : FULL_VCT_OWN_NODE_BUDGET,
+        exhausted: false,
+      };
       const ownProof = search.threatSpace(turn, THREAT_MAX_DEPTH, ownBudget);
       if (ownProof.proof === 0 && ownProof.move && !ownBudget.exhausted) {
         onDepth?.({ depth: THREAT_MAX_DEPTH, move: ownProof.move, score: WIN - 500 });
         return search.result(ownProof.move, THREAT_MAX_DEPTH, WIN - 500, 'vct');
       }
 
-      const opponentBudget: TacticalBudget = { remaining: 4_000, exhausted: false };
+      const opponentBudget: TacticalBudget = {
+        remaining: early ? EARLY_VCT_OPPONENT_NODE_BUDGET : FULL_VCT_OPPONENT_NODE_BUDGET,
+        exhausted: false,
+      };
       const opponentProof = search.threatSpace(opponent, THREAT_MAX_DEPTH, opponentBudget);
       if (opponentProof.proof === 0 && opponentProof.move && !opponentBudget.exhausted && search.remainingMs() >= 200) {
-        const defenseBudget: TacticalBudget = { remaining: 5_000, exhausted: false };
+        const defenseBudget: TacticalBudget = {
+          remaining: early ? EARLY_VCT_DEFENSE_NODE_BUDGET : FULL_VCT_DEFENSE_NODE_BUDGET,
+          exhausted: false,
+        };
         const defenses = search.findThreatDefenses(turn, opponent, opponentProof.move, THREAT_MAX_DEPTH, defenseBudget);
         if (defenses.length > 0 && !defenseBudget.exhausted) restrictedRoot = defenses;
       }
