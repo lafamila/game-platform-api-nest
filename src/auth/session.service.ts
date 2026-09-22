@@ -4,14 +4,16 @@ import {
   Logger,
   OnModuleDestroy,
   OnModuleInit,
+  Optional,
   ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
-import { DatabaseService } from '../database/database.service';
+import { DatabaseQueryExecutor, DatabaseService } from '../database/database.service';
 import { env, hasEnv, intEnv, listEnv } from '../config/env';
 import { AuthService } from './auth.service';
 import { AuthAccount, GamePlatformSession, LoginTransaction } from './auth.types';
+import { ChatBridgeService } from '../chat/chat-bridge.service';
 
 interface TokenResponse {
   access_token?: string;
@@ -47,6 +49,26 @@ export interface LoginReadinessResponse {
     jwks: ReadinessProbe;
   };
 }
+
+export interface AccountSessionRefreshResult {
+  refreshed: GamePlatformSession[];
+  rejectedSessionIds: string[];
+}
+
+interface RefreshOptions {
+  requireFreshRotation: boolean;
+  allowUnavailableSoftFail: boolean;
+}
+
+const NORMAL_REFRESH_OPTIONS: RefreshOptions = {
+  requireFreshRotation: false,
+  allowUnavailableSoftFail: true,
+};
+
+const WEBHOOK_REFRESH_OPTIONS: RefreshOptions = {
+  requireFreshRotation: true,
+  allowUnavailableSoftFail: false,
+};
 
 /** 400/401/403 만 refresh token 영구 무효로 취급(D2 보류 전제). 그 외는 일시 장애. */
 const PERMANENT_AUTH_REJECT_STATUSES = new Set([400, 401, 403]);
@@ -90,6 +112,7 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
   constructor(
     private readonly db: DatabaseService,
     private readonly auth: AuthService,
+    @Optional() private readonly chat?: ChatBridgeService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -327,13 +350,29 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     if (!sessionId) {
       return;
     }
-    const session = await this.requireSession(sessionId).catch(() => undefined);
-    await this.db.query(`DELETE FROM app_sessions WHERE id = $1`, [sessionId]);
-    if (session?.refreshToken) {
+    await this.refreshLocks.get(sessionId)?.catch(() => undefined);
+    let refreshToken: string | undefined;
+    await this.db.withAdvisoryLock(`app-session-refresh:${sessionId}`, async (db) => {
+      const row = await db.one<AppSessionRow>(
+        `SELECT id, user_json, access_token, refresh_token, access_token_expires_at, created_at, last_seen_at, expires_at
+         FROM app_sessions
+         WHERE id = $1`,
+        [sessionId],
+      );
+      refreshToken = row?.refresh_token;
+      if (this.chat) {
+        await this.chat.revokeForGameSession(sessionId, async () => {
+          await db.query(`DELETE FROM app_sessions WHERE id = $1`, [sessionId]);
+        });
+      } else {
+        await db.query(`DELETE FROM app_sessions WHERE id = $1`, [sessionId]);
+      }
+    });
+    if (refreshToken) {
       await fetch(`${env('AUTH_API_BASE_URL', 'http://localhost:3032')}/oauth/revoke`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: session.refreshToken }),
+        body: JSON.stringify({ token: refreshToken }),
       }).catch(() => undefined);
     }
   }
@@ -343,6 +382,34 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
       throw sessionUnauthorized('SESSION_INVALID', 'Refreshable game-platform session is required');
     }
     return this.refreshSessionLocked(session);
+  }
+
+  async refreshAccountSessions(accountId: string): Promise<AccountSessionRefreshResult> {
+    const result = await this.db.query<AppSessionRow>(
+      `SELECT id, user_json, access_token, refresh_token, access_token_expires_at, created_at, last_seen_at, expires_at
+       FROM app_sessions
+       WHERE account_id = $1 AND expires_at > now()
+       ORDER BY created_at ASC`,
+      [accountId],
+    );
+    const refreshed: GamePlatformSession[] = [];
+    const rejectedSessionIds: string[] = [];
+    const retryableErrors: unknown[] = [];
+    for (const row of result.rows) {
+      try {
+        refreshed.push(await this.refreshSessionLocked(rowToSession(row), WEBHOOK_REFRESH_OPTIONS));
+      } catch (error) {
+        if (isSessionExpiredError(error)) {
+          rejectedSessionIds.push(row.id);
+          continue;
+        }
+        retryableErrors.push(error);
+      }
+    }
+    if (retryableErrors.length > 0) {
+      throw retryableErrors[0];
+    }
+    return { refreshed, rejectedSessionIds };
   }
 
   private buildAuthorizeUrl(transaction: LoginTransaction): string {
@@ -454,7 +521,10 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     return session;
   }
 
-  private async refreshSession(session: GamePlatformSession): Promise<GamePlatformSession> {
+  private async refreshSession(
+    session: GamePlatformSession,
+    db: DatabaseQueryExecutor = this.db,
+  ): Promise<GamePlatformSession> {
     const token = await this.requestToken({
       grant_type: 'refresh_token',
       client_id: env('GAME_PLATFORM_OIDC_CLIENT_ID', 'game-platform-api'),
@@ -482,7 +552,7 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
       lastSeenAt: now,
       expiresAt: this.slidingExpiresAt(session.createdAt, now),
     };
-    await this.db.query(
+    await db.query(
       `UPDATE app_sessions
        SET user_json = $2::jsonb,
            access_token = $3,
@@ -504,12 +574,33 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     return refreshed;
   }
 
-  private refreshSessionLocked(session: GamePlatformSession): Promise<GamePlatformSession> {
+  private refreshSessionLocked(
+    session: GamePlatformSession,
+    options: RefreshOptions = NORMAL_REFRESH_OPTIONS,
+  ): Promise<GamePlatformSession> {
     const existing = this.refreshLocks.get(session.id);
     if (existing) {
+      if (options.requireFreshRotation) {
+        return existing.then((latest) => this.refreshSessionLocked(latest, options));
+      }
       return existing;
     }
-    const refresh = this.refreshWithClassification(session).finally(() => {
+    const refresh = this.db.withAdvisoryLock(`app-session-refresh:${session.id}`, async (db) => {
+      const currentRow = await db.one<AppSessionRow>(
+        `SELECT id, user_json, access_token, refresh_token, access_token_expires_at, created_at, last_seen_at, expires_at
+         FROM app_sessions
+         WHERE id = $1`,
+        [session.id],
+      );
+      if (!currentRow || currentRow.expires_at.getTime() <= Date.now()) {
+        throw sessionUnauthorized('SESSION_EXPIRED', 'Game-platform session expired');
+      }
+      const current = rowToSession(currentRow);
+      if (current.refreshToken !== session.refreshToken && !options.requireFreshRotation) {
+        return current;
+      }
+      return this.refreshWithClassification(current, db, options.allowUnavailableSoftFail);
+    }).finally(() => {
       this.refreshLocks.delete(session.id);
     });
     this.refreshLocks.set(session.id, refresh);
@@ -523,12 +614,16 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
    *      0.5s 후 1회 재시도, 그래도 실패면 기존 access token 이 유효하면 soft-fail(세션 유지),
    *      만료 상태면 503 AUTH_UPSTREAM_UNAVAILABLE (세션은 삭제하지 않는다)
    */
-  private async refreshWithClassification(session: GamePlatformSession): Promise<GamePlatformSession> {
+  private async refreshWithClassification(
+    session: GamePlatformSession,
+    db: DatabaseQueryExecutor,
+    allowUnavailableSoftFail: boolean,
+  ): Promise<GamePlatformSession> {
     try {
-      return await this.refreshSession(session);
+      return await this.refreshSession(session, db);
     } catch (error) {
       if (error instanceof AuthRejectedError) {
-        return this.deleteRejectedSession(session);
+        return this.deleteRejectedSession(session, db);
       }
       if (!(error instanceof AuthUnavailableError)) {
         // 예기치 못한 오류 — 세션은 유지하고 원본 오류를 전파
@@ -538,24 +633,34 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
       this.logSessionEvent('refresh_failed', 'auth_unavailable', session.id);
       await wait(REFRESH_RETRY_DELAY_MS);
       try {
-        return await this.refreshSession(session);
+        return await this.refreshSession(session, db);
       } catch (retryError) {
         if (retryError instanceof AuthRejectedError) {
-          return this.deleteRejectedSession(session);
+          return this.deleteRejectedSession(session, db);
         }
-        if (session.accessTokenExpiresAt > Date.now()) {
+        if (allowUnavailableSoftFail && session.accessTokenExpiresAt > Date.now()) {
           // 기존 access token 이 아직 유효 → soft-fail 로 서비스 지속
           this.logSessionEvent('refresh_failed', 'auth_unavailable_softfail', session.id);
           return session;
         }
-        this.logSessionEvent('refresh_failed', 'auth_unavailable_expired', session.id);
+        this.logSessionEvent(
+          'refresh_failed',
+          allowUnavailableSoftFail ? 'auth_unavailable_expired' : 'auth_unavailable_webhook_retry',
+          session.id,
+        );
         throw authUpstreamUnavailable('Authentication service is temporarily unavailable. Please retry.');
       }
     }
   }
 
-  private async deleteRejectedSession(session: GamePlatformSession): Promise<never> {
-    await this.db.query(`DELETE FROM app_sessions WHERE id = $1`, [session.id]);
+  private async deleteRejectedSession(session: GamePlatformSession, db: DatabaseQueryExecutor): Promise<never> {
+    if (this.chat) {
+      await this.chat.revokeForGameSession(session.id, async () => {
+        await db.query(`DELETE FROM app_sessions WHERE id = $1`, [session.id]);
+      });
+    } else {
+      await db.query(`DELETE FROM app_sessions WHERE id = $1`, [session.id]);
+    }
     this.logSessionEvent('deleted', 'refresh_rejected', session.id);
     throw sessionUnauthorized('SESSION_EXPIRED', 'Game-platform session expired. Please login again');
   }
@@ -704,6 +809,18 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     }
     return url.toString();
   }
+}
+
+function isSessionExpiredError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+  const candidate = error as { status?: number; getResponse?: () => unknown };
+  if (candidate.status !== 401 || typeof candidate.getResponse !== 'function') {
+    return false;
+  }
+  const response = candidate.getResponse();
+  return Boolean(response && typeof response === 'object' && (response as { code?: unknown }).code === 'SESSION_EXPIRED');
 }
 
 export function sessionResponse(session: GamePlatformSession) {

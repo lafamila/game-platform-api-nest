@@ -18,10 +18,17 @@ class FakePresence {
 
 class FakeSocketServer {
   emitted = [];
+  disconnected = [];
 
   to(room) {
     return {
       emit: (event, data) => this.emitted.push({ room, event, data }),
+    };
+  }
+
+  in(room) {
+    return {
+      disconnectSockets: (close) => this.disconnected.push({ room, close }),
     };
   }
 }
@@ -60,6 +67,27 @@ test('events still reach the SSE stream after the socket bridge', () => {
   assert.deepEqual(sessionEvents[0].data, { rev: 9 });
 });
 
+test('revoking an app session notifies and completes its SSE stream and disconnects its socket room', () => {
+  const service = new RealtimeService(new FakePresence());
+  const server = new FakeSocketServer();
+  service.attachSocketServer(server);
+  const received = [];
+  let completed = false;
+  service.streamForAccount('acc-2', 'app-session-2').subscribe({
+    next: (event) => received.push(event),
+    complete: () => { completed = true; },
+  });
+
+  service.revokeSessions('acc-2', ['app-session-2'], { accountId: 'acc-2' });
+
+  assert.equal(completed, true);
+  assert.deepEqual(received.at(-1), {
+    type: 'session.revoked',
+    data: { accountId: 'acc-2' },
+  });
+  assert.deepEqual(server.disconnected, [{ room: 'app-session:app-session-2', close: true }]);
+});
+
 test('gateway routes crazy arcade socket input through the authenticated game queue', async () => {
   const account = {
     accountId: 'acc-3',
@@ -71,7 +99,7 @@ test('gateway routes crazy arcade socket input through the authenticated game qu
   const sessions = {
     async requireSession(sessionId) {
       assert.equal(sessionId, 'socket-session-1');
-      return { account };
+      return { id: sessionId, account };
     },
   };
   const realtime = new RealtimeService(new FakePresence());
@@ -103,7 +131,7 @@ test('gateway routes crazy arcade socket input through the authenticated game qu
     clientMoveId: 'move-1',
   });
 
-  assert.deepEqual(socket.joined, ['account:acc-3']);
+  assert.deepEqual(socket.joined, ['account:acc-3', 'app-session:socket-session-1']);
   assert.equal(result.ok, true);
   assert.deepEqual(games.calls, [
     {

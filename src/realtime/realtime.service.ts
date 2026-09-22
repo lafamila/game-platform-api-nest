@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { MessageEvent } from '@nestjs/common';
 import { randomUUID } from 'crypto';
-import { Observable, Subject, interval, map, merge } from 'rxjs';
+import { Observable, Subject, Subscriber, interval, map, merge } from 'rxjs';
 import type { Server } from 'socket.io';
 import { PresenceService } from './presence.service';
 
@@ -10,17 +10,24 @@ export interface PresenceChange {
   online: boolean;
 }
 
+interface SseConnection {
+  accountId: string;
+  sessionId?: string;
+  subscriber: Subscriber<MessageEvent>;
+}
+
 @Injectable()
 export class RealtimeService {
   private readonly accountStreams = new Map<string, Subject<MessageEvent>>();
   private readonly connectionCounts = new Map<string, number>();
   private readonly presenceSubject = new Subject<PresenceChange>();
   private readonly socketRefreshTimers = new Map<string, ReturnType<typeof setInterval>>();
+  private readonly sseConnections = new Map<string, SseConnection>();
   private socketServer?: Server;
 
   constructor(private readonly presence: PresenceService) {}
 
-  streamForAccount(accountId: string): Observable<MessageEvent> {
+  streamForAccount(accountId: string, sessionId?: string): Observable<MessageEvent> {
     const subject = this.subjectFor(accountId);
     const heartbeat = interval(25_000).pipe(
       map(() => ({
@@ -30,6 +37,7 @@ export class RealtimeService {
     );
     return new Observable<MessageEvent>((subscriber) => {
       const connectionId = randomUUID();
+      this.sseConnections.set(connectionId, { accountId, sessionId, subscriber });
       this.setConnectionCount(accountId, 1);
       void this.presence.connect(accountId, connectionId).then((changed) => {
         if (changed) {
@@ -41,6 +49,7 @@ export class RealtimeService {
       }, 25_000);
       const subscription = merge(subject.asObservable(), heartbeat).subscribe(subscriber);
       return () => {
+        this.sseConnections.delete(connectionId);
         clearInterval(refreshTimer);
         subscription.unsubscribe();
         this.setConnectionCount(accountId, -1);
@@ -61,6 +70,37 @@ export class RealtimeService {
         data: payload,
       });
       this.socketServer?.to(`account:${accountId}`).emit(event, payload);
+    }
+  }
+
+  revokeAccount(accountId: string, data: unknown): void {
+    const payload = normalizeMessageData(data);
+    this.socketServer?.to(`account:${accountId}`).emit('session.revoked', payload);
+    for (const connection of [...this.sseConnections.values()].filter((entry) => entry.accountId === accountId)) {
+      connection.subscriber.next({ type: 'session.revoked', data: payload });
+      connection.subscriber.complete();
+    }
+    this.accountStreams.delete(accountId);
+    this.socketServer?.in(`account:${accountId}`).disconnectSockets(true);
+  }
+
+  revokeSessions(accountId: string, sessionIds: string[], data: unknown): void {
+    const payload = normalizeMessageData(data);
+    for (const sessionId of new Set(sessionIds)) {
+      const room = `app-session:${sessionId}`;
+      this.socketServer?.to(room).emit('session.revoked', payload);
+      this.socketServer?.in(room).disconnectSockets(true);
+      for (const connection of [...this.sseConnections.values()].filter((entry) => entry.sessionId === sessionId)) {
+        connection.subscriber.next({ type: 'session.revoked', data: payload });
+        connection.subscriber.complete();
+      }
+    }
+    if (
+      sessionIds.length > 0 &&
+      ![...this.sseConnections.values()].some((entry) => entry.accountId === accountId) &&
+      !this.isAccountConnected(accountId)
+    ) {
+      this.accountStreams.delete(accountId);
     }
   }
 

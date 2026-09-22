@@ -2,6 +2,11 @@ import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { Pool, QueryResult, QueryResultRow } from 'pg';
 import { env } from '../config/env';
 
+export interface DatabaseQueryExecutor {
+  query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: unknown[]): Promise<QueryResult<T>>;
+  one<T extends QueryResultRow = QueryResultRow>(sql: string, params?: unknown[]): Promise<T | undefined>;
+}
+
 @Injectable()
 export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   private readonly pool = new Pool({
@@ -24,6 +29,24 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   async one<T extends QueryResultRow = QueryResultRow>(sql: string, params: unknown[] = []): Promise<T | undefined> {
     const result = await this.query<T>(sql, params);
     return result.rows[0];
+  }
+
+  async withAdvisoryLock<T>(key: string, callback: (db: DatabaseQueryExecutor) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    const executor: DatabaseQueryExecutor = {
+      query: (sql, params = []) => client.query(sql, params),
+      one: async (sql, params = []) => {
+        const result = await client.query(sql, params);
+        return result.rows[0];
+      },
+    };
+    try {
+      await client.query(`SELECT pg_advisory_lock(hashtextextended($1, 0))`, [key]);
+      return await callback(executor);
+    } finally {
+      await client.query(`SELECT pg_advisory_unlock(hashtextextended($1, 0))`, [key]).catch(() => undefined);
+      client.release();
+    }
   }
 
   ready(): Promise<void> {
@@ -53,6 +76,38 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     await this.query(
       `CREATE INDEX IF NOT EXISTS idx_app_sessions_refresh_issued ON app_sessions(refresh_token_issued_at) WHERE refresh_token_issued_at IS NOT NULL`,
     );
+
+    await this.query(`
+      CREATE TABLE IF NOT EXISTS auth_webhook_events (
+        event_id uuid PRIMARY KEY,
+        event_type text NOT NULL,
+        service_key text NOT NULL,
+        account_id text NOT NULL,
+        payload_json jsonb NOT NULL,
+        attempts integer NOT NULL DEFAULT 0,
+        last_error text NULL,
+        received_at timestamptz NOT NULL DEFAULT now(),
+        processed_at timestamptz NULL
+      )
+    `);
+    await this.query(
+      `CREATE INDEX IF NOT EXISTS idx_auth_webhook_events_account ON auth_webhook_events(account_id, received_at DESC)`,
+    );
+
+    await this.query(`
+      CREATE TABLE IF NOT EXISTS chat_session_links (
+        game_session_id text PRIMARY KEY REFERENCES app_sessions(id) ON DELETE CASCADE,
+        chat_session_id text NOT NULL,
+        chat_token text NOT NULL,
+        service_key text NOT NULL,
+        expires_at timestamptz NOT NULL,
+        response_json jsonb NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+    await this.query(`ALTER TABLE chat_session_links ADD COLUMN IF NOT EXISTS response_json jsonb`);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_chat_session_links_expiry ON chat_session_links(expires_at)`);
 
     await this.query(`
       CREATE TABLE IF NOT EXISTS login_transactions (

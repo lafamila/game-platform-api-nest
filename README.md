@@ -48,6 +48,38 @@ Flutter/native clients call:
 3. after auth callback, call `POST /api/session/oidc/complete`
 4. send `X-Game-Platform-Session` on protected API and realtime requests
 
+### Permission webhook
+
+Auth onboarding should include the game API callback (replace the host for production):
+
+```json
+{
+  "permissionWebhook": {
+    "url": "http://localhost:3035/api/auth/webhooks",
+    "signingSecretSource": "generated",
+    "eventTypes": ["permission.updated", "service_application.rejected"]
+  }
+}
+```
+
+Set the one-time generated secret as `AUTH_WEBHOOK_SECRET`. The receiver verifies
+`x-auth-webhook-id`, Unix-seconds `x-auth-webhook-timestamp`, and
+`x-auth-webhook-signature: v1=<HMAC-SHA256(timestamp + "." + rawBody)>`. Processing is
+durably deduplicated. `permission.updated` forces every active account session to rotate
+after any in-flight refresh and emits a token-free `permission.updated` realtime event.
+Auth-confirmed revocation emits `session.revoked` and disconnects the affected socket/SSE
+subscriptions.
+
+### Shared chat bridge
+
+Set `CHAT_API_URL` to enable `POST /api/chat/session`. The route accepts only an opaque
+game-platform session, exchanges the server-held auth access token with chat, and returns
+chat's public `{ token, sessionId, expiresAt, serviceKey, account }` shape. Auth access and
+refresh tokens are never returned. Logout and auth-confirmed session rejection attempt
+`DELETE /api/session/current` with the linked opaque chat token. If chat is unavailable,
+cleanup is best-effort and remote presence can remain only until that short chat session
+expires. Existing game friends, invitations, and game data remain unchanged.
+
 ## Smoke
 
 ```bash

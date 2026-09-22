@@ -20,6 +20,10 @@ import { SuperadminGuard } from './auth/superadmin.guard';
 import { ReplayController } from './replay/replay.controller';
 import { ReplayViewController } from './replay/replay-view.controller';
 import { ReplayService } from './replay/replay.service';
+import { AuthWebhookController } from './auth/auth-webhook.controller';
+import { AuthWebhookService } from './auth/auth-webhook.service';
+import { ChatBridgeController } from './chat/chat-bridge.controller';
+import { ChatBridgeService } from './chat/chat-bridge.service';
 
 @Module({
   controllers: [
@@ -32,6 +36,8 @@ import { ReplayService } from './replay/replay.service';
     RealtimeController,
     ReplayController,
     ReplayViewController,
+    AuthWebhookController,
+    ChatBridgeController,
   ],
   providers: [
     DatabaseService,
@@ -46,6 +52,8 @@ import { ReplayService } from './replay/replay.service';
     RealtimeGateway,
     PresenceService,
     ReplayService,
+    AuthWebhookService,
+    ChatBridgeService,
   ],
 })
 export class AppModule {}

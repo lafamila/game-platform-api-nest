@@ -51,8 +51,10 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
       const connectionId = randomUUID();
       client.data.accountId = accountId;
       client.data.account = session.account;
+      client.data.gameSessionId = session.id;
       client.data.connectionId = connectionId;
       await client.join(accountRoom(accountId));
+      await client.join(`app-session:${session.id}`);
       this.realtime.registerSocketConnection(accountId, connectionId);
       client.emit('connected', { accountId });
     } catch (error) {

@@ -1,7 +1,7 @@
-import { Controller, Sse, UseGuards } from '@nestjs/common';
+import { Controller, Req, Sse, UseGuards } from '@nestjs/common';
 import { Observable } from 'rxjs';
-import { CurrentUser } from '../auth/current-user';
-import { AuthAccount } from '../auth/auth.types';
+import { Request } from 'express';
+import { RequestWithAuth } from '../auth/auth.types';
 import { GamePlatformSessionGuard } from '../auth/session.guard';
 import { RealtimeService } from './realtime.service';
 import { MessageEvent } from '@nestjs/common';
@@ -12,7 +12,7 @@ export class RealtimeController {
   constructor(private readonly realtime: RealtimeService) {}
 
   @Sse('events')
-  events(@CurrentUser() user: AuthAccount): Observable<MessageEvent> {
-    return this.realtime.streamForAccount(user.accountId);
+  events(@Req() request: Request & Partial<RequestWithAuth>): Observable<MessageEvent> {
+    return this.realtime.streamForAccount(request.authAccount!.accountId, request.gameSession?.id);
   }
 }
