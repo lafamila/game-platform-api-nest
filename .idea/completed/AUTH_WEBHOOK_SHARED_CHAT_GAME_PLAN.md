@@ -6,7 +6,7 @@ summary: "Auth 웹훅으로 저장된 로그인 세션 권한을 갱신하고 �
 
 # Game API Execution
 
-Canonical: root workspace `.idea/AUTH_WEBHOOK_SHARED_CHAT_PLAN.md` (or `.idea/completed/` after integration completion).
+Canonical: [root workspace plan](../../../.idea/completed/AUTH_WEBHOOK_SHARED_CHAT_PLAN.md).
 
 - Receive signed `permission.updated` and application rejection events; validate service, timestamp, signature and event identity before processing.
 - Persist duplicate-delivery state. Serialize normal and webhook token refresh across processes, reload stored refresh tokens, continue across all account sessions, and return retryable errors when auth is unavailable.
