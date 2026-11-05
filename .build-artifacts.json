@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "groups": [
+    {
+      "id": "api-dist",
+      "description": "TypeScript로 컴파일한 Game Platform API 출력",
+      "strategy": "in_place",
+      "paths": ["dist/"]
+    }
+  ]
+}

@@ -9,3 +9,5 @@ npm-debug.log*
 .DS_Store
 
 .omc/
+.build-artifacts-state.json
+.build-artifacts-staging/

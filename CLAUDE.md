@@ -310,3 +310,9 @@ Normal local development uses `auth-api-nest` on `http://localhost:3032`, Postgr
 - `npm run test` passes.
 - `npm audit --audit-level=moderate` reports zero vulnerabilities.
 - `npm run smoke:local-flow` passes with local `auth-api-nest` and PostgreSQL.
+
+## Build Artifact Retention
+
+워크스페이스 루트 [CLAUDE.md 원칙 25](../CLAUDE.md)와 로컬 [.build-artifacts.json](./.build-artifacts.json)을 빌드 산출물 목록의 canonical 기준으로 삼는다. 공용 `$build-artifacts list|build|clean`을 사용하며 기본 동작은 `list`이고, 파일 수정 시각만으로 빌드 성공을 추정하지 않는다.
+
+직전 성공 빌드는 다음 빌드와 산출물 검증이 모두 성공할 때까지 보존하고, 성공 후 같은 그룹에서 대체된 직전 산출물만 삭제한다. 실패하면 직전 성공본을 복구하며 플랫폼·아키텍처·dev/prod·flavor·배포 형식은 서로 보존한다. 소스·assets·DB·사용자 데이터·비밀·dependencies·cache와 실행 중인 runtime 또는 설치된 앱 복사본은 정리 대상이 아니다.
