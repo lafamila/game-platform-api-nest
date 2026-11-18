@@ -125,6 +125,8 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
         updated_at timestamptz NOT NULL DEFAULT now()
       )
     `);
+    await this.query(`ALTER TABLE login_transactions ADD COLUMN IF NOT EXISTS login_proof_hash text`);
+    await this.query(`ALTER TABLE login_transactions ADD COLUMN IF NOT EXISTS previous_session_id text`);
 
     await this.query(`
       CREATE TABLE IF NOT EXISTS game_sessions (

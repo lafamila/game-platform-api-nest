@@ -73,9 +73,10 @@ async function main() {
 }
 
 async function login(loginId, password, options = {}) {
+  const loginProof = require('node:crypto').randomBytes(32).toString('base64url');
   const start = await api('/session/oidc/start', {
     method: 'POST',
-    body: options.returnUri ? { returnUri: options.returnUri } : {},
+    body: { returnUri: options.returnUri ?? 'gameplatform://auth/callback', loginProof },
   });
   const authorizeUrl = new URL(start.authorizeUrl);
   const loginBody = new URLSearchParams();
@@ -115,7 +116,7 @@ async function login(loginId, password, options = {}) {
 
   return api('/session/oidc/complete', {
     method: 'POST',
-    body: { loginTransactionId: start.loginTransactionId },
+    body: { loginTransactionId: start.loginTransactionId, loginProof },
   });
 }
 

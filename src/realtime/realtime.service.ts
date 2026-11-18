@@ -27,7 +27,7 @@ export class RealtimeService {
 
   constructor(private readonly presence: PresenceService) {}
 
-  streamForAccount(accountId: string, sessionId?: string): Observable<MessageEvent> {
+  streamForAccount(accountId: string, sessionId?: string, validateSession?: () => Promise<unknown>): Observable<MessageEvent> {
     const subject = this.subjectFor(accountId);
     const heartbeat = interval(25_000).pipe(
       map(() => ({
@@ -46,6 +46,10 @@ export class RealtimeService {
       });
       const refreshTimer = setInterval(() => {
         void this.presence.refresh(accountId, connectionId);
+        void validateSession?.().catch((error: unknown) => {
+          const failure = terminalSessionFailure(error);
+          if (failure && sessionId) this.revokeSessions(accountId, [sessionId], failure);
+        });
       }, 25_000);
       const subscription = merge(subject.asObservable(), heartbeat).subscribe(subscriber);
       return () => {
@@ -108,7 +112,7 @@ export class RealtimeService {
     this.socketServer = server;
   }
 
-  registerSocketConnection(accountId: string, connectionId: string): void {
+  registerSocketConnection(accountId: string, connectionId: string, validateSession?: () => Promise<unknown>, sessionId?: string): void {
     this.setConnectionCount(accountId, 1);
     void this.presence.connect(accountId, connectionId).then((changed) => {
       if (changed) {
@@ -117,6 +121,10 @@ export class RealtimeService {
     });
     const refreshTimer = setInterval(() => {
       void this.presence.refresh(accountId, connectionId);
+      void validateSession?.().catch((error: unknown) => {
+        const failure = terminalSessionFailure(error);
+        if (failure && sessionId) this.revokeSessions(accountId, [sessionId], failure);
+      });
     }, 25_000);
     refreshTimer.unref?.();
     this.socketRefreshTimers.set(connectionId, refreshTimer);
@@ -172,6 +180,13 @@ export class RealtimeService {
     }
     this.connectionCounts.set(accountId, next);
   }
+}
+
+function terminalSessionFailure(error: unknown): object | undefined {
+  const candidate = error as { status?: number; getResponse?: () => unknown } | undefined;
+  if (candidate?.status !== 401) return undefined;
+  const response = candidate.getResponse?.();
+  return response && typeof response === 'object' ? response : { code: 'SESSION_EXPIRED', message: 'Game-platform session expired' };
 }
 
 function normalizeMessageData(data: unknown): string | object {

@@ -91,11 +91,53 @@ Every 401/503 from the session guard/service carries a stable `code` alongside t
 | 401 | `AUTH_REQUIRED` | No session id / bearer presented; login transaction not usable |
 | 401 | `SESSION_INVALID` | Malformed Authorization header, invalid bearer/token response, non-refreshable session |
 | 401 | `SESSION_EXPIRED` | Session row expired, or auth permanently rejected the refresh (400/401/403) |
+| 401 | `SESSION_AUTH_METHOD_DENIED` | Auth method policy denial or unverifiable game login provenance; preserve `message` and Auth `bodyCode` |
 | 503 | `AUTH_UPSTREAM_UNAVAILABLE` | Auth temporarily unreachable and local access token already expired |
 
 Response body shape (additive — `code` added, other fields preserved): `{ "statusCode": 401, "code": "SESSION_EXPIRED", "message": "…", "error": "Unauthorized" }`.
 
 Note: `auth.service.ts` (bearer verification for non-session consumers) and `social.service.ts` defensive post-guard checks still throw code-less 401s; the Flutter client uses the session-id path, which is fully covered.
+
+### Current Login Policy
+
+Canonical execution plan: `.idea/AUTH_GAME_LOGIN_POLICY_PLAN.md`, under the root
+Auth social production readiness plan. Only verified
+`https://lafamila.xyz/claims/service_category=game` plus
+`https://lafamila.xyz/claims/authentication_method=kakao` produces the Kakao game
+denial. Linked providers do not affect this decision; local/google/naver and
+explicit non-game categories remain permitted. Missing category/method or game
+`legacy` provenance refreshes an existing server-held refresh token once; a
+non-refreshable or still-unverifiable token requires reauthentication. Temporary
+Auth failure preserves the row but does not authorize missing provenance.
+
+Auth policy codes `AUTHENTICATION_METHOD_NOT_ALLOWED` and
+`AUTHENTICATION_METHOD_REAUTHENTICATION_REQUIRED` become terminal HTTP 401
+`SESSION_AUTH_METHOD_DENIED`, with original Auth code in `bodyCode` and exact
+description in `message`. Cleanup deletes only the affected RP session/chat link,
+notifies/disconnects its socket/SSE room, and clears only its matching cookie.
+Permission webhook reconciliation must not escalate this to account-wide logout.
+Failed new Kakao login/account switching is not evidence against an existing
+local/Google RP session. After validating callback state/native proof, reconcile
+the previous session using its own claims/refresh; preserve it if permitted.
+Failed `/oidc/complete` returns `sessionInvalidated:false` in that case: display
+the attempt's message and discard only the pending login transaction. Only
+`sessionInvalidated:true` authorizes completion-driven client logout. Protected
+request denials and scoped `session.revoked` still terminate the actual session.
+
+Native login requires a random 32-byte base64url `loginProof` in both
+`POST /session/oidc/start` and `/session/oidc/complete`; only its SHA-256 hash is
+stored. The proof never enters Auth URLs or return links. Failed native callbacks
+only record the failure: old-session cleanup waits for proof-verified completion.
+Browser callbacks must match the HttpOnly initiating state cookie before any
+session side effects. Pending legacy native transactions need a new login.
+
+Socket inputs revalidate their opaque session; existing 25-second presence ticks
+also reconcile socket/SSE sessions. Auth is contacted only for missing provenance
+or the normal <=5-minute token refresh threshold. Already-valid allowed JWTs do
+not learn a later category/method change until refresh; no instant revocation or
+durable cross-instance denial-message replay is claimed. New account metadata
+fields are optional `authenticationMethod` (`local|google|kakao|naver|legacy`) and
+`serviceCategory`; no Auth tokens are added to client responses. No new env keys.
 
 ### Disconnect-cause instrumentation
 

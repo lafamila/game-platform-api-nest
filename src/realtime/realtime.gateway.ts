@@ -11,7 +11,6 @@ import {
 } from '@nestjs/websockets';
 import { randomUUID } from 'crypto';
 import { Server, Socket } from 'socket.io';
-import { AuthAccount } from '../auth/auth.types';
 import { GamePlatformSessionService } from '../auth/session.service';
 import { listEnv } from '../config/env';
 import { GamesService } from '../games/games.service';
@@ -55,7 +54,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
       client.data.connectionId = connectionId;
       await client.join(accountRoom(accountId));
       await client.join(`app-session:${session.id}`);
-      this.realtime.registerSocketConnection(accountId, connectionId);
+      this.realtime.registerSocketConnection(accountId, connectionId, () => this.sessions.requireSession(session.id), session.id);
       client.emit('connected', { accountId });
     } catch (error) {
       const response = hasGetResponse(error) ? (error.getResponse() as { code?: string; message?: string }) : undefined;
@@ -73,10 +72,12 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     @MessageBody() body: unknown,
   ): Promise<{ ok: true; session: unknown } | { ok: false; code: string; message: string }> {
     try {
-      const account = client.data?.account as AuthAccount | undefined;
-      if (!account) {
+      if (!client.data?.gameSessionId) {
         throw new UnauthorizedException('Game-platform socket session is required');
       }
+      const current = await this.sessions.requireSession(client.data.gameSessionId);
+      const account = current.account;
+      client.data.account = account;
       const payload = isRecord(body) ? body : {};
       const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
       if (!sessionId) {
@@ -92,6 +93,10 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
       };
     } catch (error) {
       const response = hasGetResponse(error) ? (error.getResponse() as { code?: string; message?: string }) : undefined;
+      if ((error as { status?: number })?.status === 401) {
+        client.emit('auth_error', response);
+        client.disconnect(true);
+      }
       return {
         ok: false,
         code: response?.code ?? 'CRAZY_ARCADE_INPUT_FAILED',

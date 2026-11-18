@@ -9,7 +9,10 @@ const account = {
   subject: 'player-1',
   serviceKey: 'game-platform',
   permission: 'player',
-  claims: {},
+  claims: {
+    'https://lafamila.xyz/claims/service_category': 'game',
+    'https://lafamila.xyz/claims/authentication_method': 'local',
+  },
 };
 
 process.env.GAME_PLATFORM_OIDC_CLIENT_SECRET = 'test-secret';
@@ -56,6 +59,7 @@ class FakeLoginDb {
         error_code: null,
         error: null,
         expires_at: new Date(Date.now() + 60_000),
+        login_proof_hash: 'app-proof-hash',
       };
     }
     if (sql.includes('FROM app_sessions') && args[0] === 'session-1') {

@@ -8,12 +8,17 @@ import {
   ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { DatabaseQueryExecutor, DatabaseService } from '../database/database.service';
 import { env, hasEnv, intEnv, listEnv } from '../config/env';
 import { AuthService } from './auth.service';
 import { AuthAccount, GamePlatformSession, LoginTransaction } from './auth.types';
 import { ChatBridgeService } from '../chat/chat-bridge.service';
+import { RealtimeService } from '../realtime/realtime.service';
+import {
+  AuthMethodFailure, AuthMethodPolicyError, AUTH_METHOD_DENIED,
+  KAKAO_GAME_MESSAGE, SESSION_AUTH_METHOD_DENIED, authMethodFailure, upstreamAuthMethodFailure,
+} from './auth-method-policy';
 
 interface TokenResponse {
   access_token?: string;
@@ -53,6 +58,7 @@ export interface LoginReadinessResponse {
 export interface AccountSessionRefreshResult {
   refreshed: GamePlatformSession[];
   rejectedSessionIds: string[];
+  policyRejectedSessionIds?: string[];
 }
 
 interface RefreshOptions {
@@ -90,7 +96,9 @@ const KEEPALIVE_ROTATE_BEFORE_MS = 24 * 60 * 60 * 1000; // refresh 만료 24h �
 const KEEPALIVE_BATCH_SIZE = 50;
 
 /** auth 가 refresh 를 영구 거절(400/401/403)했을 때. */
-class AuthRejectedError extends Error {}
+class AuthRejectedError extends Error {
+  constructor(message: string, readonly policy?: AuthMethodFailure) { super(message); }
+}
 /** auth 가 일시적으로 불가(5xx·네트워크·JWKS 미로딩)일 때. */
 class AuthUnavailableError extends Error {}
 
@@ -113,6 +121,7 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     private readonly db: DatabaseService,
     private readonly auth: AuthService,
     @Optional() private readonly chat?: ChatBridgeService,
+    @Optional() private readonly realtime?: RealtimeService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -167,21 +176,28 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     };
   }
 
-  async startOidcLogin(input: { returnUri?: string }): Promise<{ authorizeUrl: string; loginTransactionId: string; expiresAt: string }> {
+  async startOidcLogin(input: { returnUri?: string; loginProof?: string; previousSessionId?: string }): Promise<{ authorizeUrl: string; loginTransactionId: string; expiresAt: string }> {
     const verifier = randomToken(48);
+    const returnUri = this.normalizeReturnUri(input.returnUri);
+    const native = isNativeReturnUri(returnUri);
+    if (native && (typeof input.loginProof !== 'string' || !/^[A-Za-z0-9_-]{43,128}$/.test(input.loginProof))) {
+      throw new BadRequestException('Native login requires a random loginProof');
+    }
     const transaction: LoginTransaction = {
       id: randomToken(32),
       state: randomToken(32),
       verifier,
       codeChallenge: pkceChallenge(verifier),
-      returnUri: this.normalizeReturnUri(input.returnUri),
+      returnUri,
+      loginProofHash: native ? pkceChallenge(input.loginProof!) : undefined,
+      previousSessionId: input.previousSessionId,
       expiresAt: Date.now() + 5 * 60 * 1000,
       status: 'pending',
     };
     await this.db.query(
       `INSERT INTO login_transactions
-       (id, state, verifier, code_challenge, return_uri, status, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7 / 1000.0))`,
+       (id, state, verifier, code_challenge, return_uri, status, expires_at, login_proof_hash, previous_session_id)
+       VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7 / 1000.0), $8, $9)`,
       [
         transaction.id,
         transaction.state,
@@ -190,6 +206,8 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
         transaction.returnUri ?? null,
         transaction.status,
         transaction.expiresAt,
+        transaction.loginProofHash ?? null,
+        transaction.previousSessionId ?? null,
       ],
     );
     return {
@@ -204,9 +222,15 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     state?: string;
     error?: string;
     errorDescription?: string;
-  }): Promise<{ loginTransactionId?: string; redirectUri?: string; session?: GamePlatformSession; errorCode?: string; error?: string }> {
+    policyCode?: string;
+    browserState?: string;
+  }): Promise<{ loginTransactionId?: string; redirectUri?: string; session?: GamePlatformSession; errorCode?: string; error?: string; browserBound?: boolean; invalidatedSessionId?: string }> {
     const transaction = await this.findTransactionByState(input.state);
     if (!transaction) {
+      return { errorCode: 'invalid_state', error: 'Invalid or expired login state' };
+    }
+    const native = isNativeReturnUri(transaction.returnUri);
+    if (native ? !transaction.loginProofHash : !safeEqual(transaction.state, input.browserState)) {
       return { errorCode: 'invalid_state', error: 'Invalid or expired login state' };
     }
     if (transaction.status === 'completed' && transaction.sessionId) {
@@ -214,18 +238,27 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
         loginTransactionId: transaction.id,
         redirectUri: this.returnUriWithResult(transaction, 'success'),
         session: await this.requireSession(transaction.sessionId),
+        browserBound: !native,
       };
     }
     if (transaction.status !== 'pending') {
       return { errorCode: 'invalid_state', error: 'Invalid or expired login state' };
     }
     if (input.error) {
-      await this.markTransactionFailed(transaction.id, input.error, input.errorDescription ?? input.error);
+      const policy = upstreamAuthMethodFailure(input.policyCode ?? input.error, input.errorDescription)
+        ?? (input.error === 'access_denied' && input.errorDescription === KAKAO_GAME_MESSAGE
+          ? upstreamAuthMethodFailure(AUTH_METHOD_DENIED, input.errorDescription) : undefined);
+      const code = policy?.bodyCode ?? input.error;
+      const message = policy?.message ?? input.errorDescription ?? input.error;
+      await this.markTransactionFailed(transaction.id, code, message);
+      const invalidatedSessionId = policy && !native ? await this.invalidatePreviousSession(transaction.previousSessionId) : undefined;
       return {
         loginTransactionId: transaction.id,
-        redirectUri: this.returnUriWithResult(transaction, 'error', input.error, input.errorDescription ?? input.error),
-        errorCode: input.error,
-        error: input.errorDescription ?? input.error,
+        redirectUri: this.returnUriWithResult(transaction, 'error', code, message),
+        errorCode: code,
+        error: message,
+        browserBound: !native,
+        invalidatedSessionId,
       };
     }
     if (!input.code) {
@@ -258,28 +291,39 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
         loginTransactionId: transaction.id,
         redirectUri: this.returnUriWithResult(transaction, 'success'),
         session,
+        browserBound: !native,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Login failed';
-      await this.markTransactionFailed(transaction.id, 'login_failed', message);
+      const policy = error instanceof AuthMethodPolicyError ? error.failure : error instanceof AuthRejectedError ? error.policy : undefined;
+      const code = policy?.bodyCode ?? 'login_failed';
+      await this.markTransactionFailed(transaction.id, code, message);
+      const invalidatedSessionId = policy && !native ? await this.invalidatePreviousSession(transaction.previousSessionId) : undefined;
       return {
         loginTransactionId: transaction.id,
-        redirectUri: this.returnUriWithResult(transaction, 'error', 'login_failed', message),
-        errorCode: 'login_failed',
+        redirectUri: this.returnUriWithResult(transaction, 'error', code, message),
+        errorCode: code,
         error: message,
+        browserBound: !native,
+        invalidatedSessionId,
       };
     }
   }
 
-  async completeOidcLogin(loginTransactionId: string): Promise<GamePlatformSession> {
+  async completeOidcLogin(loginTransactionId: string, loginProof?: string, browserState?: string): Promise<GamePlatformSession> {
     const row = await this.db.one<{
       id: string;
       status: string;
       session_id: string | null;
       error: string | null;
+      error_code: string | null;
+      state: string;
+      return_uri: string | null;
+      login_proof_hash: string | null;
+      previous_session_id: string | null;
       expires_at: Date;
     }>(
-      `SELECT id, status, session_id, error, expires_at
+      `SELECT id, state, return_uri, status, session_id, error_code, error, expires_at, login_proof_hash, previous_session_id
        FROM login_transactions
        WHERE id = $1`,
       [loginTransactionId],
@@ -287,7 +331,16 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     if (!row || row.expires_at.getTime() <= Date.now()) {
       throw sessionUnauthorized('AUTH_REQUIRED', 'Login transaction expired');
     }
+    const native = isNativeReturnUri(row.return_uri ?? undefined);
+    if (native ? !row.login_proof_hash || typeof loginProof !== 'string' || !/^[A-Za-z0-9_-]{43,128}$/.test(loginProof) || !safeEqual(row.login_proof_hash, pkceChallenge(loginProof)) : !safeEqual(row.state, browserState)) {
+      throw sessionUnauthorized('AUTH_REQUIRED', 'Login proof is invalid');
+    }
     if (row.status === 'failed') {
+      const policy = upstreamAuthMethodFailure(row.error_code, row.error);
+      if (policy) {
+        const invalidatedSessionId = await this.invalidatePreviousSession(row.previous_session_id ?? undefined);
+        throw new AuthMethodPolicyError(policy, invalidatedSessionId, Boolean(invalidatedSessionId));
+      }
       throw sessionUnauthorized('AUTH_REQUIRED', row.error ?? 'Login failed');
     }
     if (row.status !== 'completed' || !row.session_id) {
@@ -318,8 +371,17 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
       throw sessionUnauthorized('SESSION_EXPIRED', 'Game-platform session expired');
     }
     let session = rowToSession(row);
-    if (session.accessTokenExpiresAt - Date.now() <= PREEMPTIVE_REFRESH_MS) {
+    const failure = authMethodFailure(session.account);
+    if (failure?.bodyCode === AUTH_METHOD_DENIED || (failure && !session.refreshToken)) {
+      return this.rejectPolicySession(session, this.db, failure);
+    }
+    if (failure || session.accessTokenExpiresAt - Date.now() <= PREEMPTIVE_REFRESH_MS) {
       session = await this.refreshSessionLocked(session);
+    }
+    const remainingFailure = authMethodFailure(session.account);
+    if (remainingFailure) {
+      // A transient Auth outage cannot validate missing provenance; keep the row for retry.
+      throw authUpstreamUnavailable('Authentication method could not be verified. Please retry.');
     }
     session = await this.extendSlidingSession(session);
     return session;
@@ -331,6 +393,8 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     }
     if (input.bearerToken) {
       const account = await this.auth.verifyBearerToken(input.bearerToken);
+      const failure = authMethodFailure(account);
+      if (failure) throw new AuthMethodPolicyError(failure);
       const now = Date.now();
       return {
         id: `bearer:${account.accountId}`,
@@ -394,6 +458,7 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     );
     const refreshed: GamePlatformSession[] = [];
     const rejectedSessionIds: string[] = [];
+    const policyRejectedSessionIds: string[] = [];
     const retryableErrors: unknown[] = [];
     for (const row of result.rows) {
       try {
@@ -401,6 +466,7 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
       } catch (error) {
         if (isSessionExpiredError(error)) {
           rejectedSessionIds.push(row.id);
+          if (error instanceof AuthMethodPolicyError) policyRejectedSessionIds.push(row.id);
           continue;
         }
         retryableErrors.push(error);
@@ -409,7 +475,7 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     if (retryableErrors.length > 0) {
       throw retryableErrors[0];
     }
-    return { refreshed, rejectedSessionIds };
+    return { refreshed, rejectedSessionIds, ...(policyRejectedSessionIds.length ? { policyRejectedSessionIds } : {}) };
   }
 
   private buildAuthorizeUrl(transaction: LoginTransaction): string {
@@ -439,8 +505,10 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
       error_code: string | null;
       error: string | null;
       expires_at: Date;
+      login_proof_hash: string | null;
+      previous_session_id: string | null;
     }>(
-      `SELECT id, state, verifier, code_challenge, return_uri, status, session_id, error_code, error, expires_at
+      `SELECT id, state, verifier, code_challenge, return_uri, status, session_id, error_code, error, expires_at, login_proof_hash, previous_session_id
        FROM login_transactions
        WHERE state = $1`,
       [state],
@@ -459,6 +527,8 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
       sessionId: row.session_id ?? undefined,
       errorCode: row.error_code ?? undefined,
       error: row.error ?? undefined,
+      loginProofHash: row.login_proof_hash ?? undefined,
+      previousSessionId: row.previous_session_id ?? undefined,
     };
   }
 
@@ -476,10 +546,13 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
       throw new AuthUnavailableError(errorMessage(error, 'Token exchange failed'));
     }
     if (!response.ok) {
-      const message = await responseText(response, 'Token exchange failed');
+      const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+      const policy = upstreamAuthMethodFailure(payload.code ?? payload.bodyCode, payload.error_description ?? payload.message);
+      const rawMessage = payload.error_description ?? payload.detail ?? payload.message ?? payload.error;
+      const message = typeof rawMessage === 'string' ? rawMessage : 'Token exchange failed';
       // 400/401/403 = 영구 거절(refresh token 무효), 그 외(5xx·429 등) = 일시 장애
       if (PERMANENT_AUTH_REJECT_STATUSES.has(response.status)) {
-        throw new AuthRejectedError(message);
+        throw new AuthRejectedError(message, policy);
       }
       throw new AuthUnavailableError(message);
     }
@@ -491,6 +564,8 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
       throw sessionUnauthorized('SESSION_INVALID', 'Invalid token response');
     }
     const account = await this.auth.verifyBearerToken(token.access_token);
+    const failure = authMethodFailure(account);
+    if (failure) throw new AuthMethodPolicyError(failure);
     const now = Date.now();
     const session: GamePlatformSession = {
       id: randomToken(32),
@@ -542,6 +617,8 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
       // refresh 직후 JWKS 미로딩/검증 실패(auth 재기동 중) = 일시 장애 (root §1.1-7)
       throw new AuthUnavailableError(errorMessage(error, 'Invalid refresh token response'));
     }
+    const failure = authMethodFailure(account);
+    if (failure) throw new AuthMethodPolicyError(failure);
     const now = Date.now();
     const refreshed: GamePlatformSession = {
       ...session,
@@ -622,8 +699,9 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     try {
       return await this.refreshSession(session, db);
     } catch (error) {
+      if (error instanceof AuthMethodPolicyError) return this.rejectPolicySession(session, db, error.failure);
       if (error instanceof AuthRejectedError) {
-        return this.deleteRejectedSession(session, db);
+        return error.policy ? this.rejectPolicySession(session, db, error.policy) : this.deleteRejectedSession(session, db);
       }
       if (!(error instanceof AuthUnavailableError)) {
         // 예기치 못한 오류 — 세션은 유지하고 원본 오류를 전파
@@ -636,8 +714,9 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
         return await this.refreshSession(session, db);
       } catch (retryError) {
         if (retryError instanceof AuthRejectedError) {
-          return this.deleteRejectedSession(session, db);
+          return retryError.policy ? this.rejectPolicySession(session, db, retryError.policy) : this.deleteRejectedSession(session, db);
         }
+        if (retryError instanceof AuthMethodPolicyError) return this.rejectPolicySession(session, db, retryError.failure);
         if (allowUnavailableSoftFail && session.accessTokenExpiresAt > Date.now()) {
           // 기존 access token 이 아직 유효 → soft-fail 로 서비스 지속
           this.logSessionEvent('refresh_failed', 'auth_unavailable_softfail', session.id);
@@ -663,6 +742,33 @@ export class GamePlatformSessionService implements OnModuleInit, OnModuleDestroy
     }
     this.logSessionEvent('deleted', 'refresh_rejected', session.id);
     throw sessionUnauthorized('SESSION_EXPIRED', 'Game-platform session expired. Please login again');
+  }
+
+  private async rejectPolicySession(session: GamePlatformSession, db: DatabaseQueryExecutor, failure: AuthMethodFailure): Promise<never> {
+    await this.removePolicySession(session, db, failure);
+    throw new AuthMethodPolicyError(failure, session.id);
+  }
+
+  private async removePolicySession(session: GamePlatformSession, db: DatabaseQueryExecutor, failure: AuthMethodFailure): Promise<void> {
+    const remove = async () => { await db.query('DELETE FROM app_sessions WHERE id = $1', [session.id]); };
+    if (this.chat) await this.chat.revokeForGameSession(session.id, remove);
+    else await remove();
+    this.realtime?.revokeSessions(session.account.accountId, [session.id], { code: SESSION_AUTH_METHOD_DENIED, ...failure });
+    this.logSessionEvent('deleted', failure.bodyCode, session.id);
+  }
+
+  private async invalidatePreviousSession(id: string | undefined): Promise<string | undefined> {
+    if (!id) return undefined;
+    // A failed new login is not evidence against the previous session's method.
+    const row = await this.db.one<AppSessionRow>('SELECT * FROM app_sessions WHERE id = $1', [id]);
+    if (!row || !authMethodFailure(row.user_json)) return undefined;
+    try {
+      await this.requireSession(id);
+    } catch (error) {
+      if (error instanceof AuthMethodPolicyError) return error.sessionId;
+      if (!(error instanceof UnauthorizedException) && !(error instanceof ServiceUnavailableException)) throw error;
+    }
+    return undefined;
   }
 
   private sessionIdleMs(): number {
@@ -820,7 +926,17 @@ function isSessionExpiredError(error: unknown): boolean {
     return false;
   }
   const response = candidate.getResponse();
-  return Boolean(response && typeof response === 'object' && (response as { code?: unknown }).code === 'SESSION_EXPIRED');
+  return Boolean(response && typeof response === 'object' && ['SESSION_EXPIRED', SESSION_AUTH_METHOD_DENIED].includes(String((response as { code?: unknown }).code)));
+}
+
+function isNativeReturnUri(uri: string | undefined): boolean {
+  return Boolean(uri && !['http:', 'https:'].includes(new URL(uri).protocol));
+}
+
+function safeEqual(expected: string, actual: string | undefined): boolean {
+  if (typeof actual !== 'string') return false;
+  const a = Buffer.from(expected), b = Buffer.from(actual);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 export function sessionResponse(session: GamePlatformSession) {
@@ -971,13 +1087,4 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
 
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message.trim().length > 0 ? error.message : fallback;
-}
-
-async function responseText(response: Response, fallback: string): Promise<string> {
-  try {
-    const body = (await response.json()) as { detail?: string; message?: string; error_description?: string };
-    return body.detail ?? body.message ?? body.error_description ?? fallback;
-  } catch {
-    return fallback;
-  }
 }

@@ -43,10 +43,30 @@ Flutter/native clients must not store auth client secrets. The API owns OIDC exc
 
 Flutter/native clients call:
 
-1. `POST /api/session/oidc/start`
+1. Generate a 32-byte random base64url `loginProof` in memory; send it with
+   `returnUri` to `POST /api/session/oidc/start`.
 2. open the returned `authorizeUrl`
-3. after auth callback, call `POST /api/session/oidc/complete`
+3. After a matching auth callback (success or failure), call
+   `POST /api/session/oidc/complete` with `loginTransactionId` and the same
+   `loginProof`. Never trust callback error text to log out a session directly.
 4. send `X-Game-Platform-Session` on protected API and realtime requests
+
+Auth must register the intended service category. Signed `service_category=game`
+and current `authentication_method=kakao` are denied; linked Kakao accounts using
+local/Google login remain allowed, as do explicit non-game categories. Unknown or
+legacy provenance refreshes once where possible, otherwise requires a new login.
+HTTP 401 `SESSION_AUTH_METHOD_DENIED` preserves Auth's `bodyCode` and exact
+`message`. Protected-request denials discard the affected opaque session/bearer.
+A failed new login does not replace the current session: `/oidc/complete` also
+returns `sessionInvalidated`. If false, display the attempt error and drop only
+the pending login proof/transaction, preserving an existing permitted session.
+Only the previous session's own policy rejection can make that flag true.
+Browser login uses an HttpOnly initiating-state cookie instead of native proof.
+The server adds two nullable `login_transactions` binding columns at startup;
+no new env values or dependency installation is needed. Deploy the API/native
+proof contract together; old pending native logins must restart. Realtime checks
+reuse the 25-second presence tick, but later Auth policy changes are not learned
+before token refresh. See `CLAUDE.md` for timing and offline-message limits.
 
 ### Permission webhook
 

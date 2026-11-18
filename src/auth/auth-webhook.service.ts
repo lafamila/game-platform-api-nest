@@ -115,15 +115,17 @@ export class AuthWebhookService {
           const result = await this.sessions.refreshAccountSessions(event.accountId);
           refreshedSessions = result.refreshed.length;
           const account = result.refreshed.at(-1)?.account;
-          if (result.refreshed.length === 0 && (event.data.status === 'revoked' || result.rejectedSessionIds.length > 0)) {
+          const policyRejected = new Set(result.policyRejectedSessionIds ?? []);
+          const rejectedSessionIds = result.rejectedSessionIds.filter((id) => !policyRejected.has(id));
+          if (policyRejected.size === 0 && result.refreshed.length === 0 && (event.data.status === 'revoked' || rejectedSessionIds.length > 0)) {
             this.realtime.revokeAccount(event.accountId, {
               eventId: event.id,
               accountId: event.accountId,
               reason: 'permission_revoked',
             });
           } else {
-            if (result.rejectedSessionIds.length > 0) {
-              this.realtime.revokeSessions(event.accountId, result.rejectedSessionIds, {
+            if (rejectedSessionIds.length > 0) {
+              this.realtime.revokeSessions(event.accountId, rejectedSessionIds, {
                 eventId: event.id,
                 accountId: event.accountId,
                 reason: 'permission_revoked',

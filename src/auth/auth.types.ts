@@ -1,6 +1,7 @@
 import { JWTPayload } from 'jose';
 
 export const SERVICE_CLAIM = 'https://lafamila.xyz/claims/service';
+export type AuthenticationMethod = 'local' | 'google' | 'kakao' | 'naver' | 'legacy';
 
 export interface AuthAccount {
   accountId: string;
@@ -10,6 +11,8 @@ export interface AuthAccount {
   email?: string;
   serviceKey: string;
   permission: string;
+  authenticationMethod?: AuthenticationMethod;
+  serviceCategory?: string;
   claims: Record<string, unknown>;
 }
 
@@ -35,6 +38,8 @@ export interface LoginTransaction {
   sessionId?: string;
   errorCode?: string;
   error?: string;
+  loginProofHash?: string;
+  previousSessionId?: string;
 }
 
 export interface RequestWithAuth {
@@ -65,8 +70,16 @@ export function accountFromPayload(payload: JWTPayload, serviceKey: string, deni
     email: stringClaim(claims, 'email'),
     serviceKey,
     permission,
+    authenticationMethod: authenticationMethodClaim(claims),
+    serviceCategory: stringClaim(claims, 'https://lafamila.xyz/claims/service_category'),
     claims,
   };
+}
+
+function authenticationMethodClaim(claims: Record<string, unknown>): AuthenticationMethod | undefined {
+  const value = claims['https://lafamila.xyz/claims/authentication_method'];
+  return typeof value === 'string' && ['local', 'google', 'kakao', 'naver', 'legacy'].includes(value)
+    ? value as AuthenticationMethod : undefined;
 }
 
 function extractPermission(claims: Record<string, unknown>, serviceKey: string): string | undefined {

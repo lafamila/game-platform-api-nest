@@ -3,8 +3,9 @@ import { Request, Response } from 'express';
 import { env, intEnv } from '../config/env';
 import { CurrentUser } from './current-user';
 import { AuthAccount, RequestWithAuth } from './auth.types';
-import { GamePlatformSessionGuard, setSessionCookie } from './session.guard';
+import { clearRejectedSessionCookie, extractOidcState, GamePlatformSessionGuard, oidcStateCookieName, setSessionCookie } from './session.guard';
 import { GamePlatformSessionService, sessionResponse } from './session.service';
+import { isAuthMethodPolicyError, upstreamAuthMethodFailure } from './auth-method-policy';
 
 @Controller('session')
 export class SessionController {
@@ -20,8 +21,15 @@ export class SessionController {
   }
 
   @Post('oidc/start')
-  startOidcLogin(@Body() body: { returnUri?: string }) {
-    return this.sessions.startOidcLogin(body);
+  async startOidcLogin(@Body() body: { returnUri?: string; loginProof?: string }, @Req() request: Request, @Res({ passthrough: true }) response: Response) {
+    const guard = new GamePlatformSessionGuard(this.sessions);
+    const result = await this.sessions.startOidcLogin({ returnUri: body.returnUri, loginProof: body.loginProof, previousSessionId: guard.extractSessionId(request) });
+    if (!body.returnUri || !isAppRedirectUri(body.returnUri)) {
+      response.cookie(oidcStateCookieName(), new URL(result.authorizeUrl).searchParams.get('state'), {
+        httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/api/session/oidc', maxAge: 300_000,
+      });
+    }
+    return result;
   }
 
   @Get('oidc/callback')
@@ -30,10 +38,17 @@ export class SessionController {
     @Query('state') state: string | undefined,
     @Query('error') error: string | undefined,
     @Query('error_description') errorDescription: string | undefined,
+    @Query('error_code') errorCode: string | undefined,
+    @Query('bodyCode') bodyCode: string | undefined,
+    @Req() request: Request,
     @Res() response: Response,
   ) {
-    const result = await this.sessions.completeOidcCallback({ code, state, error, errorDescription });
-    if (result.session) {
+    const result = await this.sessions.completeOidcCallback({ code, state, error, errorDescription, policyCode: bodyCode ?? errorCode ?? (error ? code : undefined), browserState: extractOidcState(request) });
+    if (result.browserBound) {
+      response.clearCookie(oidcStateCookieName(), { path: '/api/session/oidc' });
+      if (upstreamAuthMethodFailure(result.errorCode, result.error)) clearRejectedSessionCookie(response, request, result.invalidatedSessionId);
+    }
+    if (result.session && result.browserBound) {
       setSessionCookie(response, result.session.id, intEnv('GAME_PLATFORM_SESSION_MAX_AGE_SECONDS', 604800));
     }
     if (result.redirectUri) {
@@ -48,8 +63,14 @@ export class SessionController {
   }
 
   @Post('oidc/complete')
-  async completeOidcLogin(@Body() body: { loginTransactionId: string }, @Res({ passthrough: true }) response: Response) {
-    const session = await this.sessions.completeOidcLogin(body.loginTransactionId);
+  async completeOidcLogin(@Body() body: { loginTransactionId: string; loginProof?: string }, @Req() request: Request, @Res({ passthrough: true }) response: Response) {
+    let session;
+    try {
+      session = await this.sessions.completeOidcLogin(body.loginTransactionId, body.loginProof, extractOidcState(request));
+    } catch (error) {
+      if (isAuthMethodPolicyError(error)) clearRejectedSessionCookie(response, request, error.sessionId);
+      throw error;
+    }
     setSessionCookie(response, session.id, intEnv('GAME_PLATFORM_SESSION_MAX_AGE_SECONDS', 604800));
     return sessionResponse(session);
   }
@@ -66,7 +87,13 @@ export class SessionController {
     @Req() request: Request & Partial<RequestWithAuth>,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const session = await this.sessions.refreshSessionNow(request.gameSession);
+    let session;
+    try {
+      session = await this.sessions.refreshSessionNow(request.gameSession);
+    } catch (error) {
+      if (isAuthMethodPolicyError(error)) clearRejectedSessionCookie(response, request, error.sessionId);
+      throw error;
+    }
     setSessionCookie(response, session.id, intEnv('GAME_PLATFORM_SESSION_MAX_AGE_SECONDS', 604800));
     return sessionResponse(session);
   }
@@ -205,9 +232,7 @@ function appRedirectHtml(
       window.location.href = authLogoutUrl;
     });
 
-    if (${JSON.stringify(success)}) {
-      setTimeout(openApp, 350);
-    }
+    setTimeout(openApp, 350);
   </script>
 </body>
 </html>`;

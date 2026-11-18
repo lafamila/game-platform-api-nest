@@ -8,7 +8,10 @@ const account = {
   subject: 'player-1',
   serviceKey: 'game-platform',
   permission: 'player',
-  claims: {},
+  claims: {
+    'https://lafamila.xyz/claims/service_category': 'game',
+    'https://lafamila.xyz/claims/authentication_method': 'local',
+  },
 };
 
 const MINUTE_MS = 60_000;

@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 import { env } from '../config/env';
 import { RequestWithAuth } from './auth.types';
 import { GamePlatformSessionService, sessionUnauthorized } from './session.service';
+import { isAuthMethodPolicyError, SESSION_AUTH_METHOD_DENIED } from './auth-method-policy';
 
 @Injectable()
 export class GamePlatformSessionGuard implements CanActivate {
@@ -10,10 +11,19 @@ export class GamePlatformSessionGuard implements CanActivate {
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest<Request & Partial<RequestWithAuth>>();
-    const session = await this.sessions.requireTokenOrSession({
-      bearerToken: this.extractBearerToken(request),
-      sessionId: this.extractSessionId(request),
-    });
+    let session;
+    try {
+      session = await this.sessions.requireTokenOrSession({
+        bearerToken: this.extractBearerToken(request),
+        sessionId: this.extractSessionId(request),
+      });
+    } catch (error) {
+      const response = (error as { getResponse?: () => unknown })?.getResponse?.();
+      if (isAuthMethodPolicyError(error) || (typeof response === 'object' && response !== null && (response as { code?: unknown }).code === SESSION_AUTH_METHOD_DENIED)) {
+        clearRejectedSessionCookie(context.switchToHttp().getResponse<Response>(), request, this.extractSessionId(request));
+      }
+      throw error;
+    }
     request.authAccount = session.account;
     request.gameSession = session;
     return true;
@@ -24,16 +34,7 @@ export class GamePlatformSessionGuard implements CanActivate {
     if (typeof header === 'string' && header.trim()) {
       return header.trim();
     }
-    const cookieHeader = request.headers.cookie;
-    if (!cookieHeader) {
-      return undefined;
-    }
-    const cookieName = env('GAME_PLATFORM_SESSION_COOKIE_NAME', 'game_platform_session');
-    const cookie = cookieHeader
-      .split(';')
-      .map((entry) => entry.trim())
-      .find((entry) => entry.startsWith(`${cookieName}=`));
-    return cookie ? decodeURIComponent(cookie.split('=', 2)[1] ?? '') : undefined;
+    return extractSessionCookie(request);
   }
 
   private extractBearerToken(request: Request): string | undefined {
@@ -47,6 +48,30 @@ export class GamePlatformSessionGuard implements CanActivate {
     }
     return token.trim();
   }
+}
+
+export function clearSessionCookie(response: Response): void {
+  response.clearCookie(env('GAME_PLATFORM_SESSION_COOKIE_NAME', 'game_platform_session'), { path: '/' });
+}
+
+export function clearRejectedSessionCookie(response: Response, request: Request, rejectedId?: string): void {
+  if (rejectedId && extractSessionCookie(request) === rejectedId) clearSessionCookie(response);
+}
+
+function extractSessionCookie(request: Request): string | undefined {
+  const prefix = `${env('GAME_PLATFORM_SESSION_COOKIE_NAME', 'game_platform_session')}=`;
+  const cookie = request.headers.cookie?.split(';').map((entry) => entry.trim()).find((entry) => entry.startsWith(prefix));
+  return cookie ? decodeURIComponent(cookie.slice(prefix.length)) : undefined;
+}
+
+export function oidcStateCookieName(): string {
+  return `${env('GAME_PLATFORM_SESSION_COOKIE_NAME', 'game_platform_session')}_oidc_state`;
+}
+
+export function extractOidcState(request: Request): string | undefined {
+  const prefix = `${oidcStateCookieName()}=`;
+  const cookie = request.headers.cookie?.split(';').map((entry) => entry.trim()).find((entry) => entry.startsWith(prefix));
+  return cookie ? decodeURIComponent(cookie.slice(prefix.length)) : undefined;
 }
 
 export function setSessionCookie(response: Response, value: string, maxAgeSeconds: number): void {

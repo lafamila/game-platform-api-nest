@@ -116,6 +116,14 @@ test('forwards application rejection without rotating active sessions', async ()
   assert.equal(fixture.realtime.events[0].event, 'service_application.rejected');
 });
 
+test('policy rejection never escalates scoped cleanup into an account-wide disconnect', async () => {
+  const fixture = createFixture({ revokedSessionIds: ['kakao-session'], policyRejectedSessionIds: ['kakao-session'] });
+  await fixture.service.handle(signedEvent());
+  assert.equal(fixture.realtime.events.some((event) => event.event === 'session.revoked'), false,
+    'the session service already delivered its policy-specific scoped revocation');
+  assert.equal(fixture.realtime.events[0].event, 'permission.updated');
+});
+
 function signedEvent(overrides = {}) {
   const eventId = overrides.eventId ?? randomUUID();
   const timestamp = overrides.timestamp ?? String(Math.floor(Date.now() / 1000));
@@ -170,6 +178,7 @@ function createFixture(options = {}) {
             { id: 'session-2', account },
           ],
         rejectedSessionIds: options.revokedSessionIds ?? [],
+        policyRejectedSessionIds: options.policyRejectedSessionIds,
       };
     },
   };

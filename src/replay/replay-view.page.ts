@@ -50,6 +50,7 @@ export const REPLAY_VIEW_HTML = `<!doctype html>
     <div class="sub">오목 · 오델로 리플레이 (superadmin 전용)</div>
   </header>
   <main>
+    <p id="auth-attempt-message" class="error" role="alert" hidden></p>
     <div id="gate" class="card hidden"></div>
 
     <section id="list-view" class="hidden">
@@ -109,6 +110,12 @@ export const REPLAY_VIEW_HTML = `<!doctype html>
   <script>
   (function () {
     var API = '/api';
+    var callbackParams = new URLSearchParams(location.search);
+    var callbackCode = callbackParams.get('errorCode');
+    // Callback parameters are presentation hints only; they never revoke a session.
+    var callbackPolicyMessage = callbackParams.get('status') === 'error'
+      && (callbackCode === 'AUTHENTICATION_METHOD_NOT_ALLOWED' || callbackCode === 'AUTHENTICATION_METHOD_REAUTHENTICATION_REQUIRED')
+      ? callbackParams.get('error') : undefined;
     var state = { accountId: null, accountLabel: null, game: '', page: 1, pageSize: 20, total: 0 };
     var el = function (id) { return document.getElementById(id); };
 
@@ -137,11 +144,12 @@ export const REPLAY_VIEW_HTML = `<!doctype html>
       gate.innerHTML = html;
     }
 
-    function renderLoginRequired() {
+    function renderLoginRequired(message) {
       showGate('<h2>로그인이 필요합니다</h2>'
-        + '<p class="muted">이 페이지는 superadmin 계정 전용입니다. 로그인 후 이용해 주세요.</p>'
+        + '<p class="muted" id="login-message">이 페이지는 superadmin 계정 전용입니다. 로그인 후 이용해 주세요.</p>'
         + '<button class="primary" id="login-btn">로그인</button>');
       el('login-btn').addEventListener('click', startLogin);
+      if (message) el('login-message').textContent = message;
     }
 
     function renderForbidden() {
@@ -169,7 +177,16 @@ export const REPLAY_VIEW_HTML = `<!doctype html>
 
     // handles a fetch Response, routing 401/403 to the gate; returns parsed json or null.
     function handleAuth(response) {
-      if (response.status === 401) { renderLoginRequired(); return null; }
+      if (callbackPolicyMessage && response.status !== 401) {
+        el('auth-attempt-message').textContent = callbackPolicyMessage;
+        el('auth-attempt-message').hidden = false;
+      }
+      if (response.status === 401) {
+        return response.json().catch(function () { return {}; }).then(function (body) {
+          renderLoginRequired(body.code === 'SESSION_AUTH_METHOD_DENIED' ? body.message : callbackPolicyMessage);
+          return null;
+        });
+      }
       if (response.status === 403) { renderForbidden(); return null; }
       return response.json();
     }
